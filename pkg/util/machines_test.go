@@ -240,6 +240,7 @@ func Test_GetMachineMetadata(t *testing.T) {
 		machine         *infrav1.VSphereVM
 		networkStatuses []infrav1.NetworkStatus
 		ipamState       map[string]infrav1.NetworkDeviceSpec
+		persistentDisks []infrav1.PersistentDisk
 		expected        string
 	}{
 		{
@@ -921,12 +922,54 @@ network:
       accept-ra: false
 `,
 		},
+		{
+			name: "persistent disks are defaulted and filtered",
+			machine: &infrav1.VSphereVM{
+				Spec: infrav1.VSphereVMSpec{
+					VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+						Network: infrav1.NetworkSpec{},
+					},
+				},
+			},
+			persistentDisks: []infrav1.PersistentDisk{
+				{
+					Name:       "data-1",
+					UnitNumber: toInt32Ptr(2),
+					MountPath:  "/var/lib/data",
+				},
+				{
+					Name: "data-2",
+				},
+			},
+			expected: `
+instance-id: "test-vm"
+local-hostname: "test-vm"
+wait-on-network:
+  ipv4: false
+  ipv6: false
+network:
+  version: 2
+  ethernets:
+disk_setup:
+  /dev/disk/by-path/pci-0000:00:10.0-scsi-0:0:2:0:
+    table_type: 'gpt'
+    layout: true
+    overwrite: false
+fs_setup:
+  - label: data-1
+    filesystem: ext4
+    device: /dev/disk/by-path/pci-0000:00:10.0-scsi-0:0:2:0
+    overwrite: false
+mounts:
+  - [ "/dev/disk/by-path/pci-0000:00:10.0-scsi-0:0:2:0", "/var/lib/data", "ext4", "defaults", "0", "2" ]
+`,
+		},
 	}
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			tc.machine.Name = tc.name
-			actVal, err := util.GetMachineMetadata("test-vm", *tc.machine, tc.ipamState, tc.networkStatuses...)
+			actVal, err := util.GetMachineMetadata("test-vm", *tc.machine, tc.ipamState, tc.persistentDisks, tc.networkStatuses...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -938,6 +981,10 @@ network:
 			}
 		})
 	}
+}
+
+func toInt32Ptr(v int32) *int32 {
+	return &v
 }
 
 func TestConvertProviderIDToUUID(t *testing.T) {

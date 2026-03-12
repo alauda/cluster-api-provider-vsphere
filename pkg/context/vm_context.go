@@ -36,6 +36,7 @@ type VMContext struct {
 	PatchHelper          *patch.Helper
 	Session              *session.Session
 	VSphereFailureDomain *infrav1.VSphereFailureDomain
+	ResourceSlot         *infrav1.ResourceSlot
 }
 
 // String returns VSphereVMGroupVersionKind VSphereVMNamespace/VSphereVMName.

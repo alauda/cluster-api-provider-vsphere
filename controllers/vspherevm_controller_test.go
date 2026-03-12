@@ -251,6 +251,41 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 		g.Expect(vmProvisionCondition.Reason).To(Equal(infrav1.WaitingForIPAllocationReason))
 	})
 
+	t.Run("Waiting for IP claim fulfillment before creating VM", func(t *testing.T) {
+		create(infrav1.NetworkSpec{
+			Devices: []infrav1.NetworkDeviceSpec{
+				{
+					NetworkName: "nw-1",
+					DHCP4:       true,
+					AddressesFromPools: []corev1.TypedLocalObjectReference{
+						{
+							APIGroup: &poolAPIGroup,
+							Kind:     "IPAMPools",
+							Name:     "my-ip-pool",
+						},
+					},
+				},
+			},
+		})()
+		fakeVMSvc := new(fake_svc.VMService)
+		r := setupReconciler(fakeVMSvc)
+		g := NewWithT(t)
+
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+		g.Expect(err).NotTo(HaveOccurred())
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+		g.Expect(err).NotTo(HaveOccurred())
+
+		vm := &infrav1.VSphereVM{}
+		vmKey := util.ObjectKey(vsphereVM)
+		g.Expect(r.Client.Get(context.Background(), vmKey, vm)).NotTo(HaveOccurred())
+
+		g.Expect(v1beta1conditions.Has(vm, infrav1.IPAddressClaimedCondition)).To(BeTrue())
+		ipClaimCondition := v1beta1conditions.Get(vm, infrav1.IPAddressClaimedCondition)
+		g.Expect(ipClaimCondition.Status).To(Equal(corev1.ConditionFalse))
+		fakeVMSvc.AssertNotCalled(t, "ReconcileVM", mock.Anything)
+	})
+
 	t.Run("Deleting a VM with IPAddressClaims", func(t *testing.T) {
 		create(infrav1.NetworkSpec{
 			Devices: []infrav1.NetworkDeviceSpec{

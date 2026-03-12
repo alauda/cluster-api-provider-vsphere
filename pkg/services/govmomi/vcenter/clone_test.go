@@ -68,28 +68,28 @@ func TestGetDiskSpec(t *testing.T) {
 	}{
 		{
 			name:              "Successfully clone template with correct disk requirements",
-			disks:             defaultDisks,
+			disks:             devices,
 			cloneDiskSize:     defaultSizeGiB,
 			expectDevice:      true,
 			expectedDiskCount: 1,
 		},
 		{
 			name:              "Successfully clone template and increase disk requirements",
-			disks:             defaultDisks,
+			disks:             devices,
 			cloneDiskSize:     defaultSizeGiB + 1,
 			expectDevice:      true,
 			expectedDiskCount: 1,
 		},
 		{
 			name:              "Successfully clone template with no explicit disk requirements",
-			disks:             defaultDisks,
+			disks:             devices,
 			cloneDiskSize:     0,
 			expectDevice:      true,
 			expectedDiskCount: 1,
 		},
 		{
 			name:          "Fail to clone template with lower disk requirements then on template",
-			disks:         defaultDisks,
+			disks:         devices,
 			cloneDiskSize: defaultSizeGiB - 1,
 			err:           "Error getting disk config spec for primary disk: can't resize template disk down, initial capacity is larger: 22020096KiB > 19922944KiB",
 		},
@@ -100,7 +100,7 @@ func TestGetDiskSpec(t *testing.T) {
 		},
 		{
 			name:  "Successfully clone template with 2 correct disk requirements",
-			disks: append(defaultDisks, defaultDisks...),
+			disks: append(devices, defaultDisks...),
 			// Disk sizes were bumped up by 1 in the previous test case, defaultSize + 1 is the defaultSize now.
 			cloneDiskSize:            defaultSizeGiB + 1,
 			additionalCloneDiskSizes: []int32{defaultSizeGiB + 1},
@@ -109,7 +109,7 @@ func TestGetDiskSpec(t *testing.T) {
 		},
 		{
 			name:                     "Fails to clone template and decrease second disk size",
-			disks:                    append(defaultDisks, defaultDisks...),
+			disks:                    append(devices, defaultDisks...),
 			cloneDiskSize:            defaultSizeGiB + 2,
 			additionalCloneDiskSizes: []int32{defaultSizeGiB},
 			err:                      "Error getting disk config spec for additional disk: can't resize template disk down, initial capacity is larger: 23068672KiB > 20971520KiB",
@@ -178,7 +178,9 @@ func TestCreateDataDisks(t *testing.T) {
 		devices            object.VirtualDeviceList
 		controller         types.BaseVirtualController
 		dataDisks          []infrav1.VSphereDisk
+		resourceSlot       *infrav1.ResourceSlot
 		expectedUnitNumber []int
+		expectedCreateOps  []bool
 		err                string
 	}{
 		{
@@ -187,6 +189,7 @@ func TestCreateDataDisks(t *testing.T) {
 			controller:         controller,
 			dataDisks:          createDataDiskDefinitions(1, nil),
 			expectedUnitNumber: []int{1},
+			expectedCreateOps:  []bool{true},
 		},
 		{
 			name:               "Add data disk with 2 ova disk",
@@ -194,6 +197,7 @@ func TestCreateDataDisks(t *testing.T) {
 			controller:         controller,
 			dataDisks:          createDataDiskDefinitions(1, nil),
 			expectedUnitNumber: []int{2},
+			expectedCreateOps:  []bool{true},
 		},
 		{
 			name:               "Add multiple data disk with 1 ova disk",
@@ -201,6 +205,7 @@ func TestCreateDataDisks(t *testing.T) {
 			controller:         controller,
 			dataDisks:          createDataDiskDefinitions(2, nil),
 			expectedUnitNumber: []int{1, 2},
+			expectedCreateOps:  []bool{true, true},
 		},
 		{
 			name:       "Add too many data disks with 1 ova disk",
@@ -229,6 +234,7 @@ func TestCreateDataDisks(t *testing.T) {
 			controller:         controller,
 			dataDisks:          createDataDiskDefinitions(1, &infrav1.ThinProvisioningMode),
 			expectedUnitNumber: []int{1},
+			expectedCreateOps:  []bool{true},
 		},
 		{
 			name:               "Create data disk with Thick provisioning",
@@ -236,6 +242,7 @@ func TestCreateDataDisks(t *testing.T) {
 			controller:         controller,
 			dataDisks:          createDataDiskDefinitions(1, &infrav1.ThickProvisioningMode),
 			expectedUnitNumber: []int{1},
+			expectedCreateOps:  []bool{true},
 		},
 		{
 			name:               "Create data disk with EagerZeroed provisioning",
@@ -243,6 +250,7 @@ func TestCreateDataDisks(t *testing.T) {
 			controller:         controller,
 			dataDisks:          createDataDiskDefinitions(1, &infrav1.EagerlyZeroedProvisioningMode),
 			expectedUnitNumber: []int{1},
+			expectedCreateOps:  []bool{true},
 		},
 		{
 			name:               "Create data disk without provisioning type set",
@@ -250,6 +258,23 @@ func TestCreateDataDisks(t *testing.T) {
 			controller:         controller,
 			dataDisks:          createDataDiskDefinitions(1, nil),
 			expectedUnitNumber: []int{1},
+			expectedCreateOps:  []bool{true},
+		},
+		{
+			name:       "Reuse persistent disk and backfill assigned unit number",
+			devices:    deviceList,
+			controller: controller,
+			dataDisks: []infrav1.VSphereDisk{
+				{Name: "disk-1", SizeGiB: 10},
+			},
+			resourceSlot: &infrav1.ResourceSlot{
+				Hostname: "host-1",
+				PersistentDisks: []infrav1.PersistentDisk{
+					{Name: "disk-1", VolumePath: "[datastore1] disk-1/disk-1.vmdk"},
+				},
+			},
+			expectedUnitNumber: []int{1},
+			expectedCreateOps:  []bool{false},
 		},
 	}
 
@@ -261,7 +286,15 @@ func TestCreateDataDisks(t *testing.T) {
 			g := gomega.NewWithT(t)
 
 			// Create the data disks
-			newDisks, funcError := createDataDisks(ctx.TODO(), tc.dataDisks, tc.devices)
+			vsphereVM := &infrav1.VSphereVM{
+				Spec: infrav1.VSphereVMSpec{
+					VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+						DataDisks: tc.dataDisks,
+					},
+				},
+			}
+			vmContext := &capvcontext.VMContext{VSphereVM: vsphereVM, ResourceSlot: tc.resourceSlot}
+			newDisks, funcError := createDataDisks(ctx.TODO(), vmContext, tc.devices)
 			if (tc.err != "" && funcError == nil) || (tc.err == "" && funcError != nil) || (funcError != nil && tc.err != funcError.Error()) {
 				t.Fatalf("Expected to get '%v' error from assignUnitNumber, got: '%v'", tc.err, funcError)
 			}
@@ -286,6 +319,11 @@ func TestCreateDataDisks(t *testing.T) {
 					if tc.err == "" && unitNumber != int32(tc.expectedUnitNumber[index]) {
 						t.Fatalf("Expected to get unitNumber '%d' error from assignUnitNumber, got: '%d'", tc.expectedUnitNumber[index], unitNumber)
 					}
+					if tc.expectedCreateOps[index] {
+						g.Expect(disk.GetVirtualDeviceConfigSpec().FileOperation).To(gomega.Equal(types.VirtualDeviceConfigSpecFileOperationCreate))
+					} else {
+						g.Expect(disk.GetVirtualDeviceConfigSpec().FileOperation).To(gomega.BeEmpty())
+					}
 
 					// Check to see if the provision type matches.
 					backingInfo := disk.GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().Backing.(*types.VirtualDiskFlatVer2BackingInfo)
@@ -302,6 +340,9 @@ func TestCreateDataDisks(t *testing.T) {
 					default:
 						// If not set, the behaviour may depend on the configuration of the backing datastore.
 					}
+				}
+				if tc.resourceSlot != nil && tc.resourceSlot.PersistentDisks[0].UnitNumber == nil {
+					t.Fatal("expected persistent disk unit number to be backfilled")
 				}
 			}
 		})

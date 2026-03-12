@@ -61,6 +61,7 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 		VSphereVM:                vmCtx.VSphereVM,
 		Session:                  vmCtx.Session,
 		PatchHelper:              vmCtx.PatchHelper,
+		ResourceSlot:             vmCtx.ResourceSlot,
 	}
 	log.Info("Starting clone process")
 
@@ -153,7 +154,7 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 
 	// Process all DataDisks definitions to dynamically create and add disks to the VM
 	if len(vmCtx.VSphereVM.Spec.DataDisks) > 0 {
-		dataDisks, err := createDataDisks(ctx, vmCtx.VSphereVM.Spec.DataDisks, devices)
+		dataDisks, err := createDataDisks(ctx, vmCtx, devices)
 		if err != nil {
 			return errors.Wrapf(err, "error getting data disks")
 		}
@@ -423,7 +424,7 @@ func getDiskConfigSpec(disk *types.VirtualDisk, diskCloneCapacityKB int64) (type
 }
 
 // createDataDisks parses through the list of VSphereDisk objects and generates the VirtualDeviceConfigSpec for each one.
-func createDataDisks(ctx context.Context, dataDiskDefs []infrav1.VSphereDisk, devices object.VirtualDeviceList) ([]types.BaseVirtualDeviceConfigSpec, error) {
+func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices object.VirtualDeviceList) ([]types.BaseVirtualDeviceConfigSpec, error) {
 	log := ctrl.LoggerFrom(ctx)
 	additionalDisks := []types.BaseVirtualDeviceConfigSpec{}
 
@@ -447,14 +448,30 @@ func createDataDisks(ctx context.Context, dataDiskDefs []infrav1.VSphereDisk, de
 		return nil, err
 	}
 
-	for i, dataDisk := range dataDiskDefs {
+	for i, dataDisk := range vmCtx.VSphereVM.Spec.DataDisks {
 		log.V(2).Info("Adding disk", "name", dataDisk.Name, "spec", dataDisk)
+
+		// ADDITION: Check for persistent disk in ResourceSlot
+		var pd *infrav1.PersistentDisk
+		if vmCtx.ResourceSlot != nil {
+			for j := range vmCtx.ResourceSlot.PersistentDisks {
+				if vmCtx.ResourceSlot.PersistentDisks[j].Name == dataDisk.Name {
+					pd = &vmCtx.ResourceSlot.PersistentDisks[j]
+					break
+				}
+			}
+		}
 
 		backing := &types.VirtualDiskFlatVer2BackingInfo{
 			DiskMode: string(types.VirtualDiskModePersistent),
 			VirtualDeviceFileBackingInfo: types.VirtualDeviceFileBackingInfo{
 				FileName: "",
 			},
+		}
+
+		// ADDITION: Backfill VolumePath if available
+		if pd != nil && pd.VolumePath != "" {
+			backing.FileName = pd.VolumePath
 		}
 
 		// Set provisioning type for the new data disk.
@@ -484,20 +501,35 @@ func createDataDisks(ctx context.Context, dataDiskDefs []infrav1.VSphereDisk, de
 		vd := dev.GetVirtualDevice()
 		vd.ControllerKey = controllerKey
 
-		// Assign unit number to the new disk.  Should be next available slot on the controller.
-		unitNumber, err := unitNumberAssigner.assign()
-		if err != nil {
-			return nil, err
+		// MODIFICATION: Assign unit number, favoring fixed unit number if provided
+		var unitNumber int32
+		if pd != nil && pd.UnitNumber != nil {
+			unitNumber = *pd.UnitNumber
+			unitNumberAssigner.markUsed(unitNumber)
+		} else {
+			unitNumber, err = unitNumberAssigner.assign()
+			if err != nil {
+				return nil, err
+			}
+			if pd != nil {
+				pd.UnitNumber = &unitNumber
+			}
 		}
 		vd.UnitNumber = &unitNumber
 
 		log.V(4).Info("Created device for data disk device", "name", dataDisk.Name, "spec", dataDisk, "device", dev)
 
-		additionalDisks = append(additionalDisks, &types.VirtualDeviceConfigSpec{
-			Device:        dev,
-			Operation:     types.VirtualDeviceConfigSpecOperationAdd,
-			FileOperation: types.VirtualDeviceConfigSpecFileOperationCreate,
-		})
+		spec := &types.VirtualDeviceConfigSpec{
+			Device:    dev,
+			Operation: types.VirtualDeviceConfigSpecOperationAdd,
+		}
+
+		// ADDITION: Only create the file if we don't have an existing VolumePath
+		if pd == nil || pd.VolumePath == "" {
+			spec.FileOperation = types.VirtualDeviceConfigSpecFileOperationCreate
+		}
+
+		additionalDisks = append(additionalDisks, spec)
 	}
 
 	return additionalDisks, nil
@@ -530,6 +562,13 @@ func newUnitNumberAssigner(controller types.BaseVirtualController, existingDevic
 
 	// Set offset to 0, it will auto-increment on the first assignment.
 	return &unitNumberAssigner{used: used, offset: 0}, nil
+}
+
+// ADDITION: markUsed marks a specific unit number as used.
+func (a *unitNumberAssigner) markUsed(unit int32) {
+	if unit >= 0 && int(unit) < len(a.used) {
+		a.used[unit] = true
+	}
 }
 
 func (a *unitNumberAssigner) assign() (int32, error) {

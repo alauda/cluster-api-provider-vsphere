@@ -260,6 +260,18 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		PatchHelper:              patchHelper,
 	}
 
+	if vsphereMachine.Spec.ResourcePoolRef != nil {
+		slot, err := services.GetSlotForMachine(ctx, r.Client, vsphereMachine.Spec.ResourcePoolRef, &corev1.ObjectReference{
+			Namespace: vsphereMachine.Namespace,
+			Name:      vsphereMachine.Name,
+			UID:       vsphereMachine.UID,
+		})
+		if err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to get resource slot for VSphereMachine %s", vsphereMachine.Name)
+		}
+		vmContext.ResourceSlot = slot
+	}
+
 	// Print the task-ref upon entry and upon exit.
 	log.V(4).Info("VSphereVM.Status.TaskRef OnEntry", "taskRef", vmContext.VSphereVM.Status.TaskRef)
 	defer func() {
@@ -411,6 +423,34 @@ func (r vmReconciler) reconcileDelete(ctx context.Context, vmCtx *capvcontext.VM
 		return reconcile.Result{}, nil
 	}
 
+	// AFTER PHYSICAL DELETION IS CONFIRMED: Release the resource pool slot.
+	// The owner VSphereMachine may already be gone, so fall back to the owner ref and
+	// locate the pool by status assignment when necessary.
+	machineRef, err := util.GetOwnerVSphereMachineRef(vmCtx.VSphereVM.ObjectMeta)
+	if err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine owner reference for VSphereVM")
+	}
+	if machineRef != nil {
+		var poolRef *corev1.ObjectReference
+
+		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine for VSphereVM")
+		}
+		if machine != nil {
+			poolRef = machine.Spec.ResourcePoolRef
+		}
+		if poolRef == nil {
+			poolRef, err = services.FindResourcePoolForMachine(ctx, r.Client, vmCtx.VSphereVM.Namespace, machineRef)
+			if err != nil {
+				return reconcile.Result{}, errors.Wrapf(err, "failed to find resource pool for VSphereVM")
+			}
+		}
+		if err := services.ReleaseSlot(ctx, r.Client, poolRef, machineRef); err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to release slot for VM")
+		}
+	}
+
 	// Attempt to delete the node corresponding to the vsphere VM
 	err = r.deleteNode(ctx, vmCtx, vm.Name)
 	if err != nil {
@@ -487,6 +527,10 @@ func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VM
 	if err := r.reconcileIPAddressClaims(ctx, vmCtx); err != nil {
 		return reconcile.Result{}, err
 	}
+	if !v1beta1conditions.IsTrue(vmCtx.VSphereVM, infrav1.IPAddressClaimedCondition) {
+		log.Info("VM is waiting for IP address claims to be fulfilled")
+		return reconcile.Result{}, nil
+	}
 
 	// Get or create the VM.
 	vm, err := r.VMService.ReconcileVM(ctx, vmCtx)
@@ -542,6 +586,17 @@ func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VM
 		Status: metav1.ConditionTrue,
 		Reason: infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Reason,
 	})
+
+	// Persist discovered paths back to the pool
+	if vmCtx.ResourceSlot != nil {
+		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
+		if err == nil && machine != nil && machine.Spec.ResourcePoolRef != nil {
+			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.ResourcePoolRef, vmCtx.ResourceSlot); err != nil {
+				return reconcile.Result{}, errors.Wrapf(err, "failed to persist slot changes for vm %s", vmCtx.VSphereVM.Name)
+			}
+		}
+	}
+
 	log.Info("VSphereVM is ready")
 	return reconcile.Result{}, nil
 }

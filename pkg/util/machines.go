@@ -25,6 +25,7 @@ import (
 	"text/template"
 
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	apitypes "k8s.io/apimachinery/pkg/types"
@@ -91,7 +92,7 @@ func IsControlPlaneMachine(machine metav1.Object) bool {
 // GetMachineMetadata the cloud-init metadata as a base-64 encoded
 // string for a given VSphereMachine.
 // IPAM state includes IP and Gateways that should be added to each device.
-func GetMachineMetadata(hostname string, vsphereVM infrav1.VSphereVM, ipamState map[string]infrav1.NetworkDeviceSpec, networkStatuses ...infrav1.NetworkStatus) ([]byte, error) {
+func GetMachineMetadata(hostname string, vsphereVM infrav1.VSphereVM, ipamState map[string]infrav1.NetworkDeviceSpec, persistentDisks []infrav1.PersistentDisk, networkStatuses ...infrav1.NetworkStatus) ([]byte, error) {
 	// Create a copy of the devices and add their MAC addresses from a network status.
 	devices := make([]infrav1.NetworkDeviceSpec, max(len(vsphereVM.Spec.Network.Devices), len(networkStatuses)))
 
@@ -143,6 +144,15 @@ func GetMachineMetadata(hostname string, vsphereVM infrav1.VSphereVM, ipamState 
 		devices[i].MACAddr = status.MACAddr
 	}
 
+	normalizedPersistentDisks := make([]infrav1.PersistentDisk, 0, len(persistentDisks))
+	for i := range persistentDisks {
+		disk := persistentDisks[i]
+		if disk.FSFormat == "" {
+			disk.FSFormat = "ext4"
+		}
+		normalizedPersistentDisks = append(normalizedPersistentDisks, disk)
+	}
+
 	buf := &bytes.Buffer{}
 	tpl := template.Must(template.New("t").Funcs(
 		template.FuncMap{
@@ -151,17 +161,19 @@ func GetMachineMetadata(hostname string, vsphereVM infrav1.VSphereVM, ipamState 
 			},
 		}).Parse(metadataFormat))
 	if err := tpl.Execute(buf, struct {
-		Hostname    string
-		Devices     []infrav1.NetworkDeviceSpec
-		Routes      []infrav1.NetworkRouteSpec
-		WaitForIPv4 bool
-		WaitForIPv6 bool
+		Hostname        string
+		Devices         []infrav1.NetworkDeviceSpec
+		Routes          []infrav1.NetworkRouteSpec
+		PersistentDisks []infrav1.PersistentDisk
+		WaitForIPv4     bool
+		WaitForIPv6     bool
 	}{
-		Hostname:    hostname, // note that hostname determines the Kubernetes node name
-		Devices:     devices,
-		Routes:      vsphereVM.Spec.Network.Routes,
-		WaitForIPv4: waitForIPv4,
-		WaitForIPv6: waitForIPv6,
+		Hostname:        hostname, // note that hostname determines the Kubernetes node name
+		Devices:         devices,
+		Routes:          vsphereVM.Spec.Network.Routes,
+		PersistentDisks: normalizedPersistentDisks,
+		WaitForIPv4:     waitForIPv4,
+		WaitForIPv6:     waitForIPv6,
 	}); err != nil {
 		return nil, errors.Wrapf(
 			err,
@@ -173,13 +185,31 @@ func GetMachineMetadata(hostname string, vsphereVM infrav1.VSphereVM, ipamState 
 
 // GetOwnerVSphereMachine returns the VSphereMachine owner for the passed object.
 func GetOwnerVSphereMachine(ctx context.Context, c client.Client, obj metav1.ObjectMeta) (*infrav1.VSphereMachine, error) {
+	ref, err := GetOwnerVSphereMachineRef(obj)
+	if err != nil {
+		return nil, err
+	}
+	if ref == nil {
+		return nil, nil
+	}
+	return getVSphereMachineByName(ctx, c, obj.Namespace, ref.Name)
+}
+
+// GetOwnerVSphereMachineRef returns the owner reference for the VSphereMachine owner, if present.
+func GetOwnerVSphereMachineRef(obj metav1.ObjectMeta) (*corev1.ObjectReference, error) {
 	for _, ref := range obj.OwnerReferences {
 		gv, err := schema.ParseGroupVersion(ref.APIVersion)
 		if err != nil {
 			return nil, err
 		}
 		if ref.Kind == "VSphereMachine" && gv.Group == infrav1.GroupVersion.Group {
-			return getVSphereMachineByName(ctx, c, obj.Namespace, ref.Name)
+			return &corev1.ObjectReference{
+				APIVersion: ref.APIVersion,
+				Kind:       ref.Kind,
+				Namespace:  obj.Namespace,
+				Name:       ref.Name,
+				UID:        ref.UID,
+			}, nil
 		}
 	}
 	return nil, nil

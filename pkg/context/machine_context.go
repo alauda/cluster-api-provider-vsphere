@@ -51,6 +51,7 @@ type VIMMachineContext struct {
 	*BaseMachineContext
 	VSphereCluster *infrav1.VSphereCluster
 	VSphereMachine *infrav1.VSphereMachine
+	ResourceSlot   *infrav1.ResourceSlot
 }
 
 // String returns VSphereMachineGroupVersionKind VSphereMachineNamespace/VSphereMachineName.

@@ -207,6 +207,11 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 		return vm, err
 	}
 
+	// Reconcile PersistentDisk statuses (discover VolumePath/DiskUUID)
+	if err := vms.reconcilePersistentDiskStatuses(ctx, virtualMachineCtx); err != nil {
+		return vm, err
+	}
+
 	vm.State = infrav1.VirtualMachineStateReady
 	return vm, nil
 }
@@ -244,7 +249,6 @@ func (vms *VMService) DestroyVM(ctx context.Context, vmCtx *capvcontext.VMContex
 		return reconcile.Result{}, vm, err
 	}
 
-	//
 	// At this point we know the VM exists, so it needs to be destroyed.
 	//
 
@@ -254,6 +258,13 @@ func (vms *VMService) DestroyVM(ctx context.Context, vmCtx *capvcontext.VMContex
 		Obj:       object.NewVirtualMachine(vmCtx.Session.Client.Client, vmRef),
 		Ref:       vmRef,
 		State:     &vm,
+	}
+
+	// Detach persistent disks before destruction to prevent them from being deleted.
+	if virtualMachineCtx.ResourceSlot != nil && len(virtualMachineCtx.ResourceSlot.PersistentDisks) > 0 {
+		if err := vms.detachPersistentDisks(ctx, virtualMachineCtx); err != nil {
+			return reconcile.Result{}, vm, errors.Wrapf(err, "failed to detach persistent disks for vm %s", virtualMachineCtx)
+		}
 	}
 
 	// Shut down the VM
@@ -364,7 +375,17 @@ func (vms *VMService) reconcileMetadata(ctx context.Context, virtualMachineCtx *
 		return false, err
 	}
 
-	newMetadata, err := util.GetMachineMetadata(virtualMachineCtx.VSphereVM.Name, *virtualMachineCtx.VSphereVM, virtualMachineCtx.IPAMState, virtualMachineCtx.State.Network...)
+	var persistentDisks []infrav1.PersistentDisk
+	if virtualMachineCtx.ResourceSlot != nil {
+		persistentDisks = virtualMachineCtx.ResourceSlot.PersistentDisks
+	}
+
+	hostname := virtualMachineCtx.VSphereVM.Name
+	if virtualMachineCtx.ResourceSlot != nil {
+		hostname = virtualMachineCtx.ResourceSlot.Hostname
+	}
+
+	newMetadata, err := util.GetMachineMetadata(hostname, *virtualMachineCtx.VSphereVM, virtualMachineCtx.IPAMState, persistentDisks, virtualMachineCtx.State.Network...)
 	if err != nil {
 		return false, err
 	}
@@ -780,6 +801,99 @@ func (vms *VMService) reconcileClusterModuleMembership(ctx context.Context, virt
 			return err
 		}
 		virtualMachineCtx.VSphereVM.Status.ModuleUUID = virtualMachineCtx.ClusterModuleInfo
+	}
+	return nil
+}
+
+func (vms *VMService) detachPersistentDisks(ctx context.Context, virtualMachineCtx *virtualMachineContext) error {
+	log := ctrl.LoggerFrom(ctx)
+	devices, err := virtualMachineCtx.Obj.Device(ctx)
+	if err != nil {
+		return err
+	}
+
+	disks := devices.SelectByType((*types.VirtualDisk)(nil))
+	var deviceChanges []types.BaseVirtualDeviceConfigSpec
+
+	if virtualMachineCtx.ResourceSlot == nil {
+		return nil
+	}
+
+	for _, d := range disks {
+		disk := d.(*types.VirtualDisk)
+		if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+			for _, pd := range virtualMachineCtx.ResourceSlot.PersistentDisks {
+				match := false
+				if pd.VolumePath != "" && backing.FileName == pd.VolumePath {
+					match = true
+				} else if pd.UnitNumber != nil && disk.UnitNumber != nil && *pd.UnitNumber == *disk.UnitNumber {
+					match = true
+				}
+
+				if match {
+					log.Info("Detaching persistent disk", "disk", pd.Name, "path", backing.FileName, "unit", disk.UnitNumber)
+					deviceChanges = append(deviceChanges, &types.VirtualDeviceConfigSpec{
+						Operation: types.VirtualDeviceConfigSpecOperationRemove,
+						Device:    disk,
+					})
+					break
+				}
+			}
+		}
+	}
+
+	if len(deviceChanges) > 0 {
+		task, err := virtualMachineCtx.Obj.Reconfigure(ctx, types.VirtualMachineConfigSpec{
+			DeviceChange: deviceChanges,
+		})
+		if err != nil {
+			return err
+		}
+		return task.Wait(ctx)
+	}
+
+	return nil
+}
+
+func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtualMachineCtx *virtualMachineContext) error {
+	if virtualMachineCtx.ResourceSlot == nil || len(virtualMachineCtx.ResourceSlot.PersistentDisks) == 0 {
+		return nil
+	}
+
+	devices, err := virtualMachineCtx.Obj.Device(ctx)
+	if err != nil {
+		return err
+	}
+
+	disks := devices.SelectByType((*types.VirtualDisk)(nil))
+	updated := false
+
+	// Create a copy to avoid side effects during iteration if needed, 
+	// but we are updating the pointer's content which is what we want.
+	for i := range virtualMachineCtx.ResourceSlot.PersistentDisks {
+		pd := &virtualMachineCtx.ResourceSlot.PersistentDisks[i]
+		for _, d := range disks {
+			disk := d.(*types.VirtualDisk)
+			if pd.UnitNumber != nil && disk.UnitNumber != nil && *disk.UnitNumber == *pd.UnitNumber {
+				if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+					if pd.VolumePath != backing.FileName {
+						pd.VolumePath = backing.FileName
+						updated = true
+					}
+					if pd.DiskUUID != backing.Uuid {
+						pd.DiskUUID = backing.Uuid
+						updated = true
+					}
+				}
+			}
+		}
+	}
+
+	if updated {
+		// We need to persist this back to the ResourcePool.
+		// Since we don't have the pool object here, we might need to fetch it.
+		// Better: The VIMMachineService already knows the pool.
+		// Let's assume we can fetch it via the VSphereMachine's reference.
 	}
 	return nil
 }

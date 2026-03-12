@@ -369,6 +369,94 @@ func Test_mergeNetworkConfigurationToNetworkDeviceSpec(t *testing.T) {
 	})
 }
 
+func Test_mergeSlotNetwork(t *testing.T) {
+	t.Run("slot static ip overrides CAPV IPAM inputs", func(t *testing.T) {
+		g := NewWithT(t)
+		service := &VimMachineService{}
+		apiGroup := "ipam.cluster.x-k8s.io"
+
+		vm := &infrav1.VSphereVM{
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					Network: infrav1.NetworkSpec{
+						Devices: []infrav1.NetworkDeviceSpec{
+							{
+								NetworkName: "original-network",
+								DHCP4:       true,
+								AddressesFromPools: []corev1.TypedLocalObjectReference{
+									{
+										APIGroup: &apiGroup,
+										Kind:     "IPPool",
+										Name:     "pool-a",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		service.mergeSlotNetwork(vm, []infrav1.NetworkConfig{
+			{
+				NetworkName: "slot-network",
+				IP:          "192.168.1.10/24",
+				Gateway:     "192.168.1.1",
+				DNS:         []string{"8.8.8.8"},
+			},
+		})
+
+		g.Expect(vm.Spec.Network.Devices).To(HaveLen(1))
+		g.Expect(vm.Spec.Network.Devices[0].NetworkName).To(Equal("slot-network"))
+		g.Expect(vm.Spec.Network.Devices[0].IPAddrs).To(Equal([]string{"192.168.1.10/24"}))
+		g.Expect(vm.Spec.Network.Devices[0].Gateway4).To(Equal("192.168.1.1"))
+		g.Expect(vm.Spec.Network.Devices[0].DHCP4).To(BeFalse())
+		g.Expect(vm.Spec.Network.Devices[0].Nameservers).To(Equal([]string{"8.8.8.8"}))
+		g.Expect(vm.Spec.Network.Devices[0].AddressesFromPools).To(BeNil())
+	})
+
+	t.Run("slot without ip keeps CAPV network allocation inputs", func(t *testing.T) {
+		g := NewWithT(t)
+		service := &VimMachineService{}
+		apiGroup := "ipam.cluster.x-k8s.io"
+
+		vm := &infrav1.VSphereVM{
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					Network: infrav1.NetworkSpec{
+						Devices: []infrav1.NetworkDeviceSpec{
+							{
+								NetworkName: "original-network",
+								DHCP4:       true,
+								AddressesFromPools: []corev1.TypedLocalObjectReference{
+									{
+										APIGroup: &apiGroup,
+										Kind:     "IPPool",
+										Name:     "pool-a",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		service.mergeSlotNetwork(vm, []infrav1.NetworkConfig{
+			{
+				NetworkName: "slot-network",
+			},
+		})
+
+		g.Expect(vm.Spec.Network.Devices).To(HaveLen(1))
+		g.Expect(vm.Spec.Network.Devices[0].NetworkName).To(Equal("slot-network"))
+		g.Expect(vm.Spec.Network.Devices[0].DHCP4).To(BeTrue())
+		g.Expect(vm.Spec.Network.Devices[0].IPAddrs).To(BeEmpty())
+		g.Expect(vm.Spec.Network.Devices[0].AddressesFromPools).To(HaveLen(1))
+		g.Expect(vm.Spec.Network.Devices[0].AddressesFromPools[0].Name).To(Equal("pool-a"))
+	})
+}
+
 func Test_VimMachineService_GetHostInfo(t *testing.T) {
 	var (
 		hostAddr = "1.2.3.4"
@@ -927,7 +1015,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template which doesn't respect max length: trim to max length",
 			machineName: "quick-start-d34gt4-md-0-wqc85-8nxwc-gfd5v", // 41 characters
-			template:    ptr.To[string]("{{ .machine.name }}-{{ .machine.name }}"),
+			template:    ptr.To("{{ .machine.name }}-{{ .machine.name }}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("quick-start-d34gt4-md-0-wqc85-8nxwc-gfd5v-quick-start-d34gt4-md"), // 63 characters
 			},
@@ -935,7 +1023,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template for 20 characters: keep machine name if name has 20 characters",
 			machineName: "quick-md-8nxwc-gfd5v", // 20 characters
-			template:    ptr.To[string]("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
+			template:    ptr.To("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("quick-md-8nxwc-gfd5v"), // 20 characters
 			},
@@ -943,7 +1031,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template for 20 characters: trim to 20 characters if name has more than 20 characters",
 			machineName: "quick-start-d34gt4-md-0-wqc85-8nxwc-gfd5v", // 41 characters
-			template:    ptr.To[string]("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
+			template:    ptr.To("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("quick-start-d3-gfd5v"), // 20 characters
 			},
@@ -951,7 +1039,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template for 20 characters: trim to 19 characters if name has more than 20 characters and last character of prefix is -",
 			machineName: "quick-start-d-34gt4-md-0-wqc85-8nxwc-gfd5v", // 42 characters
-			template:    ptr.To[string]("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
+			template:    ptr.To("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("quick-start-d-gfd5v"), // 19 characters
 			},
@@ -959,7 +1047,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template with a prefix and only 5 random character from the machine name",
 			machineName: "quick-start-d-34gt4-md-0-wqc85-8nxwc-gfd5v", // 42 characters
-			template:    ptr.To[string]("vm-{{ trunc -5 .machine.name }}"),
+			template:    ptr.To("vm-{{ trunc -5 .machine.name }}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("vm-gfd5v"), // 8 characters
 			},

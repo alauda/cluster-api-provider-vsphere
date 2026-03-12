@@ -146,4 +146,30 @@ network:
     metric: {{ .Metric }}
   {{- end }}
   {{- end }}
+{{- if .PersistentDisks }}
+disk_setup:
+{{- range .PersistentDisks }}
+  {{- if .UnitNumber }}
+  /dev/disk/by-path/pci-0000:00:10.0-scsi-0:0:{{ .UnitNumber }}:0:
+    table_type: 'gpt'
+    layout: true
+    overwrite: false
+  {{- end }}
+{{- end }}
+fs_setup:
+{{- range .PersistentDisks }}
+  {{- if .UnitNumber }}
+  - label: {{ .Name }}
+    filesystem: {{ .FSFormat }}
+    device: /dev/disk/by-path/pci-0000:00:10.0-scsi-0:0:{{ .UnitNumber }}:0
+    overwrite: false
+  {{- end }}
+{{- end }}
+mounts:
+{{- range .PersistentDisks }}
+  {{- if and .UnitNumber .MountPath }}
+  - [ "/dev/disk/by-path/pci-0000:00:10.0-scsi-0:0:{{ .UnitNumber }}:0", "{{ .MountPath }}", "{{ .FSFormat }}", "{{ range $i, $opt := .MountOptions }}{{if $i}},{{end}}{{ $opt }}{{else}}defaults{{end}}", "0", "2" ]
+  {{- end }}
+{{- end }}
+{{- end }}
 `

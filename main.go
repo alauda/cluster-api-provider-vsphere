@@ -94,6 +94,7 @@ var (
 	vSphereVMConcurrency              int
 	vSphereClusterIdentityConcurrency int
 	vSphereDeploymentZoneConcurrency  int
+	vSphereResourcePoolConcurrency    int
 	skipCRDMigrationPhases            []string
 
 	managerOptions = capiflags.ManagerOptions{}
@@ -140,6 +141,9 @@ func InitFlags(fs *pflag.FlagSet) {
 
 	fs.IntVar(&vSphereDeploymentZoneConcurrency, "vspheredeploymentzone-concurrency", 10,
 		"Number of vSphere deployment zones to process simultaneously")
+
+	fs.IntVar(&vSphereResourcePoolConcurrency, "vsphereresourcepool-concurrency", 10,
+		"Number of vSphere resource pools to process simultaneously")
 
 	fs.StringVar(
 		&managerOpts.PodName,
@@ -233,7 +237,7 @@ func InitFlags(fs *pflag.FlagSet) {
 // ADD CRD RBAC for CRD Migrator.
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // govmomi
-// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions;customresourcedefinitions/status,verbs=update;patch,resourceNames=vsphereclusters.infrastructure.cluster.x-k8s.io;vsphereclustertemplates.infrastructure.cluster.x-k8s.io;vspheremachines.infrastructure.cluster.x-k8s.io;vspheremachinetemplates.infrastructure.cluster.x-k8s.io;vspherevms.infrastructure.cluster.x-k8s.io;vsphereclusteridentities.infrastructure.cluster.x-k8s.io;vspheredeploymentzones.infrastructure.cluster.x-k8s.io;vspherefailuredomains.infrastructure.cluster.x-k8s.io
+// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions;customresourcedefinitions/status,verbs=update;patch,resourceNames=vsphereclusters.infrastructure.cluster.x-k8s.io;vsphereclustertemplates.infrastructure.cluster.x-k8s.io;vspheremachines.infrastructure.cluster.x-k8s.io;vspheremachinetemplates.infrastructure.cluster.x-k8s.io;vspherevms.infrastructure.cluster.x-k8s.io;vsphereclusteridentities.infrastructure.cluster.x-k8s.io;vspheredeploymentzones.infrastructure.cluster.x-k8s.io;vspherefailuredomains.infrastructure.cluster.x-k8s.io;vsphereresourcepools.infrastructure.cluster.x-k8s.io
 // supervisor
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions;customresourcedefinitions/status,verbs=update;patch,resourceNames=vsphereclusters.vmware.infrastructure.cluster.x-k8s.io;vsphereclustertemplates.vmware.infrastructure.cluster.x-k8s.io;vspheremachines.vmware.infrastructure.cluster.x-k8s.io;vspheremachinetemplates.vmware.infrastructure.cluster.x-k8s.io;providerserviceaccounts.vmware.infrastructure.cluster.x-k8s.io
 // govmomi CRs
@@ -344,6 +348,7 @@ func main() {
 			crdMigratorConfig[&infrav1.VSphereVM{}] = crdmigrator.ByObjectConfig{UseCache: true, UseStatusForStorageVersionMigration: true}
 			crdMigratorConfig[&infrav1.VSphereClusterIdentity{}] = crdmigrator.ByObjectConfig{UseCache: true, UseStatusForStorageVersionMigration: true}
 			crdMigratorConfig[&infrav1.VSphereDeploymentZone{}] = crdmigrator.ByObjectConfig{UseCache: true, UseStatusForStorageVersionMigration: true}
+			crdMigratorConfig[&infrav1.VSphereResourcePool{}] = crdmigrator.ByObjectConfig{UseCache: true, UseStatusForStorageVersionMigration: true}
 			crdMigratorConfig[&infrav1.VSphereFailureDomain{}] = crdmigrator.ByObjectConfig{UseCache: true}
 		}
 		if isSupervisorCRDLoaded {
@@ -450,6 +455,10 @@ func setupVAPIControllers(ctx context.Context, controllerCtx *capvcontext.Contro
 		return err
 	}
 	if err := controllers.AddVsphereClusterIdentityControllerToManager(ctx, controllerCtx, mgr, concurrency(vSphereClusterIdentityConcurrency)); err != nil {
+		return err
+	}
+
+	if err := controllers.AddVSphereResourcePoolControllerToManager(ctx, controllerCtx, mgr, concurrency(vSphereResourcePoolConcurrency)); err != nil {
 		return err
 	}
 
