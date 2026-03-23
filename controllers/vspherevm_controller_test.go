@@ -34,6 +34,7 @@ import (
 	ipamv1 "sigs.k8s.io/cluster-api/exp/ipam/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -246,6 +247,106 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 		vmProvisionCondition := conditions.Get(vm, infrav1.VMProvisionedCondition)
 		g.Expect(vmProvisionCondition.Status).To(Equal(corev1.ConditionFalse))
 		g.Expect(vmProvisionCondition.Reason).To(Equal(infrav1.WaitingForIPAllocationReason))
+	})
+
+	t.Run("Waiting for IP claim fulfillment before creating VM", func(t *testing.T) {
+		create(infrav1.NetworkSpec{
+			Devices: []infrav1.NetworkDeviceSpec{
+				{
+					NetworkName: "nw-1",
+					DHCP4:       true,
+					AddressesFromPools: []corev1.TypedLocalObjectReference{
+						{
+							APIGroup: &poolAPIGroup,
+							Kind:     "IPAMPools",
+							Name:     "my-ip-pool",
+						},
+					},
+				},
+			},
+		})()
+		fakeVMSvc := new(fake_svc.VMService)
+		r := setupReconciler(fakeVMSvc)
+		g := NewWithT(t)
+
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+		g.Expect(err).NotTo(HaveOccurred())
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+		g.Expect(err).NotTo(HaveOccurred())
+
+		vm := &infrav1.VSphereVM{}
+		vmKey := util.ObjectKey(vsphereVM)
+		g.Expect(r.Client.Get(context.Background(), vmKey, vm)).NotTo(HaveOccurred())
+
+		g.Expect(conditions.Has(vm, infrav1.IPAddressClaimedCondition)).To(BeTrue())
+		ipClaimCondition := conditions.Get(vm, infrav1.IPAddressClaimedCondition)
+		g.Expect(ipClaimCondition.Status).To(Equal(corev1.ConditionFalse))
+		fakeVMSvc.AssertNotCalled(t, "ReconcileVM", mock.Anything)
+	})
+
+	t.Run("Defaults VirtualMachineProvisioned v1beta2 condition when it is not reported yet", func(t *testing.T) {
+		create(infrav1.NetworkSpec{
+			Devices: []infrav1.NetworkDeviceSpec{
+				{NetworkName: "nw-1", DHCP4: true},
+			},
+		})()
+		fakeVMSvc := new(fake_svc.VMService)
+		fakeVMSvc.On("ReconcileVM", mock.Anything).Return(infrav1.VirtualMachine{
+			Name:     vsphereVM.Name,
+			BiosUUID: "265104de-1472-547c-b873-6dc7883fb6cb",
+			State:    infrav1.VirtualMachineStatePending,
+		}, nil)
+		r := setupReconciler(fakeVMSvc)
+		g := NewWithT(t)
+
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+		g.Expect(err).NotTo(HaveOccurred())
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+		g.Expect(err).NotTo(HaveOccurred())
+
+		vm := &infrav1.VSphereVM{}
+		vmKey := util.ObjectKey(vsphereVM)
+		g.Expect(r.Client.Get(context.Background(), vmKey, vm)).NotTo(HaveOccurred())
+
+		vmProvisionCondition := v1beta2conditions.Get(vm, infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition)
+		g.Expect(vmProvisionCondition).NotTo(BeNil())
+		g.Expect(vmProvisionCondition.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(vmProvisionCondition.Reason).To(Equal(infrav1.VSphereVMVirtualMachineNotProvisionedV1Beta2Reason))
+
+		readyCondition := v1beta2conditions.Get(vm, infrav1.VSphereVMReadyV1Beta2Condition)
+		g.Expect(readyCondition).NotTo(BeNil())
+		g.Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(readyCondition.Message).NotTo(ContainSubstring("Condition not yet reported"))
+	})
+
+	t.Run("Marks IPAddressClaimsFulfilled with fulfilled reason when no claims are required", func(t *testing.T) {
+		create(infrav1.NetworkSpec{
+			Devices: []infrav1.NetworkDeviceSpec{
+				{NetworkName: "nw-1", DHCP4: true},
+			},
+		})()
+		fakeVMSvc := new(fake_svc.VMService)
+		fakeVMSvc.On("ReconcileVM", mock.Anything).Return(infrav1.VirtualMachine{
+			Name:     vsphereVM.Name,
+			BiosUUID: "265104de-1472-547c-b873-6dc7883fb6cb",
+			State:    infrav1.VirtualMachineStatePending,
+		}, nil)
+		r := setupReconciler(fakeVMSvc)
+		g := NewWithT(t)
+
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+		g.Expect(err).NotTo(HaveOccurred())
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+		g.Expect(err).NotTo(HaveOccurred())
+
+		vm := &infrav1.VSphereVM{}
+		vmKey := util.ObjectKey(vsphereVM)
+		g.Expect(r.Client.Get(context.Background(), vmKey, vm)).NotTo(HaveOccurred())
+
+		ipClaimsCondition := v1beta2conditions.Get(vm, infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition)
+		g.Expect(ipClaimsCondition).NotTo(BeNil())
+		g.Expect(ipClaimsCondition.Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(ipClaimsCondition.Reason).To(Equal(infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Reason))
 	})
 
 	t.Run("Deleting a VM with IPAddressClaims", func(t *testing.T) {
@@ -503,6 +604,56 @@ func TestRetrievingVCenterCredentialsFromCluster(t *testing.T) {
 		g.Expect(vCenterCondition.Status).To(Equal(corev1.ConditionTrue))
 	},
 	)
+
+	t.Run("Patches default conditions even when waiting for VSphereMachine owner ref", func(t *testing.T) {
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "valid-cluster",
+				Namespace: "test",
+			},
+			Spec: clusterv1.ClusterSpec{
+				InfrastructureRef: &corev1.ObjectReference{
+					Name: vsphereCluster.Name,
+				},
+			},
+		}
+
+		vmWithoutOwner := vsphereVM.DeepCopy()
+		vmWithoutOwner.OwnerReferences = nil
+
+		initObjs := createMachineOwnerHierarchy(machine)
+		initObjs = append(initObjs, secret, vmWithoutOwner, vsphereMachine, machine, cluster, vsphereCluster)
+		controllerMgrContext := fake.NewControllerManagerContext(initObjs...)
+
+		r := vmReconciler{
+			Recorder:                 apirecord.NewFakeRecorder(100),
+			ControllerManagerContext: controllerMgrContext,
+		}
+
+		g := NewWithT(t)
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vmWithoutOwner)})
+		g.Expect(err).NotTo(HaveOccurred())
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vmWithoutOwner)})
+		g.Expect(err).NotTo(HaveOccurred())
+
+		vm := &infrav1.VSphereVM{}
+		vmKey := util.ObjectKey(vmWithoutOwner)
+		g.Expect(r.Client.Get(context.Background(), vmKey, vm)).NotTo(HaveOccurred())
+
+		vCenterCondition := v1beta2conditions.Get(vm, infrav1.VSphereVMVCenterAvailableV1Beta2Condition)
+		g.Expect(vCenterCondition).NotTo(BeNil())
+		g.Expect(vCenterCondition.Status).To(Equal(metav1.ConditionTrue))
+
+		vmProvisionCondition := v1beta2conditions.Get(vm, infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition)
+		g.Expect(vmProvisionCondition).NotTo(BeNil())
+		g.Expect(vmProvisionCondition.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(vmProvisionCondition.Reason).To(Equal(infrav1.VSphereVMVirtualMachineNotProvisionedV1Beta2Reason))
+
+		readyCondition := v1beta2conditions.Get(vm, infrav1.VSphereVMReadyV1Beta2Condition)
+		g.Expect(readyCondition).NotTo(BeNil())
+		g.Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(readyCondition.Message).NotTo(ContainSubstring("Condition not yet reported"))
+	})
 
 	t.Run("Error if cluster infrastructureRef is nil", func(t *testing.T) {
 		cluster := &clusterv1.Cluster{

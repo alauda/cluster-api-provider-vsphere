@@ -538,7 +538,7 @@ func Test_BuildState(t *testing.T) {
 		g.Expect(ipamState[devMAC1].Gateway4).To(gomega.Equal("10.0.0.1"))
 
 		// Compute the new metadata from the context to see if the addresses are rendered correctly
-		metadataBytes, err := util.GetMachineMetadata(vmCtx.VSphereVM.Name, *vmCtx.VSphereVM, ipamState, networkStatus...)
+		metadataBytes, err := util.GetMachineMetadata(vmCtx.VSphereVM.Name, *vmCtx.VSphereVM, ipamState, nil, networkStatus...)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 
 		metadata := vmMetadata{}

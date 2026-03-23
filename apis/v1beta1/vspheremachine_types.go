@@ -17,6 +17,7 @@ limitations under the License.
 package v1beta1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/errors"
@@ -146,6 +147,10 @@ type VSphereMachineSpec struct {
 	// NamingStrategy allows configuring the naming strategy used when calculating the name of the VSphereVM.
 	// +optional
 	NamingStrategy *VSphereVMNamingStrategy `json:"namingStrategy,omitempty"`
+
+	// ResourcePoolRef is a reference to the VSphereResourcePool to use for this machine.
+	// +optional
+	ResourcePoolRef *corev1.ObjectReference `json:"resourcePoolRef,omitempty"`
 }
 
 // VSphereVMNamingStrategy defines the naming strategy for the VSphereVMs.

@@ -23,6 +23,7 @@ spec:
         description: |-
           VSphereClusterTemplate is the Schema for the vsphereclustertemplates API
 
+
           Deprecated: This type will be removed in one of the next releases.
         properties:
           apiVersion:

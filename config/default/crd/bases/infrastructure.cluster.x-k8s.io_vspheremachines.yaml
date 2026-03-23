@@ -45,6 +45,7 @@ spec:
         description: |-
           VSphereMachine is the Schema for the vspheremachines API
 
+
           Deprecated: This type will be removed in one of the next releases.
         properties:
           apiVersion:
@@ -124,8 +125,11 @@ spec:
                   VM.
                 properties:
                   devices:
-                    description: |
+                    description: |-
                       Devices is the list of network devices used by the virtual machine.
+
+
+                      TODO(akutz) Make sure at least one network matches the ClusterSpec.CloudProviderConfiguration.Network.Name
                     items:
                       description: |-
                         NetworkDeviceSpec defines the network configuration for a virtual machine's
@@ -369,8 +373,8 @@ spec:
                         The Severity field MUST be set only when Status=False.
                       type: string
                     status:
+                      $ref: '#/definitions/k8s.io~1api~1core~1v1~0ConditionStatus'
                       description: Status of the condition, one of True, False, Unknown.
-                      type: string
                     type:
                       description: |-
                         Type of condition in CamelCase or in foo.example.com/CamelCase.
@@ -388,6 +392,7 @@ spec:
                   reconciling the Machine and will contain a more verbose string suitable
                   for logging and human consumption.
 
+
                   This field should not be set for transitive errors that a controller
                   faces that are expected to be fixed automatically over
                   time (like service outages), but instead indicate that something is
@@ -396,6 +401,7 @@ spec:
                   of terminal errors would be invalid combinations of settings in the
                   spec, values that are unsupported by the controller, or the
                   responsible controller itself being critically misconfigured.
+
 
                   Any transient errors that occur during the reconciliation of Machines
                   can be added as events to the Machine object and/or logged in the
@@ -407,6 +413,7 @@ spec:
                   reconciling the Machine and will contain a succinct value suitable
                   for machine interpretation.
 
+
                   This field should not be set for transitive errors that a controller
                   faces that are expected to be fixed automatically over
                   time (like service outages), but instead indicate that something is
@@ -415,6 +422,7 @@ spec:
                   of terminal errors would be invalid combinations of settings in the
                   spec, values that are unsupported by the controller, or the
                   responsible controller itself being critically misconfigured.
+
 
                   Any transient errors that occur during the reconciliation of Machines
                   can be added as events to the Machine object and/or logged in the
@@ -487,6 +495,7 @@ spec:
         description: |-
           VSphereMachine is the Schema for the vspheremachines API
 
+
           Deprecated: This type will be removed in one of the next releases.
         properties:
           apiVersion:
@@ -566,8 +575,11 @@ spec:
                   VM.
                 properties:
                   devices:
-                    description: |
+                    description: |-
                       Devices is the list of network devices used by the virtual machine.
+
+
+                      TODO(akutz) Make sure at least one network matches the ClusterSpec.CloudProviderConfiguration.Network.Name
                     items:
                       description: |-
                         NetworkDeviceSpec defines the network configuration for a virtual machine's
@@ -811,8 +823,8 @@ spec:
                         The Severity field MUST be set only when Status=False.
                       type: string
                     status:
+                      $ref: '#/definitions/k8s.io~1api~1core~1v1~0ConditionStatus'
                       description: Status of the condition, one of True, False, Unknown.
-                      type: string
                     type:
                       description: |-
                         Type of condition in CamelCase or in foo.example.com/CamelCase.
@@ -830,6 +842,7 @@ spec:
                   reconciling the Machine and will contain a more verbose string suitable
                   for logging and human consumption.
 
+
                   This field should not be set for transitive errors that a controller
                   faces that are expected to be fixed automatically over
                   time (like service outages), but instead indicate that something is
@@ -838,6 +851,7 @@ spec:
                   of terminal errors would be invalid combinations of settings in the
                   spec, values that are unsupported by the controller, or the
                   responsible controller itself being critically misconfigured.
+
 
                   Any transient errors that occur during the reconciliation of Machines
                   can be added as events to the Machine object and/or logged in the
@@ -849,6 +863,7 @@ spec:
                   reconciling the Machine and will contain a succinct value suitable
                   for machine interpretation.
 
+
                   This field should not be set for transitive errors that a controller
                   faces that are expected to be fixed automatically over
                   time (like service outages), but instead indicate that something is
@@ -857,6 +872,7 @@ spec:
                   of terminal errors would be invalid combinations of settings in the
                   spec, values that are unsupported by the controller, or the
                   responsible controller itself being critically misconfigured.
+
 
                   Any transient errors that occur during the reconciliation of Machines
                   can be added as events to the Machine object and/or logged in the
@@ -1042,7 +1058,9 @@ spec:
                   The VM will be powered off forcibly after the timeout if the VM is still
                   up and running when the PowerOffMode is set to trySoft.
 
+
                   This parameter only applies when the PowerOffMode is set to trySoft.
+
 
                   If omitted, the timeout defaults to 5 minutes.
                 type: string
@@ -1087,8 +1105,11 @@ spec:
                   VM.
                 properties:
                   devices:
-                    description: |
+                    description: |-
                       Devices is the list of network devices used by the virtual machine.
+
+
+                      TODO(akutz) Make sure at least one network matches the ClusterSpec.CloudProviderConfiguration.Network.Name
                     items:
                       description: |-
                         NetworkDeviceSpec defines the network configuration for a virtual machine's
@@ -1100,27 +1121,7 @@ spec:
                             to IPAddressClaims. The machine's cloud-init metadata will be populated
                             with IPAddresses fulfilled by an IPAM provider.
                           items:
-                            description: |-
-                              TypedLocalObjectReference contains enough information to let you locate the
-                              typed referenced object inside the same namespace.
-                            properties:
-                              apiGroup:
-                                description: |-
-                                  APIGroup is the group for the resource being referenced.
-                                  If APIGroup is not specified, the specified Kind must be in the core API group.
-                                  For any other third-party types, APIGroup is required.
-                                type: string
-                              kind:
-                                description: Kind is the type of resource being referenced
-                                type: string
-                              name:
-                                description: Name is the name of resource being referenced
-                                type: string
-                            required:
-                            - kind
-                            - name
-                            type: object
-                            x-kubernetes-map-type: atomic
+                            $ref: '#/definitions/k8s.io~1api~1core~1v1~0TypedLocalObjectReference'
                           type: array
                         deviceName:
                           description: |-
@@ -1342,6 +1343,7 @@ spec:
                       PreferredAPIServeCIDR is the preferred CIDR for the Kubernetes API
                       server endpoint on this machine
 
+
                       Deprecated: This field is going to be removed in a future release.
                     type: string
                   routes:
@@ -1435,6 +1437,7 @@ spec:
                 description: |-
                   PowerOffMode describes the desired behavior when powering off a VM.
 
+
                   There are three, supported power off modes: hard, soft, and
                   trySoft. The first mode, hard, is the equivalent of a physical
                   system's power cord being ripped from the wall. The soft mode
@@ -1442,6 +1445,7 @@ spec:
                   gracefully shut down the VM. Its variant, trySoft, first attempts
                   a graceful shutdown, and if that fails or the VM is not in a powered off
                   state after reaching the GuestSoftPowerOffTimeout, the VM is halted.
+
 
                   If omitted, the mode defaults to hard.
                 enum:
@@ -1459,6 +1463,10 @@ spec:
                   ResourcePool is the name, inventory path, managed object reference or the managed
                   object ID in which the virtual machine is created/located.
                 type: string
+              resourcePoolRef:
+                $ref: '#/definitions/k8s.io~1api~1core~1v1~0ObjectReference'
+                description: ResourcePoolRef is a reference to the VSphereResourcePool
+                  to use for this machine.
               server:
                 description: |-
                   Server is the IP address or FQDN of the vSphere server on which
@@ -1564,8 +1572,8 @@ spec:
                       maxLength: 32
                       type: string
                     status:
+                      $ref: '#/definitions/k8s.io~1api~1core~1v1~0ConditionStatus'
                       description: status of the condition, one of True, False, Unknown.
-                      type: string
                     type:
                       description: |-
                         type of condition in CamelCase or in foo.example.com/CamelCase.
@@ -1586,6 +1594,7 @@ spec:
                   reconciling the Machine and will contain a more verbose string suitable
                   for logging and human consumption.
 
+
                   This field should not be set for transitive errors that a controller
                   faces that are expected to be fixed automatically over
                   time (like service outages), but instead indicate that something is
@@ -1594,6 +1603,7 @@ spec:
                   of terminal errors would be invalid combinations of settings in the
                   spec, values that are unsupported by the controller, or the
                   responsible controller itself being critically misconfigured.
+
 
                   Any transient errors that occur during the reconciliation of Machines
                   can be added as events to the Machine object and/or logged in the
@@ -1605,6 +1615,7 @@ spec:
                   reconciling the Machine and will contain a succinct value suitable
                   for machine interpretation.
 
+
                   This field should not be set for transitive errors that a controller
                   faces that are expected to be fixed automatically over
                   time (like service outages), but instead indicate that something is
@@ -1613,6 +1624,7 @@ spec:
                   of terminal errors would be invalid combinations of settings in the
                   spec, values that are unsupported by the controller, or the
                   responsible controller itself being critically misconfigured.
+
 
                   Any transient errors that occur during the reconciliation of Machines
                   can be added as events to the Machine object and/or logged in the
@@ -1659,8 +1671,17 @@ spec:
                       conditions represents the observations of a VSphereMachine's current state.
                       Known condition types are Ready, VirtualMachineProvisioned and Paused.
                     items:
-                      description: Condition contains details for one aspect of the
-                        current state of this API Resource.
+                      description: "Condition contains details for one aspect of the
+                        current state of this API Resource.\n---\nThis struct is intended
+                        for direct use as an array at the field path .status.conditions.
+                        \ For example,\n\n\n\ttype FooStatus struct{\n\t    // Represents
+                        the observations of a foo's current state.\n\t    // Known
+                        .status.conditions.type are: \"Available\", \"Progressing\",
+                        and \"Degraded\"\n\t    // +patchMergeKey=type\n\t    // +patchStrategy=merge\n\t
+                        \   // +listType=map\n\t    // +listMapKey=type\n\t    Conditions
+                        []metav1.Condition `json:\"conditions,omitempty\" patchStrategy:\"merge\"
+                        patchMergeKey:\"type\" protobuf:\"bytes,1,rep,name=conditions\"`\n\n\n\t
+                        \   // other fields\n\t}"
                       properties:
                         lastTransitionTime:
                           description: |-
@@ -1702,7 +1723,12 @@ spec:
                           - Unknown
                           type: string
                         type:
-                          description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                          description: |-
+                            type of condition in CamelCase or in foo.example.com/CamelCase.
+                            ---
+                            Many .condition.type values are consistent across resources like Available, but because arbitrary conditions can be
+                            useful (see .node.status.conditions), the ability to deconflict is important.
+                            The regex it matches is (dns1123SubdomainFmt/)?(qualifiedNameFmt)
                           maxLength: 316
                           pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
                           type: string

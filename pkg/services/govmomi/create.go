@@ -21,6 +21,7 @@ import (
 
 	"github.com/pkg/errors"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1beta1"
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/vcenter"
@@ -29,8 +30,10 @@ import (
 // createVM creates a new VM with the data in the VMContext passed. This method does not wait
 // for the new VM to be created.
 func createVM(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []byte, format bootstrapv1.Format) error {
+	log := ctrl.LoggerFrom(ctx)
 	if !vmCtx.Session.IsVC() {
 		return errors.Errorf("expected VCenter client got %v", vmCtx.Session.ServiceContent.About.ApiType)
 	}
+	log.Info("createVM invoked", "format", string(format), "bootstrapBytes", len(bootstrapData))
 	return vcenter.Clone(ctx, vmCtx, bootstrapData, format)
 }

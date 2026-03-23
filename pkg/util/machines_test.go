@@ -18,9 +18,19 @@ package util_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/pem"
+	"math/big"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/onsi/gomega"
+	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -240,6 +250,7 @@ func Test_GetMachineMetadata(t *testing.T) {
 		machine         *infrav1.VSphereVM
 		networkStatuses []infrav1.NetworkStatus
 		ipamState       map[string]infrav1.NetworkDeviceSpec
+		persistentDisks []infrav1.PersistentDisk
 		expected        string
 	}{
 		{
@@ -921,12 +932,89 @@ network:
       accept-ra: false
 `,
 		},
+		{
+			name: "persistent disks are defaulted and filtered",
+			machine: &infrav1.VSphereVM{
+				Spec: infrav1.VSphereVMSpec{
+					VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+						Network: infrav1.NetworkSpec{},
+					},
+				},
+			},
+			persistentDisks: []infrav1.PersistentDisk{
+				{
+					Name:       "data-1",
+					UnitNumber: toInt32Ptr(2),
+					MountPath:  "/var/lib/data",
+				},
+				{
+					Name: "data-2",
+				},
+			},
+			expected: `
+instance-id: "test-vm"
+local-hostname: "test-vm"
+wait-on-network:
+  ipv4: false
+  ipv6: false
+network:
+  version: 2
+  ethernets:
+`,
+		},
+		{
+			name: "static network without mac still renders metadata",
+			machine: &infrav1.VSphereVM{
+				Spec: infrav1.VSphereVMSpec{
+					VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+						Network: infrav1.NetworkSpec{
+							Devices: []infrav1.NetworkDeviceSpec{
+								{
+									IPAddrs:     []string{"192.168.10.10/24"},
+									Gateway4:    "192.168.10.1",
+									Nameservers: []string{"8.8.8.8"},
+								},
+							},
+						},
+					},
+				},
+			},
+			persistentDisks: []infrav1.PersistentDisk{
+				{
+					Name:       "data-1",
+					UnitNumber: toInt32Ptr(0),
+					MountPath:  "/var/cpaas",
+				},
+			},
+			expected: `
+instance-id: "test-vm"
+local-hostname: "test-vm"
+wait-on-network:
+  ipv4: false
+  ipv6: false
+network:
+  version: 2
+  ethernets:
+    id0:
+      set-name: "eth0"
+      wakeonlan: true
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      addresses:
+      - "192.168.10.10/24"
+      gateway4: "192.168.10.1"
+      nameservers:
+        addresses:
+        - "8.8.8.8"
+`,
+		},
 	}
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			tc.machine.Name = tc.name
-			actVal, err := util.GetMachineMetadata("test-vm", *tc.machine, tc.ipamState, tc.networkStatuses...)
+			actVal, err := util.GetMachineMetadata("test-vm", *tc.machine, tc.ipamState, tc.persistentDisks, tc.networkStatuses...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -938,6 +1026,272 @@ network:
 			}
 		})
 	}
+}
+
+func Test_GetPersistentDiskCloudConfig(t *testing.T) {
+	actual, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+		Name:       "data-1",
+		UnitNumber: toInt32Ptr(2),
+		MountPath:  "/var/lib/data",
+		DiskUUID:   "6000C29d-45cb-2787-e901-a2a0131b2e82",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var actualObj interface{}
+	if err := yaml.Unmarshal(actual, &actualObj); err != nil {
+		t.Fatalf("failed to parse actual cloud-config: %v", err)
+	}
+	actualMap := actualObj.(map[interface{}]interface{})
+	writeFiles, ok := actualMap["write_files"].([]interface{})
+	if !ok || len(writeFiles) != 3 {
+		t.Fatalf("expected 3 write_files entries, got: %#v", actualMap["write_files"])
+	}
+	configEntry := writeFiles[0].(map[interface{}]interface{})
+	encodedConfig := configEntry["content"].(string)
+	decodedConfig, err := base64.StdEncoding.DecodeString(encodedConfig)
+	if err != nil {
+		t.Fatalf("failed to decode persistent disk config: %v", err)
+	}
+	if !strings.Contains(string(decodedConfig), "6000C29d-45cb-2787-e901-a2a0131b2e82") {
+		t.Fatalf("expected persistent disk config to contain disk UUID, got: %s", string(decodedConfig))
+	}
+	scriptEntry := writeFiles[1].(map[interface{}]interface{})
+	encodedScript := scriptEntry["content"].(string)
+	decodedScript, err := base64.StdEncoding.DecodeString(encodedScript)
+	if err != nil {
+		t.Fatalf("failed to decode persistent disk reconcile script: %v", err)
+	}
+	scriptText := string(decodedScript)
+	for _, expected := range []string{
+		"find_device_by_uuid()",
+		"Prefer a device-mapper node when multipath is configured",
+		"grep -qi '^mpath-'",
+		"set -- ${unique_devices}",
+	} {
+		if !strings.Contains(scriptText, expected) {
+			t.Fatalf("expected reconcile script to contain %q, got: %s", expected, scriptText)
+		}
+	}
+	if strings.Contains(scriptText, "match_count") {
+		t.Fatalf("expected reconcile script to stop relying on single-match counting, got: %s", scriptText)
+	}
+	runcmd, ok := actualMap["runcmd"].([]interface{})
+	if !ok || len(runcmd) != 2 {
+		t.Fatalf("expected 2 runcmd entries, got: %#v", actualMap["runcmd"])
+	}
+	actualStr := string(actual)
+	for _, expected := range []string{
+		"/etc/capv/persistent-disks.tsv",
+		"/usr/local/bin/capv-persistent-disk-reconcile.sh",
+		"/etc/systemd/system/capv-persistent-disk-reconcile.service",
+		"systemctl",
+	} {
+		if !strings.Contains(actualStr, expected) {
+			t.Fatalf("expected generated cloud-config to contain %q, got: %s", expected, actualStr)
+		}
+	}
+}
+
+func Test_GetKubeletServingCertCloudConfig(t *testing.T) {
+	vm := infrav1.VSphereVM{
+		Spec: infrav1.VSphereVMSpec{
+			VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+				Network: infrav1.NetworkSpec{
+					Devices: []infrav1.NetworkDeviceSpec{
+						{IPAddrs: []string{"192.168.130.219/20"}},
+						{IPAddrs: []string{"192.168.164.244/24"}},
+					},
+				},
+			},
+		},
+	}
+
+	caCertPEM, caKeyPEM := newTestCA(t)
+	actual, err := util.GetKubeletServingCertCloudConfig("master-01", vm, nil, caCertPEM, caKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actual) == 0 {
+		t.Fatal("expected kubelet serving cert cloud-config to be generated")
+	}
+
+	var actualObj interface{}
+	if err := yaml.Unmarshal(actual, &actualObj); err != nil {
+		t.Fatalf("failed to parse actual cloud-config: %v", err)
+	}
+	actualMap := actualObj.(map[interface{}]interface{})
+	writeFiles, ok := actualMap["write_files"].([]interface{})
+	if !ok || len(writeFiles) != 3 {
+		t.Fatalf("expected 3 write_files entries, got: %#v", actualMap["write_files"])
+	}
+
+	certEntry := writeFiles[0].(map[interface{}]interface{})
+	encodedCert := certEntry["content"].(string)
+	decodedCert, err := base64.StdEncoding.DecodeString(encodedCert)
+	if err != nil {
+		t.Fatalf("failed to decode kubelet cert: %v", err)
+	}
+	certBlock, _ := pem.Decode(decodedCert)
+	if certBlock == nil {
+		t.Fatal("expected kubelet cert PEM block")
+	}
+	kubeletCert, err := x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		t.Fatalf("failed to parse kubelet cert: %v", err)
+	}
+	if kubeletCert.Subject.CommonName != "kubelet" {
+		t.Fatalf("expected kubelet cert CN kubelet, got %q", kubeletCert.Subject.CommonName)
+	}
+	if len(kubeletCert.DNSNames) != 1 || kubeletCert.DNSNames[0] != "master-01" {
+		t.Fatalf("expected kubelet cert DNS SAN master-01, got %#v", kubeletCert.DNSNames)
+	}
+	actualIPs := []string{}
+	for _, ip := range kubeletCert.IPAddresses {
+		actualIPs = append(actualIPs, ip.String())
+	}
+	for _, expected := range []string{"192.168.130.219", "192.168.164.244"} {
+		if !strings.Contains(strings.Join(actualIPs, ","), expected) {
+			t.Fatalf("expected kubelet cert IP SANs to contain %q, got %#v", expected, actualIPs)
+		}
+	}
+
+	keyEntry := writeFiles[1].(map[interface{}]interface{})
+	encodedKey := keyEntry["content"].(string)
+	decodedKey, err := base64.StdEncoding.DecodeString(encodedKey)
+	if err != nil {
+		t.Fatalf("failed to decode kubelet key: %v", err)
+	}
+	keyBlock, _ := pem.Decode(decodedKey)
+	if keyBlock == nil {
+		t.Fatal("expected kubelet key PEM block")
+	}
+	if _, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes); err != nil {
+		t.Fatalf("failed to parse kubelet key: %v", err)
+	}
+
+	patchEntry := writeFiles[2].(map[interface{}]interface{})
+	patchText := patchEntry["content"].(string)
+	for _, expected := range []string{
+		"tlsCertFile",
+		"/etc/kubernetes/pki/kubelet.crt",
+		"tlsPrivateKeyFile",
+		"/etc/kubernetes/pki/kubelet.key",
+	} {
+		if !strings.Contains(patchText, expected) {
+			t.Fatalf("expected kubelet patch to contain %q, got: %s", expected, patchText)
+		}
+	}
+	if _, ok := actualMap["runcmd"]; ok {
+		t.Fatalf("expected kubelet serving cert cloud-config to stop relying on runcmd, got: %#v", actualMap["runcmd"])
+	}
+}
+
+func newTestCA(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate CA key: %v", err)
+	}
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("failed to generate CA serial number: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: "test-ca",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("failed to create CA cert: %v", err)
+	}
+	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	caKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(caKey)})
+	return caCertPEM, caKeyPEM
+}
+
+func Test_MergeCloudConfigUserData(t *testing.T) {
+	userData := []byte(`## template: jinja
+#cloud-config
+
+write_files:
+- path: /tmp/example
+  content: hello
+runcmd:
+- echo ok
+`)
+	diskConfig, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+		Name:       "data-1",
+		UnitNumber: toInt32Ptr(2),
+		MountPath:  "/var/lib/data",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actual, err := util.MergeCloudConfigUserData(userData, diskConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actualStr := string(actual)
+	for _, expected := range []string{
+		"## template: jinja",
+		"#cloud-config",
+		"write_files:",
+		"runcmd:",
+		"/etc/capv/persistent-disks.tsv",
+	} {
+		if !strings.Contains(actualStr, expected) {
+			t.Fatalf("expected merged cloud-config to contain %q, got: %s", expected, actualStr)
+		}
+	}
+}
+
+func Test_MergeCloudConfigUserData_Idempotent(t *testing.T) {
+	userData := []byte(`## template: jinja
+#cloud-config
+
+runcmd:
+- echo ok
+`)
+	diskConfig, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+		Name:       "data-1",
+		UnitNumber: toInt32Ptr(2),
+		MountPath:  "/var/lib/data",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := util.MergeCloudConfigUserData(userData, diskConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := util.MergeCloudConfigUserData(first, diskConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Count(string(second), "/etc/capv/persistent-disks.tsv") != 1 {
+		t.Fatalf("expected persistent disk config to be merged once, got: %s", string(second))
+	}
+	if strings.Count(string(second), "/etc/systemd/system/capv-persistent-disk-reconcile.service") != 1 {
+		t.Fatalf("expected persistent disk service to be merged once, got: %s", string(second))
+	}
+}
+
+func toInt32Ptr(v int32) *int32 {
+	return &v
 }
 
 func TestConvertProviderIDToUUID(t *testing.T) {

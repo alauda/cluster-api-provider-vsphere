@@ -27,6 +27,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	ipamv1 "sigs.k8s.io/cluster-api/exp/ipam/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -45,6 +46,43 @@ func Test_vmReconciler_reconcileIPAddressClaims(t *testing.T) {
 		}
 	}
 	ctx := context.Background()
+
+	t.Run("when VSphereVM Spec has no address pool references", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+
+		vsphereVM := &infrav1.VSphereVM{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				Labels: map[string]string{
+					clusterv1.ClusterNameLabel: "my-cluster",
+				},
+			},
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					Network: infrav1.NetworkSpec{
+						Devices: []infrav1.NetworkDeviceSpec{{
+							NetworkName: "nw-1",
+							DHCP4:       true,
+						}},
+					},
+				},
+			},
+		}
+
+		testCtx := setup(vsphereVM)
+		err := vmReconciler{}.reconcileIPAddressClaims(ctx, testCtx)
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+
+		claimedCondition := conditions.Get(testCtx.VSphereVM, infrav1.IPAddressClaimedCondition)
+		g.Expect(claimedCondition).NotTo(gomega.BeNil())
+		g.Expect(claimedCondition.Status).To(gomega.Equal(corev1.ConditionTrue))
+
+		ipClaimsCondition := v1beta2conditions.Get(testCtx.VSphereVM, infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition)
+		g.Expect(ipClaimsCondition).NotTo(gomega.BeNil())
+		g.Expect(ipClaimsCondition.Status).To(gomega.Equal(metav1.ConditionTrue))
+		g.Expect(ipClaimsCondition.Reason).To(gomega.Equal(infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Reason))
+	})
 
 	t.Run("when VSphereVM Spec has address pool references", func(t *testing.T) {
 		vsphereVM := &infrav1.VSphereVM{

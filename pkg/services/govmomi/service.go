@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -39,6 +40,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
@@ -50,6 +52,11 @@ import (
 	govmominet "sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/net"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/pci"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
+)
+
+const (
+	bootstrapSecretKubeletServingCertKey = "kubelet-serving.crt"
+	bootstrapSecretKubeletServingKeyKey  = "kubelet-serving.key"
 )
 
 // VMService provdes API to interact with the VMs using govmomi.
@@ -90,7 +97,7 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 		// but sometimes this error is transient, for instance, if the storage was temporarily disconnected but
 		// later recovered, the machine will recover from this error.
 		if wasNotFoundByBIOSUUID(err) {
-			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.NotFoundByBIOSUUIDReason, clusterv1.ConditionSeverityWarning, err.Error())
+			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.NotFoundByBIOSUUIDReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 			v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
 				Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
@@ -113,10 +120,13 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 			})
 		}
 
+		log := ctrl.LoggerFrom(ctx)
+
 		// Get the bootstrap data.
+		log.Info("Preparing bootstrap data for new VM create")
 		bootstrapData, format, err := vms.getBootstrapData(ctx, vmCtx)
 		if err != nil {
-			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.CloningFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.CloningFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 			v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
 				Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
@@ -125,11 +135,13 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 			})
 			return vm, err
 		}
+		log.Info("Prepared bootstrap data for new VM create", "format", string(format), "bytes", len(bootstrapData))
 
 		// Create the VM.
+		log.Info("Calling createVM", "format", string(format), "bootstrapBytes", len(bootstrapData))
 		err = createVM(ctx, vmCtx, bootstrapData, format)
 		if err != nil {
-			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.CloningFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.CloningFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 			v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
 				Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
@@ -138,6 +150,10 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 			})
 			return vm, err
 		}
+		if err := persistResourceSlotBackfill(ctx, vmCtx); err != nil {
+			return vm, err
+		}
+		log.Info("createVM call completed")
 		return vm, nil
 	}
 
@@ -172,6 +188,16 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 		return vm, err
 	}
 
+	// Discover persistent-disk identifiers before the first power-on so we can
+	// update guestinfo user-data with a durable reconcile service.
+	if err := vms.reconcilePersistentDiskStatuses(ctx, virtualMachineCtx); err != nil {
+		return vm, err
+	}
+
+	if ok, err := vms.reconcileBootstrapUserData(ctx, virtualMachineCtx); err != nil || !ok {
+		return vm, err
+	}
+
 	if ok, err := vms.reconcileMetadata(ctx, virtualMachineCtx); err != nil || !ok {
 		return vm, err
 	}
@@ -197,7 +223,7 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 	}
 
 	if err := vms.reconcileTags(ctx, virtualMachineCtx); err != nil {
-		conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.TagsAttachmentFailedReason, clusterv1.ConditionSeverityError, err.Error())
+		conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.TagsAttachmentFailedReason, clusterv1.ConditionSeverityError, "%s", err.Error())
 		v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
 			Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 			Status:  metav1.ConditionFalse,
@@ -244,7 +270,6 @@ func (vms *VMService) DestroyVM(ctx context.Context, vmCtx *capvcontext.VMContex
 		return reconcile.Result{}, vm, err
 	}
 
-	//
 	// At this point we know the VM exists, so it needs to be destroyed.
 	//
 
@@ -254,6 +279,13 @@ func (vms *VMService) DestroyVM(ctx context.Context, vmCtx *capvcontext.VMContex
 		Obj:       object.NewVirtualMachine(vmCtx.Session.Client.Client, vmRef),
 		Ref:       vmRef,
 		State:     &vm,
+	}
+
+	// Detach persistent disks before destruction to prevent them from being deleted.
+	if virtualMachineCtx.ResourceSlot != nil && len(virtualMachineCtx.ResourceSlot.PersistentDisks) > 0 {
+		if err := vms.detachPersistentDisks(ctx, virtualMachineCtx); err != nil {
+			return reconcile.Result{}, vm, errors.Wrapf(err, "failed to detach persistent disks for vm %s", virtualMachineCtx)
+		}
 	}
 
 	// Shut down the VM
@@ -343,7 +375,7 @@ func (vms *VMService) reconcileIPAddresses(ctx context.Context, virtualMachineCt
 		return false, err
 	}
 	if errors.Is(err, ipam.ErrWaitingForIPAddr) {
-		conditions.MarkFalse(virtualMachineCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.WaitingForIPAddressReason, clusterv1.ConditionSeverityInfo, err.Error())
+		conditions.MarkFalse(virtualMachineCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.WaitingForIPAddressReason, clusterv1.ConditionSeverityInfo, "%s", err.Error())
 		v1beta2conditions.Set(virtualMachineCtx.VSphereVM, metav1.Condition{
 			Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 			Status:  metav1.ConditionFalse,
@@ -364,7 +396,17 @@ func (vms *VMService) reconcileMetadata(ctx context.Context, virtualMachineCtx *
 		return false, err
 	}
 
-	newMetadata, err := util.GetMachineMetadata(virtualMachineCtx.VSphereVM.Name, *virtualMachineCtx.VSphereVM, virtualMachineCtx.IPAMState, virtualMachineCtx.State.Network...)
+	var persistentDisks []infrav1.PersistentDisk
+	if virtualMachineCtx.ResourceSlot != nil {
+		persistentDisks = virtualMachineCtx.ResourceSlot.PersistentDisks
+	}
+
+	hostname := virtualMachineCtx.VSphereVM.Name
+	if virtualMachineCtx.ResourceSlot != nil {
+		hostname = virtualMachineCtx.ResourceSlot.Hostname
+	}
+
+	newMetadata, err := util.GetMachineMetadata(hostname, *virtualMachineCtx.VSphereVM, virtualMachineCtx.IPAMState, persistentDisks, virtualMachineCtx.State.Network...)
 	if err != nil {
 		return false, err
 	}
@@ -397,7 +439,7 @@ func (vms *VMService) reconcilePowerState(ctx context.Context, virtualMachineCtx
 		log.Info("Powering on VM")
 		task, err := virtualMachineCtx.Obj.PowerOn(ctx)
 		if err != nil {
-			conditions.MarkFalse(virtualMachineCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.PoweringOnFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+			conditions.MarkFalse(virtualMachineCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.PoweringOnFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 			v1beta2conditions.Set(virtualMachineCtx.VSphereVM, metav1.Condition{
 				Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
@@ -604,6 +646,14 @@ func (vms *VMService) reconcilePCIDevices(ctx context.Context, virtualMachineCtx
 }
 
 func (vms *VMService) getMetadata(ctx context.Context, virtualMachineCtx *virtualMachineContext) (string, error) {
+	return vms.getGuestInfoValue(ctx, virtualMachineCtx, guestInfoKeyMetadata)
+}
+
+func (vms *VMService) getUserData(ctx context.Context, virtualMachineCtx *virtualMachineContext) (string, error) {
+	return vms.getGuestInfoValue(ctx, virtualMachineCtx, guestInfoKeyUserData)
+}
+
+func (vms *VMService) getGuestInfoValue(ctx context.Context, virtualMachineCtx *virtualMachineContext, key string) (string, error) {
 	var (
 		obj mo.VirtualMachine
 
@@ -618,22 +668,22 @@ func (vms *VMService) getMetadata(ctx context.Context, virtualMachineCtx *virtua
 		return "", nil
 	}
 
-	var metadataBase64 string
+	var base64Value string
 	for _, ec := range obj.Config.ExtraConfig {
-		if optVal := ec.GetOptionValue(); optVal != nil && optVal.Key == guestInfoKeyMetadata {
+		if optVal := ec.GetOptionValue(); optVal != nil && optVal.Key == key {
 			if v, ok := optVal.Value.(string); ok {
-				metadataBase64 = v
+				base64Value = v
 			}
 		}
 	}
 
-	if metadataBase64 == "" {
+	if base64Value == "" {
 		return "", nil
 	}
 
-	metadataBuf, err := base64.StdEncoding.DecodeString(metadataBase64)
+	metadataBuf, err := base64.StdEncoding.DecodeString(base64Value)
 	if err != nil {
-		return "", errors.Wrapf(err, "unable to decode metadata for %s", virtualMachineCtx)
+		return "", errors.Wrapf(err, "unable to decode guestinfo %s for %s", key, virtualMachineCtx)
 	}
 
 	return string(metadataBuf), nil
@@ -667,6 +717,109 @@ func (vms *VMService) setMetadata(ctx context.Context, virtualMachineCtx *virtua
 	return task.Reference().Value, nil
 }
 
+func (vms *VMService) setUserData(ctx context.Context, virtualMachineCtx *virtualMachineContext, userData []byte, format bootstrapv1.Format) (string, error) {
+	var extraConfig extra.Config
+
+	switch format {
+	case bootstrapv1.CloudConfig:
+		extraConfig.SetCloudInitUserData(userData)
+	case bootstrapv1.Ignition:
+		extraConfig.SetIgnitionUserData(userData)
+	default:
+		return "", errors.Errorf("unsupported bootstrap format %q for vm %s", format, virtualMachineCtx)
+	}
+
+	task, err := virtualMachineCtx.Obj.Reconfigure(ctx, types.VirtualMachineConfigSpec{
+		ExtraConfig: extraConfig,
+	})
+	if err != nil {
+		return "", errors.Wrapf(err, "unable to set user data on vm %s", virtualMachineCtx)
+	}
+
+	return task.Reference().Value, nil
+}
+
+func (vms *VMService) reconcileBootstrapUserData(ctx context.Context, virtualMachineCtx *virtualMachineContext) (bool, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	powerState, err := vms.getPowerState(ctx, virtualMachineCtx)
+	if err != nil {
+		return false, err
+	}
+	if powerState != infrav1.VirtualMachinePowerStatePoweredOff {
+		return true, nil
+	}
+
+	bootstrapData, format, err := vms.getBootstrapData(ctx, &virtualMachineCtx.VMContext)
+	if err != nil {
+		return false, err
+	}
+	if format != bootstrapv1.CloudConfig {
+		return true, nil
+	}
+
+	existingUserData, err := vms.getUserData(ctx, virtualMachineCtx)
+	if err != nil {
+		return false, err
+	}
+
+	mergedUserData := bootstrapData
+	if hasKubeletServingCertUserData(existingUserData) {
+		// Preserve the existing kubelet serving cert payload so user-data stays stable
+		// across reconciles before the VM powers on.
+		mergedUserData = []byte(existingUserData)
+	}
+
+	if virtualMachineCtx.ResourceSlot != nil && len(virtualMachineCtx.ResourceSlot.PersistentDisks) > 0 {
+		diskConfig, err := util.GetPersistentDiskCloudConfig(virtualMachineCtx.ResourceSlot.PersistentDisks)
+		if err != nil {
+			return false, err
+		}
+		if len(diskConfig) > 0 {
+			mergedUserData, err = util.MergeCloudConfigUserData(mergedUserData, diskConfig)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+
+	if !hasKubeletServingCertUserData(existingUserData) {
+		kubeletServingCertConfig, err := vms.buildKubeletServingCertCloudConfig(ctx, virtualMachineCtx)
+		if err != nil {
+			return false, err
+		}
+		if len(kubeletServingCertConfig) > 0 {
+			mergedUserData, err = util.MergeCloudConfigUserData(mergedUserData, kubeletServingCertConfig)
+			if err != nil {
+				return false, err
+			}
+		}
+	} else {
+		log.Info("Reusing existing kubelet serving cert bootstrap data")
+	}
+
+	if string(mergedUserData) == existingUserData {
+		return true, nil
+	}
+
+	log.Info("Updating VM user-data with bootstrap extensions")
+	taskRef, err := vms.setUserData(ctx, virtualMachineCtx, mergedUserData, format)
+	if err != nil {
+		return false, err
+	}
+	virtualMachineCtx.VSphereVM.Status.TaskRef = taskRef
+	log.Info("Wait for VM user-data to be updated")
+	return false, nil
+}
+
+func hasKubeletServingCertUserData(userData string) bool {
+	if userData == "" {
+		return false
+	}
+	return strings.Contains(userData, "/etc/kubernetes/pki/kubelet.crt") &&
+		strings.Contains(userData, "/etc/kubernetes/pki/kubelet.key")
+}
+
 func (vms *VMService) getNetworkStatus(ctx context.Context, virtualMachineCtx *virtualMachineContext) ([]infrav1.NetworkStatus, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -692,18 +845,13 @@ func (vms *VMService) getNetworkStatus(ctx context.Context, virtualMachineCtx *v
 func (vms *VMService) getBootstrapData(ctx context.Context, vmCtx *capvcontext.VMContext) ([]byte, bootstrapv1.Format, error) {
 	log := ctrl.LoggerFrom(ctx)
 
-	if vmCtx.VSphereVM.Spec.BootstrapRef == nil {
+	secret, err := vms.getBootstrapSecret(ctx, vmCtx)
+	if err != nil {
+		return nil, "", err
+	}
+	if secret == nil {
 		log.Info("VM has no bootstrap data")
 		return nil, "", nil
-	}
-
-	secret := &corev1.Secret{}
-	secretKey := apitypes.NamespacedName{
-		Namespace: vmCtx.VSphereVM.Spec.BootstrapRef.Namespace,
-		Name:      vmCtx.VSphereVM.Spec.BootstrapRef.Name,
-	}
-	if err := vmCtx.Client.Get(ctx, secretKey, secret); err != nil {
-		return nil, "", errors.Wrapf(err, "failed to get bootstrap data secret for %s", vmCtx)
 	}
 
 	format, ok := secret.Data["format"]
@@ -717,7 +865,92 @@ func (vms *VMService) getBootstrapData(ctx context.Context, vmCtx *capvcontext.V
 		return nil, "", errors.New("error retrieving bootstrap data: secret value key is missing")
 	}
 
+	log.Info("Loaded bootstrap data", "format", string(format), "bytes", len(value), "hasResourceSlot", vmCtx.ResourceSlot != nil)
+
 	return value, bootstrapv1.Format(format), nil
+}
+
+func (vms *VMService) getBootstrapSecret(ctx context.Context, vmCtx *capvcontext.VMContext) (*corev1.Secret, error) {
+	if vmCtx.VSphereVM.Spec.BootstrapRef == nil {
+		return nil, nil
+	}
+
+	secret := &corev1.Secret{}
+	secretKey := apitypes.NamespacedName{
+		Namespace: vmCtx.VSphereVM.Spec.BootstrapRef.Namespace,
+		Name:      vmCtx.VSphereVM.Spec.BootstrapRef.Name,
+	}
+	if err := vmCtx.Client.Get(ctx, secretKey, secret); err != nil {
+		return nil, errors.Wrapf(err, "failed to get bootstrap data secret for %s", vmCtx)
+	}
+	return secret, nil
+}
+
+func (vms *VMService) buildKubeletServingCertCloudConfig(ctx context.Context, virtualMachineCtx *virtualMachineContext) ([]byte, error) {
+	clusterName := virtualMachineCtx.VSphereVM.Labels[clusterv1.ClusterNameLabel]
+	if clusterName == "" {
+		return nil, nil
+	}
+
+	caSecret := &corev1.Secret{}
+	caSecretKey := apitypes.NamespacedName{
+		Namespace: virtualMachineCtx.VSphereVM.Namespace,
+		Name:      fmt.Sprintf("%s-ca", clusterName),
+	}
+	if err := virtualMachineCtx.Client.Get(ctx, caSecretKey, caSecret); err != nil {
+		return nil, errors.Wrapf(err, "failed to get cluster CA secret for %s", virtualMachineCtx)
+	}
+
+	caCert, ok := caSecret.Data["tls.crt"]
+	if !ok || len(caCert) == 0 {
+		return nil, errors.Errorf("cluster CA secret %s/%s is missing tls.crt", caSecretKey.Namespace, caSecretKey.Name)
+	}
+	caKey, ok := caSecret.Data["tls.key"]
+	if !ok || len(caKey) == 0 {
+		return nil, errors.Errorf("cluster CA secret %s/%s is missing tls.key", caSecretKey.Namespace, caSecretKey.Name)
+	}
+
+	hostname := virtualMachineCtx.VSphereVM.Name
+	if virtualMachineCtx.ResourceSlot != nil && virtualMachineCtx.ResourceSlot.Hostname != "" {
+		hostname = virtualMachineCtx.ResourceSlot.Hostname
+	}
+
+	bootstrapSecret, err := vms.getBootstrapSecret(ctx, &virtualMachineCtx.VMContext)
+	if err != nil {
+		return nil, err
+	}
+	if bootstrapSecret == nil {
+		return nil, nil
+	}
+	if bootstrapSecret.Data == nil {
+		bootstrapSecret.Data = map[string][]byte{}
+	}
+
+	kubeletCertPEM := bootstrapSecret.Data[bootstrapSecretKubeletServingCertKey]
+	kubeletKeyPEM := bootstrapSecret.Data[bootstrapSecretKubeletServingKeyKey]
+	if len(kubeletCertPEM) == 0 || len(kubeletKeyPEM) == 0 {
+		kubeletCertPEM, kubeletKeyPEM, err = util.NewKubeletServingCertData(
+			hostname,
+			*virtualMachineCtx.VSphereVM,
+			virtualMachineCtx.IPAMState,
+			caCert,
+			caKey,
+			virtualMachineCtx.State.Network...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if len(kubeletCertPEM) == 0 || len(kubeletKeyPEM) == 0 {
+			return nil, nil
+		}
+		bootstrapSecret.Data[bootstrapSecretKubeletServingCertKey] = kubeletCertPEM
+		bootstrapSecret.Data[bootstrapSecretKubeletServingKeyKey] = kubeletKeyPEM
+		if err := virtualMachineCtx.Client.Update(ctx, bootstrapSecret); err != nil {
+			return nil, errors.Wrapf(err, "failed to persist kubelet serving cert data to bootstrap secret for %s", virtualMachineCtx)
+		}
+	}
+
+	return util.GetKubeletServingCertCloudConfigFromPEM(kubeletCertPEM, kubeletKeyPEM)
 }
 
 func (vms *VMService) reconcileVMGroupInfo(ctx context.Context, virtualMachineCtx *virtualMachineContext) (bool, error) {
@@ -781,5 +1014,198 @@ func (vms *VMService) reconcileClusterModuleMembership(ctx context.Context, virt
 		}
 		virtualMachineCtx.VSphereVM.Status.ModuleUUID = virtualMachineCtx.ClusterModuleInfo
 	}
+	return nil
+}
+
+func (vms *VMService) detachPersistentDisks(ctx context.Context, virtualMachineCtx *virtualMachineContext) error {
+	log := ctrl.LoggerFrom(ctx)
+	devices, err := virtualMachineCtx.Obj.Device(ctx)
+	if err != nil {
+		return err
+	}
+
+	disks := devices.SelectByType((*types.VirtualDisk)(nil))
+	var deviceChanges []types.BaseVirtualDeviceConfigSpec
+
+	if virtualMachineCtx.ResourceSlot == nil {
+		return nil
+	}
+
+	for _, d := range disks {
+		disk := d.(*types.VirtualDisk)
+		if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+			for _, pd := range virtualMachineCtx.ResourceSlot.PersistentDisks {
+				match := false
+				if pd.VolumePath != "" && backing.FileName == pd.VolumePath {
+					match = true
+				} else if pd.UnitNumber != nil && disk.UnitNumber != nil && *pd.UnitNumber == *disk.UnitNumber {
+					match = true
+				}
+
+				if match {
+					log.Info("Detaching persistent disk", "disk", pd.Name, "path", backing.FileName, "unit", disk.UnitNumber)
+					deviceChanges = append(deviceChanges, &types.VirtualDeviceConfigSpec{
+						Operation: types.VirtualDeviceConfigSpecOperationRemove,
+						Device:    disk,
+					})
+					break
+				}
+			}
+		}
+	}
+
+	if len(deviceChanges) > 0 {
+		task, err := virtualMachineCtx.Obj.Reconfigure(ctx, types.VirtualMachineConfigSpec{
+			DeviceChange: deviceChanges,
+		})
+		if err != nil {
+			return err
+		}
+		return task.Wait(ctx)
+	}
+
+	return nil
+}
+
+func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtualMachineCtx *virtualMachineContext) error {
+	if virtualMachineCtx.ResourceSlot == nil || len(virtualMachineCtx.ResourceSlot.PersistentDisks) == 0 {
+		return nil
+	}
+
+	devices, err := virtualMachineCtx.Obj.Device(ctx)
+	if err != nil {
+		return err
+	}
+
+	disks := devices.SelectByType((*types.VirtualDisk)(nil))
+	updated := false
+	usedDiskKeys := map[int32]struct{}{}
+
+	for i := range virtualMachineCtx.ResourceSlot.PersistentDisks {
+		pd := &virtualMachineCtx.ResourceSlot.PersistentDisks[i]
+		disk := findPersistentDiskDevice(pd, disks, usedDiskKeys)
+		if disk == nil {
+			continue
+		}
+
+		usedDiskKeys[disk.Key] = struct{}{}
+		if pd.UnitNumber == nil && disk.UnitNumber != nil {
+			unitNumber := *disk.UnitNumber
+			pd.UnitNumber = &unitNumber
+			updated = true
+		}
+
+		if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+			if pd.VolumePath != backing.FileName {
+				pd.VolumePath = backing.FileName
+				updated = true
+			}
+			if pd.DiskUUID != backing.Uuid {
+				pd.DiskUUID = backing.Uuid
+				updated = true
+			}
+		}
+	}
+
+	if updated {
+		return persistResourceSlotBackfill(ctx, &virtualMachineCtx.VMContext)
+	}
+	return nil
+}
+
+func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDeviceList, usedDiskKeys map[int32]struct{}) *types.VirtualDisk {
+	if pd == nil {
+		return nil
+	}
+
+	if pd.UnitNumber != nil {
+		for _, d := range disks {
+			disk := d.(*types.VirtualDisk)
+			if disk.UnitNumber == nil || *disk.UnitNumber != *pd.UnitNumber {
+				continue
+			}
+			if _, used := usedDiskKeys[disk.Key]; used {
+				continue
+			}
+			return disk
+		}
+	}
+
+	expectedCapacityKB := int64(pd.SizeGiB) * 1024 * 1024
+	var match *types.VirtualDisk
+	for _, d := range disks {
+		disk := d.(*types.VirtualDisk)
+		if _, used := usedDiskKeys[disk.Key]; used {
+			continue
+		}
+		if disk.CapacityInKB != expectedCapacityKB {
+			continue
+		}
+		if match != nil {
+			return nil
+		}
+		match = disk
+	}
+	return match
+}
+
+func persistResourceSlotBackfill(ctx context.Context, vmCtx *capvcontext.VMContext) error {
+	if vmCtx == nil || vmCtx.Client == nil || vmCtx.ResourceSlot == nil {
+		return nil
+	}
+
+	machine, err := util.GetOwnerVSphereMachine(ctx, vmCtx.Client, vmCtx.VSphereVM.ObjectMeta)
+	if err != nil || machine == nil || machine.Spec.ResourcePoolRef == nil {
+		return err
+	}
+
+	pool := &infrav1.VSphereResourcePool{}
+	if err := vmCtx.Client.Get(ctx, client.ObjectKey{
+		Namespace: machine.Spec.ResourcePoolRef.Namespace,
+		Name:      machine.Spec.ResourcePoolRef.Name,
+	}, pool); err != nil {
+		return errors.Wrapf(err, "failed to get resource pool for vm %s", vmCtx.VSphereVM.Name)
+	}
+
+	updated := false
+	for i := range pool.Spec.Resources {
+		if pool.Spec.Resources[i].Hostname != vmCtx.ResourceSlot.Hostname {
+			continue
+		}
+		for j := range pool.Spec.Resources[i].PersistentDisks {
+			pdInSpec := &pool.Spec.Resources[i].PersistentDisks[j]
+			for _, updatedDisk := range vmCtx.ResourceSlot.PersistentDisks {
+				if pdInSpec.Name != updatedDisk.Name {
+					continue
+				}
+				if (pdInSpec.UnitNumber == nil) != (updatedDisk.UnitNumber == nil) || (pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber) {
+					if updatedDisk.UnitNumber == nil {
+						pdInSpec.UnitNumber = nil
+					} else {
+						unitNumber := *updatedDisk.UnitNumber
+						pdInSpec.UnitNumber = &unitNumber
+					}
+					updated = true
+				}
+				if pdInSpec.VolumePath != updatedDisk.VolumePath {
+					pdInSpec.VolumePath = updatedDisk.VolumePath
+					updated = true
+				}
+				if pdInSpec.DiskUUID != updatedDisk.DiskUUID {
+					pdInSpec.DiskUUID = updatedDisk.DiskUUID
+					updated = true
+				}
+			}
+		}
+	}
+
+	if !updated {
+		return nil
+	}
+
+	if err := vmCtx.Client.Update(ctx, pool); err != nil {
+		return errors.Wrapf(err, "failed to persist resource pool disk backfill for vm %s", vmCtx.VSphereVM.Name)
+	}
+
 	return nil
 }

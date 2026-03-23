@@ -28,8 +28,10 @@ network:
   ethernets:
     {{- range $i, $net := .Devices }}
     id{{ $i }}:
+      {{- if $net.MACAddr }}
       match:
         macaddress: "{{ $net.MACAddr }}"
+      {{- end }}
       {{- if $net.DeviceName }}
       set-name: "{{ $net.DeviceName }}"
       {{- else }}

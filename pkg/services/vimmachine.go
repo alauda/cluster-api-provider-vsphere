@@ -150,6 +150,11 @@ func (v *VimMachineService) ReconcileNormal(ctx context.Context, machineCtx capv
 	if !ok {
 		return false, errors.New("received unexpected VIMMachineContext type")
 	}
+
+	if err := v.reconcileResourcePool(ctx, vimMachineCtx); err != nil {
+		return false, err
+	}
+
 	vsphereVM, err := v.findVSphereVM(ctx, vimMachineCtx)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return false, err
@@ -159,6 +164,11 @@ func (v *VimMachineService) ReconcileNormal(ctx context.Context, machineCtx capv
 	ctx = ctrl.LoggerInto(ctx, log)
 	vm, err := v.createOrPatchVSphereVM(ctx, vimMachineCtx, vsphereVM)
 	if err != nil {
+		return false, err
+	}
+
+	// Persist any changes back to the ResourcePool (e.g. backfilled VolumePath)
+	if err := v.persistResourcePoolChanges(ctx, vimMachineCtx); err != nil {
 		return false, err
 	}
 
@@ -356,6 +366,9 @@ func (v *VimMachineService) createOrPatchVSphereVM(ctx context.Context, vimMachi
 		if vm.Labels == nil {
 			vm.Labels = map[string]string{}
 		}
+		if vm.Annotations == nil {
+			vm.Annotations = map[string]string{}
+		}
 
 		// Ensure the VSphereVM has a label that can be used when searching for
 		// resources associated with the target cluster.
@@ -371,9 +384,25 @@ func (v *VimMachineService) createOrPatchVSphereVM(ctx context.Context, vimMachi
 		// clone spec.
 		vimMachineCtx.VSphereMachine.Spec.VirtualMachineCloneSpec.DeepCopyInto(&vm.Spec.VirtualMachineCloneSpec)
 
+		if vimMachineCtx.ResourceSlot != nil {
+			vm.Annotations["infrastructure.cluster.x-k8s.io/resource-slot-hostname"] = vimMachineCtx.ResourceSlot.Hostname
+			v.mergeSlotNetwork(vm, vimMachineCtx.ResourceSlot.Network)
+			v.mergeSlotPersistentDisks(vm, vimMachineCtx.ResourceSlot.PersistentDisks)
+		}
+
 		// If Failure Domain is present on CAPI machine, use that to override the vm clone spec.
 		if overrideFunc, ok := v.generateOverrideFunc(ctx, vimMachineCtx); ok {
 			overrideFunc(vm)
+		}
+
+		if vimMachineCtx.ResourceSlot != nil {
+			datacenter, err := ResolveResourcePoolDatacenterFromRef(ctx, v.Client, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef, vimMachineCtx.ResourceSlot)
+			if err != nil {
+				return err
+			}
+			if datacenter != "" {
+				vm.Spec.Datacenter = datacenter
+			}
 		}
 
 		// Several of the VSphereVM's clone spec properties can be derived
@@ -552,5 +581,158 @@ func mergeNetworkConfigurationInNetworkDeviceSpec(device *infrav1.NetworkDeviceS
 	if len(nc.AddressesFromPools) > 0 {
 		device.AddressesFromPools = make([]corev1.TypedLocalObjectReference, len(nc.AddressesFromPools))
 		copy(device.AddressesFromPools, nc.AddressesFromPools)
+	}
+}
+
+func (v *VimMachineService) reconcileResourcePool(ctx context.Context, vimMachineCtx *capvcontext.VIMMachineContext) error {
+	if vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef == nil {
+		return nil
+	}
+	log := ctrl.LoggerFrom(ctx)
+	log.Info("Reconciling ResourcePool", "pool", klog.KRef(vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef.Namespace, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef.Name))
+
+	desiredDatacenter, err := v.resolveDesiredDatacenter(ctx, vimMachineCtx)
+	if err != nil {
+		return errors.Wrap(err, "failed to resolve desired datacenter for resource pool allocation")
+	}
+
+	allowedFailureDomainDatacenters, err := v.resolveFailureDomainDatacenters(ctx, vimMachineCtx)
+	if err != nil {
+		return errors.Wrap(err, "failed to resolve failure domain datacenters for resource pool allocation")
+	}
+
+	slot, err := AllocateSlot(ctx, v.Client, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef, vimMachineCtx.VSphereMachine, desiredDatacenter, allowedFailureDomainDatacenters)
+	if err != nil {
+		return errors.Wrap(err, "failed to allocate slot from pool")
+	}
+	vimMachineCtx.ResourceSlot = slot
+	if vimMachineCtx.VSphereMachine.Spec.Datacenter == "" && slot != nil && slot.Datacenter != "" {
+		vimMachineCtx.VSphereMachine.Spec.Datacenter = slot.Datacenter
+	}
+	return nil
+}
+
+func (v *VimMachineService) resolveDesiredDatacenter(ctx context.Context, vimMachineCtx *capvcontext.VIMMachineContext) (string, error) {
+	if vimMachineCtx == nil || vimMachineCtx.VSphereMachine == nil {
+		return "", nil
+	}
+
+	desiredDatacenter := vimMachineCtx.VSphereMachine.Spec.Datacenter
+	if desiredDatacenter != "" {
+		if _, err := v.resolveFailureDomainDatacenters(ctx, vimMachineCtx); err != nil {
+			return "", err
+		}
+		return desiredDatacenter, nil
+	}
+
+	return "", nil
+}
+
+func (v *VimMachineService) resolveFailureDomainDatacenters(ctx context.Context, vimMachineCtx *capvcontext.VIMMachineContext) ([]string, error) {
+	if vimMachineCtx == nil || vimMachineCtx.Machine == nil || vimMachineCtx.Machine.Spec.FailureDomain == nil {
+		return nil, nil
+	}
+
+	var vsphereDeploymentZone infrav1.VSphereDeploymentZone
+	if err := v.Client.Get(ctx, client.ObjectKey{Name: *vimMachineCtx.Machine.Spec.FailureDomain}, &vsphereDeploymentZone); err != nil {
+		return nil, err
+	}
+
+	var vsphereFailureDomain infrav1.VSphereFailureDomain
+	if err := v.Client.Get(ctx, client.ObjectKey{Name: vsphereDeploymentZone.Spec.FailureDomain}, &vsphereFailureDomain); err != nil {
+		return nil, err
+	}
+
+	if vsphereFailureDomain.Spec.Topology.Datacenter != "" {
+		return []string{vsphereFailureDomain.Spec.Topology.Datacenter}, nil
+	}
+	return nil, nil
+}
+
+func (v *VimMachineService) persistResourcePoolChanges(ctx context.Context, vimMachineCtx *capvcontext.VIMMachineContext) error {
+	if vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef == nil || vimMachineCtx.ResourceSlot == nil {
+		return nil
+	}
+
+	pool := &infrav1.VSphereResourcePool{}
+	if err := v.Client.Get(ctx, client.ObjectKey{Namespace: vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef.Namespace, Name: vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef.Name}, pool); err != nil {
+		return err
+	}
+
+	updated := false
+	for i := range pool.Spec.Resources {
+		if pool.Spec.Resources[i].Hostname == vimMachineCtx.ResourceSlot.Hostname {
+			// Update the persistent disks status in the pool based on what was backfilled in the context
+			pool.Spec.Resources[i].PersistentDisks = vimMachineCtx.ResourceSlot.PersistentDisks
+			updated = true
+			break
+		}
+	}
+
+	if updated {
+		// Note: Updating Spec here might be controversial, but it's required to persist VolumePath
+		return v.Client.Update(ctx, pool)
+	}
+	return nil
+}
+
+func (v *VimMachineService) mergeSlotNetwork(vm *infrav1.VSphereVM, slotNetworks []infrav1.NetworkConfig) {
+	if len(slotNetworks) == 0 {
+		return
+	}
+	// Use slot networks to override or append to vm devices
+	newDevices := make([]infrav1.NetworkDeviceSpec, 0, max(len(vm.Spec.Network.Devices), len(slotNetworks)))
+	for i := 0; i < len(slotNetworks) || i < len(vm.Spec.Network.Devices); i++ {
+		var dev infrav1.NetworkDeviceSpec
+		if i < len(vm.Spec.Network.Devices) {
+			dev = vm.Spec.Network.Devices[i]
+		}
+		if i < len(slotNetworks) {
+			sn := slotNetworks[i]
+			slotProvidesStaticIP := sn.IP != "" || sn.IPv6 != ""
+			dev.NetworkName = sn.NetworkName
+			if sn.IP != "" {
+				dev.IPAddrs = []string{sn.IP}
+				dev.DHCP4 = false
+			}
+			if sn.Gateway != "" {
+				dev.Gateway4 = sn.Gateway
+			}
+			if sn.IPv6 != "" {
+				dev.IPAddrs = append(dev.IPAddrs, sn.IPv6)
+				dev.DHCP6 = false
+			}
+			if sn.IPv6Gateway != "" {
+				dev.Gateway6 = sn.IPv6Gateway
+			}
+			if len(sn.DNS) > 0 {
+				dev.Nameservers = sn.DNS
+			}
+			if slotProvidesStaticIP {
+				// Slot-provided addresses take precedence over CAPV IPAM/DHCP inputs.
+				dev.AddressesFromPools = nil
+			}
+		}
+		newDevices = append(newDevices, dev)
+	}
+	vm.Spec.Network.Devices = newDevices
+}
+
+func (v *VimMachineService) mergeSlotPersistentDisks(vm *infrav1.VSphereVM, persistentDisks []infrav1.PersistentDisk) {
+	for _, pd := range persistentDisks {
+		found := false
+		for i, existing := range vm.Spec.DataDisks {
+			if existing.Name == pd.Name {
+				vm.Spec.DataDisks[i].SizeGiB = pd.SizeGiB
+				found = true
+				break
+			}
+		}
+		if !found {
+			vm.Spec.DataDisks = append(vm.Spec.DataDisks, infrav1.VSphereDisk{
+				Name:    pd.Name,
+				SizeGiB: pd.SizeGiB,
+			})
+		}
 	}
 }

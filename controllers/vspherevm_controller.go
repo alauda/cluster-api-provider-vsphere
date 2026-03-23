@@ -170,6 +170,94 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		return ctrl.Result{}, err
 	}
 
+	originalTaskRef := vsphereVM.Status.TaskRef
+	// Always issue a patch when exiting this function so changes to the
+	// resource are patched back to the API server, even on early returns.
+	defer func() {
+		// Before computing ready condition, make sure that VirtualMachineProvisioned is always set.
+		// NOTE: This is required because v1beta2 conditions comply to guideline requiring conditions to be set at the
+		// first reconcile.
+		if c := v1beta2conditions.Get(vsphereVM, infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition); c == nil {
+			if vsphereVM.Status.Ready {
+				v1beta2conditions.Set(vsphereVM, metav1.Condition{
+					Type:   infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+					Status: metav1.ConditionTrue,
+					Reason: infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Reason,
+				})
+			} else {
+				v1beta2conditions.Set(vsphereVM, metav1.Condition{
+					Type:   infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+					Status: metav1.ConditionFalse,
+					Reason: infrav1.VSphereVMVirtualMachineNotProvisionedV1Beta2Reason,
+				})
+			}
+		}
+
+		// always update the readyCondition.
+		conditions.SetSummary(vsphereVM,
+			conditions.WithConditions(
+				infrav1.VCenterAvailableCondition,
+				infrav1.IPAddressClaimedCondition,
+				infrav1.VMProvisionedCondition,
+			),
+		)
+
+		if err := v1beta2conditions.SetSummaryCondition(vsphereVM, vsphereVM, infrav1.VSphereVMReadyV1Beta2Condition,
+			v1beta2conditions.ForConditionTypes{
+				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
+				infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+			},
+			v1beta2conditions.IgnoreTypesIfMissing{
+				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
+				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+			},
+			// Using a custom merge strategy to override reasons applied during merge.
+			v1beta2conditions.CustomMergeStrategy{
+				MergeStrategy: v1beta2conditions.DefaultMergeStrategy(
+					// Use custom reasons.
+					v1beta2conditions.ComputeReasonFunc(v1beta2conditions.GetDefaultComputeMergeReasonFunc(
+						infrav1.VSphereVMNotReadyV1Beta2Reason,
+						infrav1.VSphereVMReadyUnknownV1Beta2Reason,
+						infrav1.VSphereVMReadyV1Beta2Reason,
+					)),
+				),
+			},
+		); err != nil {
+			reterr = kerrors.NewAggregate([]error{reterr, errors.Wrapf(err, "failed to set %s condition", infrav1.VSphereVMReadyV1Beta2Condition)})
+			return
+		}
+
+		if err := patchHelper.Patch(ctx, vsphereVM, patch.WithOwnedV1Beta2Conditions{Conditions: []string{
+			infrav1.VSphereVMReadyV1Beta2Condition,
+			infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
+			infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+			infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+			infrav1.VSphereVMGuestSoftPowerOffSucceededV1Beta2Condition,
+			infrav1.VSphereVMPCIDevicesDetachedV1Beta2Condition,
+			clusterv1.PausedV1Beta2Condition,
+		}}); err != nil {
+			reterr = kerrors.NewAggregate([]error{reterr, err})
+		}
+
+		// Wait until VSphereVM is updated in the cache if the `.Status.TaskRef` field changes.
+		// Note: We have to do this because otherwise using a cached client in current state could
+		// return a stale state of a VSphereVM we just patched (because the cache might be stale).
+		// This can lead to duplicate tasks being triggered (e.g. VM deletion) and make the controller
+		// wait for longer then required.
+		if vsphereVM.Status.TaskRef != originalTaskRef {
+			err = wait.PollUntilContextTimeout(ctx, 5*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+				key := ctrlclient.ObjectKey{Namespace: vsphereVM.GetNamespace(), Name: vsphereVM.GetName()}
+				cachedVSphereVM := &infrav1.VSphereVM{}
+				if err := r.Client.Get(ctx, key, cachedVSphereVM); err != nil {
+					return false, err
+				}
+				return originalTaskRef != cachedVSphereVM.Status.TaskRef, nil
+			})
+			reterr = kerrors.NewAggregate([]error{reterr, err})
+		}
+	}()
+
 	authSession, err := r.retrieveVcenterSession(ctx, vsphereVM)
 	if err != nil {
 		conditions.MarkFalse(vsphereVM, infrav1.VCenterAvailableCondition, infrav1.VCenterUnreachableReason, clusterv1.ConditionSeverityError, err.Error())
@@ -254,91 +342,39 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		PatchHelper:              patchHelper,
 	}
 
+	if vsphereMachine.Spec.ResourcePoolRef != nil {
+		slot, err := services.GetSlotForMachine(ctx, r.Client, vsphereMachine.Spec.ResourcePoolRef, &corev1.ObjectReference{
+			Namespace: vsphereMachine.Namespace,
+			Name:      vsphereMachine.Name,
+			UID:       vsphereMachine.UID,
+		})
+		if err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to get resource slot for VSphereMachine %s", vsphereMachine.Name)
+		}
+		if slot == nil {
+			if hostname := vsphereVM.Annotations["infrastructure.cluster.x-k8s.io/resource-slot-hostname"]; hostname != "" {
+				pool := &infrav1.VSphereResourcePool{}
+				if err := r.Client.Get(ctx, apitypes.NamespacedName{
+					Namespace: vsphereMachine.Spec.ResourcePoolRef.Namespace,
+					Name:      vsphereMachine.Spec.ResourcePoolRef.Name,
+				}, pool); err != nil {
+					return reconcile.Result{}, errors.Wrapf(err, "failed to get resource pool %s for VSphereMachine %s", vsphereMachine.Spec.ResourcePoolRef.Name, vsphereMachine.Name)
+				}
+				for i := range pool.Spec.Resources {
+					if pool.Spec.Resources[i].Hostname == hostname {
+						slot = &pool.Spec.Resources[i]
+						break
+					}
+				}
+			}
+		}
+		vmContext.ResourceSlot = slot
+	}
+
 	// Print the task-ref upon entry and upon exit.
 	log.V(4).Info("VSphereVM.Status.TaskRef OnEntry", "taskRef", vmContext.VSphereVM.Status.TaskRef)
 	defer func() {
 		log.V(4).Info("VSphereVM.Status.TaskRef OnExit", "taskRef", vmContext.VSphereVM.Status.TaskRef)
-	}()
-	originalTaskRef := vmContext.VSphereVM.Status.TaskRef
-
-	// Always issue a patch when exiting this function so changes to the
-	// resource are patched back to the API server.
-	defer func() {
-		// Before computing ready condition, make sure that VirtualMachineProvisioned is always set.
-		// NOTE: This is required because v1beta2 conditions comply to guideline requiring conditions to be set at the
-		// first reconcile.
-		if c := v1beta2conditions.Get(vmContext.VSphereVM, infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition); c != nil {
-			if vmContext.VSphereVM.Status.Ready {
-				v1beta2conditions.Set(vmContext.VSphereVM, metav1.Condition{
-					Type:   infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
-					Status: metav1.ConditionTrue,
-					Reason: infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Reason,
-				})
-			} else {
-				v1beta2conditions.Set(vmContext.VSphereVM, metav1.Condition{
-					Type:   infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
-					Status: metav1.ConditionFalse,
-					Reason: infrav1.VSphereVMVirtualMachineNotProvisionedV1Beta2Reason,
-				})
-			}
-		}
-
-		// always update the readyCondition.
-		conditions.SetSummary(vmContext.VSphereVM,
-			conditions.WithConditions(
-				infrav1.VCenterAvailableCondition,
-				infrav1.IPAddressClaimedCondition,
-				infrav1.VMProvisionedCondition,
-			),
-		)
-
-		if err := v1beta2conditions.SetSummaryCondition(vmContext.VSphereVM, vmContext.VSphereVM, infrav1.VSphereVMReadyV1Beta2Condition,
-			v1beta2conditions.ForConditionTypes{
-				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
-				infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
-				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
-			},
-			v1beta2conditions.IgnoreTypesIfMissing{
-				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
-				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
-			},
-			// Using a custom merge strategy to override reasons applied during merge.
-			v1beta2conditions.CustomMergeStrategy{
-				MergeStrategy: v1beta2conditions.DefaultMergeStrategy(
-					// Use custom reasons.
-					v1beta2conditions.ComputeReasonFunc(v1beta2conditions.GetDefaultComputeMergeReasonFunc(
-						infrav1.VSphereVMNotReadyV1Beta2Reason,
-						infrav1.VSphereVMReadyUnknownV1Beta2Reason,
-						infrav1.VSphereVMReadyV1Beta2Reason,
-					)),
-				),
-			},
-		); err != nil {
-			reterr = kerrors.NewAggregate([]error{reterr, errors.Wrapf(err, "failed to set %s condition", infrav1.VSphereVMReadyV1Beta2Condition)})
-			return
-		}
-
-		// Patch the VSphereVM resource.
-		if err := vmContext.Patch(ctx); err != nil {
-			reterr = kerrors.NewAggregate([]error{reterr, err})
-		}
-
-		// Wait until VSphereVM is updated in the cache if the `.Status.TaskRef` field changes.
-		// Note: We have to do this because otherwise using a cached client in current state could
-		// return a stale state of a VSphereVM we just patched (because the cache might be stale).
-		// This can lead to duplicate tasks being triggered (e.g. VM deletion) and make the controller
-		// wait for longer then required.
-		if vmContext.VSphereVM.Status.TaskRef != originalTaskRef {
-			err = wait.PollUntilContextTimeout(ctx, 5*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-				key := ctrlclient.ObjectKey{Namespace: vmContext.VSphereVM.GetNamespace(), Name: vmContext.VSphereVM.GetName()}
-				cachedVSphereVM := &infrav1.VSphereVM{}
-				if err := r.Client.Get(ctx, key, cachedVSphereVM); err != nil {
-					return false, err
-				}
-				return originalTaskRef != cachedVSphereVM.Status.TaskRef, nil
-			})
-			reterr = kerrors.NewAggregate([]error{reterr, err})
-		}
 	}()
 
 	return r.reconcile(ctx, vmContext, fetchClusterModuleInput{
@@ -403,6 +439,34 @@ func (r vmReconciler) reconcileDelete(ctx context.Context, vmCtx *capvcontext.VM
 	if vm.State != infrav1.VirtualMachineStateNotFound {
 		log.Info(fmt.Sprintf("VM state is %q, waiting for %q", vm.State, infrav1.VirtualMachineStateNotFound))
 		return reconcile.Result{}, nil
+	}
+
+	// AFTER PHYSICAL DELETION IS CONFIRMED: Release the resource pool slot.
+	// The owner VSphereMachine may already be gone, so fall back to the owner ref and
+	// locate the pool by status assignment when necessary.
+	machineRef, err := util.GetOwnerVSphereMachineRef(vmCtx.VSphereVM.ObjectMeta)
+	if err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine owner reference for VSphereVM")
+	}
+	if machineRef != nil {
+		var poolRef *corev1.ObjectReference
+
+		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine for VSphereVM")
+		}
+		if machine != nil {
+			poolRef = machine.Spec.ResourcePoolRef
+		}
+		if poolRef == nil {
+			poolRef, err = services.FindResourcePoolForMachine(ctx, r.Client, vmCtx.VSphereVM.Namespace, machineRef)
+			if err != nil {
+				return reconcile.Result{}, errors.Wrapf(err, "failed to find resource pool for VSphereVM")
+			}
+		}
+		if err := services.ReleaseSlot(ctx, r.Client, poolRef, machineRef); err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to release slot for VM")
+		}
 	}
 
 	// Attempt to delete the node corresponding to the vsphere VM
@@ -481,6 +545,10 @@ func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VM
 	if err := r.reconcileIPAddressClaims(ctx, vmCtx); err != nil {
 		return reconcile.Result{}, err
 	}
+	if !conditions.IsTrue(vmCtx.VSphereVM, infrav1.IPAddressClaimedCondition) {
+		log.Info("VM is waiting for IP address claims to be fulfilled")
+		return reconcile.Result{}, nil
+	}
 
 	// Get or create the VM.
 	vm, err := r.VMService.ReconcileVM(ctx, vmCtx)
@@ -536,6 +604,17 @@ func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VM
 		Status: metav1.ConditionTrue,
 		Reason: infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Reason,
 	})
+
+	// Persist discovered paths back to the pool
+	if vmCtx.ResourceSlot != nil {
+		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
+		if err == nil && machine != nil && machine.Spec.ResourcePoolRef != nil {
+			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.ResourcePoolRef, vmCtx.ResourceSlot); err != nil {
+				return reconcile.Result{}, errors.Wrapf(err, "failed to persist slot changes for vm %s", vmCtx.VSphereVM.Name)
+			}
+		}
+	}
+
 	log.Info("VSphereVM is ready")
 	return reconcile.Result{}, nil
 }

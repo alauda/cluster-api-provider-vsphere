@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -38,6 +39,7 @@ import (
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/extra"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/template"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
 const (
@@ -61,8 +63,10 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 		VSphereVM:                vmCtx.VSphereVM,
 		Session:                  vmCtx.Session,
 		PatchHelper:              vmCtx.PatchHelper,
+		ResourceSlot:             vmCtx.ResourceSlot,
 	}
 	log.Info("Starting clone process")
+	log.Info("Clone received bootstrap payload", "format", string(format), "bootstrapBytes", len(bootstrapData), "hasResourceSlot", vmCtx.ResourceSlot != nil)
 
 	var extraConfig extra.Config
 	if len(bootstrapData) > 0 {
@@ -73,6 +77,18 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 		case bootstrapv1.Ignition:
 			extraConfig.SetIgnitionUserData(bootstrapData)
 		}
+	}
+	if format == bootstrapv1.CloudConfig {
+		hostname := vmCtx.VSphereVM.Name
+		if vmCtx.ResourceSlot != nil {
+			hostname = vmCtx.ResourceSlot.Hostname
+		}
+		metadata, err := util.GetMachineMetadata(hostname, *vmCtx.VSphereVM, nil, nil)
+		if err != nil {
+			return errors.Wrapf(err, "failed to build initial cloud-init metadata for %q", vmCtx)
+		}
+		log.Info("Applied initial cloud-init metadata to VM clone spec")
+		extraConfig.SetCloudInitMetadata(metadata)
 	}
 	if vmCtx.VSphereVM.Spec.CustomVMXKeys != nil {
 		log.Info("Applied custom VMX keys to VM clone spec")
@@ -153,7 +169,7 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 
 	// Process all DataDisks definitions to dynamically create and add disks to the VM
 	if len(vmCtx.VSphereVM.Spec.DataDisks) > 0 {
-		dataDisks, err := createDataDisks(ctx, vmCtx.VSphereVM.Spec.DataDisks, devices)
+		dataDisks, err := createDataDisks(ctx, vmCtx, devices)
 		if err != nil {
 			return errors.Wrapf(err, "error getting data disks")
 		}
@@ -423,9 +439,10 @@ func getDiskConfigSpec(disk *types.VirtualDisk, diskCloneCapacityKB int64) (type
 }
 
 // createDataDisks parses through the list of VSphereDisk objects and generates the VirtualDeviceConfigSpec for each one.
-func createDataDisks(ctx context.Context, dataDiskDefs []infrav1.VSphereDisk, devices object.VirtualDeviceList) ([]types.BaseVirtualDeviceConfigSpec, error) {
+func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices object.VirtualDeviceList) ([]types.BaseVirtualDeviceConfigSpec, error) {
 	log := ctrl.LoggerFrom(ctx)
 	additionalDisks := []types.BaseVirtualDeviceConfigSpec{}
+	storageProfileIDs := map[string]string{}
 
 	disks := devices.SelectByType((*types.VirtualDisk)(nil))
 	if len(disks) == 0 {
@@ -435,10 +452,9 @@ func createDataDisks(ctx context.Context, dataDiskDefs []infrav1.VSphereDisk, de
 	// There is at least one disk
 	primaryDisk := disks[0].(*types.VirtualDisk)
 
-	// Get the controller of the primary disk.
-	controller, ok := devices.FindByKey(primaryDisk.ControllerKey).(types.BaseVirtualController)
-	if !ok {
-		return nil, errors.Errorf("unable to find controller with key=%v", primaryDisk.ControllerKey)
+	controller, err := getDataDiskController(devices, primaryDisk)
+	if err != nil {
+		return nil, err
 	}
 
 	controllerKey := controller.GetVirtualController().Key
@@ -447,14 +463,35 @@ func createDataDisks(ctx context.Context, dataDiskDefs []infrav1.VSphereDisk, de
 		return nil, err
 	}
 
-	for i, dataDisk := range dataDiskDefs {
+	for i, dataDisk := range vmCtx.VSphereVM.Spec.DataDisks {
 		log.V(2).Info("Adding disk", "name", dataDisk.Name, "spec", dataDisk)
+
+		// ADDITION: Check for persistent disk in ResourceSlot
+		var pd *infrav1.PersistentDisk
+		if vmCtx.ResourceSlot != nil {
+			for j := range vmCtx.ResourceSlot.PersistentDisks {
+				if vmCtx.ResourceSlot.PersistentDisks[j].Name == dataDisk.Name {
+					pd = &vmCtx.ResourceSlot.PersistentDisks[j]
+					break
+				}
+			}
+		}
 
 		backing := &types.VirtualDiskFlatVer2BackingInfo{
 			DiskMode: string(types.VirtualDiskModePersistent),
 			VirtualDeviceFileBackingInfo: types.VirtualDeviceFileBackingInfo{
 				FileName: "",
 			},
+		}
+
+		// ADDITION: Backfill VolumePath if available
+		if pd != nil && pd.VolumePath != "" {
+			backing.FileName = pd.VolumePath
+		} else if pd != nil && pd.Datastore != "" {
+			// Reconfigure VM disk creation allows datastore selection via the backing file path.
+			// Use a datastore-qualified file name placeholder so each persistent disk can land on
+			// its own datastore without changing the VM-level datastore selection.
+			backing.FileName = datastoreFileHint(pd.Datastore)
 		}
 
 		// Set provisioning type for the new data disk.
@@ -484,23 +521,85 @@ func createDataDisks(ctx context.Context, dataDiskDefs []infrav1.VSphereDisk, de
 		vd := dev.GetVirtualDevice()
 		vd.ControllerKey = controllerKey
 
-		// Assign unit number to the new disk.  Should be next available slot on the controller.
-		unitNumber, err := unitNumberAssigner.assign()
-		if err != nil {
-			return nil, err
+		// MODIFICATION: Assign unit number, favoring fixed unit number if provided
+		var unitNumber int32
+		if pd != nil && pd.UnitNumber != nil {
+			unitNumber = *pd.UnitNumber
+			unitNumberAssigner.markUsed(unitNumber)
+		} else {
+			unitNumber, err = unitNumberAssigner.assign()
+			if err != nil {
+				return nil, err
+			}
+			if pd != nil {
+				pd.UnitNumber = &unitNumber
+			}
 		}
 		vd.UnitNumber = &unitNumber
 
 		log.V(4).Info("Created device for data disk device", "name", dataDisk.Name, "spec", dataDisk, "device", dev)
 
-		additionalDisks = append(additionalDisks, &types.VirtualDeviceConfigSpec{
-			Device:        dev,
-			Operation:     types.VirtualDeviceConfigSpecOperationAdd,
-			FileOperation: types.VirtualDeviceConfigSpecFileOperationCreate,
-		})
+		spec := &types.VirtualDeviceConfigSpec{
+			Device:    dev,
+			Operation: types.VirtualDeviceConfigSpecOperationAdd,
+		}
+
+		// ADDITION: Only create the file if we don't have an existing VolumePath
+		if pd == nil || pd.VolumePath == "" {
+			spec.FileOperation = types.VirtualDeviceConfigSpecFileOperationCreate
+		}
+
+		if pd != nil && pd.StoragePolicy != "" {
+			profileID, ok := storageProfileIDs[pd.StoragePolicy]
+			if !ok {
+				pbmClient, err := pbm.NewClient(ctx, vmCtx.Session.Client.Client)
+				if err != nil {
+					return nil, errors.Wrap(err, "unable to create pbm client for persistent disk storage policy")
+				}
+				profileID, err = pbmClient.ProfileIDByName(ctx, pd.StoragePolicy)
+				if err != nil {
+					return nil, errors.Wrapf(err, "unable to get storageProfileID from name %s for persistent disk %s", pd.StoragePolicy, pd.Name)
+				}
+				storageProfileIDs[pd.StoragePolicy] = profileID
+			}
+			spec.Profile = []types.BaseVirtualMachineProfileSpec{
+				&types.VirtualMachineDefinedProfileSpec{ProfileId: profileID},
+			}
+		}
+
+		additionalDisks = append(additionalDisks, spec)
 	}
 
 	return additionalDisks, nil
+}
+
+func datastoreFileHint(datastore string) string {
+	ds := strings.TrimSpace(datastore)
+	if ds == "" {
+		return ""
+	}
+	return fmt.Sprintf("[%s]", ds)
+}
+
+func getDataDiskController(devices object.VirtualDeviceList, primaryDisk *types.VirtualDisk) (types.BaseVirtualController, error) {
+	controller, ok := devices.FindByKey(primaryDisk.ControllerKey).(types.BaseVirtualController)
+	if !ok {
+		return nil, errors.Errorf("unable to find controller with key=%v", primaryDisk.ControllerKey)
+	}
+
+	if _, ok := controller.(types.BaseVirtualSCSIController); ok {
+		return controller, nil
+	}
+
+	for _, device := range devices {
+		_, isSCSIController := device.(types.BaseVirtualSCSIController)
+		controller, isController := device.(types.BaseVirtualController)
+		if isSCSIController && isController {
+			return controller, nil
+		}
+	}
+
+	return nil, errors.Errorf("unable to find SCSI controller for data disks, primary disk controller with key=%v is not SCSI", primaryDisk.ControllerKey)
 }
 
 type unitNumberAssigner struct {
@@ -530,6 +629,13 @@ func newUnitNumberAssigner(controller types.BaseVirtualController, existingDevic
 
 	// Set offset to 0, it will auto-increment on the first assignment.
 	return &unitNumberAssigner{used: used, offset: 0}, nil
+}
+
+// ADDITION: markUsed marks a specific unit number as used.
+func (a *unitNumberAssigner) markUsed(unit int32) {
+	if unit >= 0 && int(unit) < len(a.used) {
+		a.used[unit] = true
+	}
 }
 
 func (a *unitNumberAssigner) assign() (int32, error) {

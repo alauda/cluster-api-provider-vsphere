@@ -127,10 +127,11 @@ func (r vmReconciler) reconcileIPAddressClaims(ctx context.Context, vmCtx *capvc
 				return errors.Wrap(err, "failed to aggregate Ready condition from IPAddressClaims")
 			}
 		} else {
+			conditions.MarkTrue(vmCtx.VSphereVM, infrav1.IPAddressClaimedCondition)
 			v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
 				Type:   infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
 				Status: metav1.ConditionTrue,
-				Reason: infrav1.VSphereVMIPAddressClaimsNotFulfilledV1Beta2Reason,
+				Reason: infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Reason,
 			})
 		}
 		return nil

@@ -21,14 +21,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	pkgerrors "github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -36,6 +43,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	"sigs.k8s.io/cluster-api/util/finalizers"
+	kcfg "sigs.k8s.io/cluster-api/util/kubeconfig"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/paused"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -50,6 +58,19 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
 	infrautilv1 "sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
+)
+
+var (
+	modulePluginGVK = schema.GroupVersionKind{
+		Group:   "cluster.alauda.io",
+		Version: "v1alpha1",
+		Kind:    "ModulePlugin",
+	}
+	appReleaseGVR = schema.GroupVersionResource{
+		Group:    "operator.alauda.io",
+		Version:  "v1alpha1",
+		Resource: "appreleases",
+	}
 )
 
 type clusterReconciler struct {
@@ -327,7 +348,237 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 
 	clusterCtx.VSphereCluster.Status.Ready = true
 
+	if err := r.reconcileKubeOvnAppRelease(ctx, clusterCtx); err != nil {
+		return reconcile.Result{}, err
+	}
+
 	return reconcile.Result{}, nil
+}
+
+func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clusterCtx *capvcontext.ClusterContext) error {
+	cluster := clusterCtx.Cluster
+	if cluster == nil || cluster.Annotations["cpaas.io/network-type"] != "kube-ovn" {
+		return nil
+	}
+	var err error
+
+	targetVersion := cluster.Annotations["cpaas.io/kube-ovn-version"]
+	joinCIDR := cluster.Annotations["cpaas.io/kube-ovn-join-cidr"]
+	registry := cluster.Annotations["cpaas.io/registry-address"]
+	if registry == "" {
+		return fmt.Errorf("cpaas.io/registry-address annotation is required to deploy kube-ovn")
+	}
+
+	if targetVersion == "" {
+		modulePlugin := &unstructured.Unstructured{}
+		modulePlugin.SetAPIVersion(modulePluginGVK.GroupVersion().String())
+		modulePlugin.SetKind(modulePluginGVK.Kind)
+		if err := r.Client.Get(ctx, client.ObjectKey{Name: "kube-ovn"}, modulePlugin); err != nil {
+			return pkgerrors.Wrap(err, "failed to get kube-ovn ModulePlugin")
+		}
+		var found bool
+		targetVersion, found, err = unstructured.NestedString(modulePlugin.Object, "status", "latestVersion")
+		if err != nil {
+			return pkgerrors.Wrap(err, "failed to read kube-ovn ModulePlugin status.latestVersion")
+		}
+		if !found || targetVersion == "" {
+			return fmt.Errorf("kube-ovn module plugin latestVersion is empty")
+		}
+	}
+
+	podCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, true)
+	serviceCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, false)
+	if podCIDR == "" || serviceCIDR == "" {
+		return fmt.Errorf("cluster network pod/service CIDR must be set before deploying kube-ovn")
+	}
+
+	clientset, restConfig, err := r.newRemoteClients(ctx, cluster)
+	if err != nil {
+		return err
+	}
+
+	imagePullSecrets, err := sentryImagePullSecrets(ctx, clientset)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	appRelease := buildKubeOvnAppRelease(cluster, registry, targetVersion, podCIDR, serviceCIDR, joinCIDR, imagePullSecrets)
+	dc, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return pkgerrors.Wrap(err, "failed to create dynamic client for workload cluster")
+	}
+
+	current, err := dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Get(ctx, appRelease.GetName(), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, err = dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Create(ctx, appRelease, metav1.CreateOptions{})
+		return err
+	}
+	if err != nil {
+		return pkgerrors.Wrap(err, "failed to get existing kube-ovn AppRelease")
+	}
+
+	if !reflect.DeepEqual(current.Object["spec"], appRelease.Object["spec"]) {
+		current.Object["spec"] = appRelease.Object["spec"]
+		_, err = dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Update(ctx, current, metav1.UpdateOptions{})
+		if err != nil {
+			return pkgerrors.Wrap(err, "failed to update kube-ovn AppRelease")
+		}
+	}
+
+	return nil
+}
+
+func (r *clusterReconciler) newRemoteClients(ctx context.Context, cluster *clusterv1.Cluster) (kubernetes.Interface, *rest.Config, error) {
+	clusterKey := client.ObjectKey{Namespace: cluster.Namespace, Name: cluster.Name}
+	kubeconfig, err := kcfg.FromSecret(ctx, r.Client, clusterKey)
+	if err != nil {
+		return nil, nil, pkgerrors.Wrapf(err, "failed to retrieve kubeconfig secret for Cluster %q in namespace %q", cluster.Name, cluster.Namespace)
+	}
+
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return nil, nil, pkgerrors.Wrapf(err, "failed to create rest config for Cluster %q in namespace %q", cluster.Name, cluster.Namespace)
+	}
+	restConfig.Timeout = 10 * time.Second
+
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, nil, pkgerrors.Wrap(err, "failed to create workload clientset")
+	}
+
+	return clientset, restConfig, nil
+}
+
+func firstCIDRBlock(network *clusterv1.ClusterNetwork, pod bool) string {
+	if network == nil {
+		return ""
+	}
+	if pod && network.Pods != nil && len(network.Pods.CIDRBlocks) > 0 {
+		return network.Pods.CIDRBlocks[0]
+	}
+	if !pod && network.Services != nil && len(network.Services.CIDRBlocks) > 0 {
+		return network.Services.CIDRBlocks[0]
+	}
+	return ""
+}
+
+func sentryImagePullSecrets(ctx context.Context, clientset kubernetes.Interface) ([]interface{}, error) {
+	sa, err := clientset.CoreV1().ServiceAccounts("cpaas-system").Get(ctx, "sentry", metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if len(sa.ImagePullSecrets) == 0 {
+		return nil, nil
+	}
+	secrets := make([]interface{}, 0, len(sa.ImagePullSecrets))
+	for _, s := range sa.ImagePullSecrets {
+		secrets = append(secrets, s.Name)
+	}
+	return secrets, nil
+}
+
+func buildKubeOvnAppRelease(
+	cluster *clusterv1.Cluster,
+	registry string,
+	targetVersion string,
+	podCIDR string,
+	serviceCIDR string,
+	joinCIDR string,
+	imagePullSecrets []interface{},
+) *unstructured.Unstructured {
+	host := cluster.Spec.ControlPlaneEndpoint.Host
+	if host == "" {
+		host = cluster.Name
+	}
+	appRelease := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": appReleaseGVR.GroupVersion().String(),
+			"kind":       "AppRelease",
+			"metadata": map[string]interface{}{
+				"name":      "cni-kube-ovn",
+				"namespace": "cpaas-system",
+				"annotations": map[string]interface{}{
+					"auto-recycle":  "true",
+					"interval-sync": "true",
+				},
+			},
+			"spec": map[string]interface{}{
+				"destination": map[string]interface{}{
+					"cluster":   "",
+					"namespace": "",
+				},
+				"source": map[string]interface{}{
+					"repoURL": registry,
+					"charts": []interface{}{
+						map[string]interface{}{
+							"name":           "acp/chart-cpaas-kube-ovn",
+							"releaseName":    "cpaas-kube-ovn",
+							"targetRevision": targetVersion,
+						},
+					},
+				},
+				"timeout": int64(120),
+				"values": map[string]interface{}{
+					"func": map[string]interface{}{
+						"ENABLE_OVN_LB_PREFER_LOCAL": false,
+						"LS_CT_SKIP_DST_LPORT_IPS":   true,
+					},
+					"global": map[string]interface{}{
+						"albName":         "cpaas-system",
+						"labelBaseDomain": "cpaas.io",
+						"namespace":       "cpaas-system",
+						"platformUrl":     fmt.Sprintf("https://%s", host),
+						"region":          cluster.Name,
+						"scheme":          "https",
+						"host":            host,
+						"replicas":        int64(1),
+						"labels":          map[string]interface{}{},
+						"nodeSelector":    nil,
+						"tolerations":     nil,
+						"protectSecretFiles": map[string]interface{}{
+							"enabled": false,
+						},
+						"auth": map[string]interface{}{
+							"default_admin": "admin",
+						},
+						"cluster": map[string]interface{}{
+							"name":        cluster.Name,
+							"isGlobal":    false,
+							"networkType": "kube-ovn",
+							"type":        "Imported",
+						},
+						"registry": map[string]interface{}{
+							"address": registry,
+						},
+						"ingress": map[string]interface{}{
+							"ingressClassName": "cpaas-system",
+						},
+					},
+					"ipv4": map[string]interface{}{
+						"POD_CIDR":    podCIDR,
+						"SVC_CIDR":    serviceCIDR,
+						"JOIN_CIDR":   joinCIDR,
+						"POD_GATEWAY": "",
+					},
+					"networking": map[string]interface{}{
+						"NETWORK_TYPE":      "geneve",
+						"NET_STACK":         "ipv4",
+						"NODE_LOCAL_DNS_IP": "",
+						"EXCLUDE_IPS":       nil,
+						"IFACE":             "eth0",
+						"vlan": map[string]interface{}{
+							"VLAN_ID":             nil,
+							"VLAN_INTERFACE_NAME": "eth0",
+						},
+					},
+				},
+			},
+		},
+	}
+	if len(imagePullSecrets) > 0 {
+		_ = unstructured.SetNestedSlice(appRelease.Object, imagePullSecrets, "spec", "values", "global", "registry", "imagePullSecrets")
+	}
+	return appRelease
 }
 
 func (r *clusterReconciler) reconcileIdentitySecret(ctx context.Context, clusterCtx *capvcontext.ClusterContext) error {

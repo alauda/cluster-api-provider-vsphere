@@ -18,8 +18,15 @@ package govmomi
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	"github.com/vmware/govmomi/find"
@@ -28,8 +35,11 @@ import (
 	"github.com/vmware/govmomi/simulator"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/types"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
@@ -197,6 +207,87 @@ func Test_ReconcileStoragePolicy(t *testing.T) {
 	})
 }
 
+func Test_buildKubeletServingCertCloudConfig(t *testing.T) {
+	g := NewWithT(t)
+	vms := &VMService{}
+	caCertPEM, caKeyPEM := newTestCA(t)
+	bootstrapSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "bootstrap-secret",
+			Namespace: "cpaas-system",
+		},
+		Data: map[string][]byte{
+			"value": []byte("#cloud-config\n"),
+		},
+	}
+
+	vmCtx := emptyVirtualMachineContext()
+	vmCtx.Client = fake.NewClientBuilder().WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "capv-test-ca",
+				Namespace: "cpaas-system",
+			},
+			Data: map[string][]byte{
+				"tls.crt": caCertPEM,
+				"tls.key": caKeyPEM,
+			},
+		},
+		bootstrapSecret,
+	).Build()
+	vmCtx.VSphereVM = &infrav1.VSphereVM{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "capv-test-md-0-abcde",
+			Namespace: "cpaas-system",
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel: "capv-test",
+			},
+		},
+		Spec: infrav1.VSphereVMSpec{
+			VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+				Network: infrav1.NetworkSpec{
+					Devices: []infrav1.NetworkDeviceSpec{
+						{IPAddrs: []string{"192.168.132.20/20"}},
+						{IPAddrs: []string{"192.168.164.245/24"}},
+					},
+				},
+			},
+		},
+	}
+	vmCtx.ResourceSlot = &infrav1.ResourceSlot{Hostname: "worker-01"}
+	vmCtx.State = &infrav1.VirtualMachine{}
+	vmCtx.VSphereVM.Spec.BootstrapRef = &corev1.ObjectReference{
+		Kind:      "Secret",
+		Namespace: "cpaas-system",
+		Name:      "bootstrap-secret",
+	}
+
+	config, err := vms.buildKubeletServingCertCloudConfig(context.Background(), vmCtx)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(config).ToNot(BeEmpty())
+	g.Expect(string(config)).To(ContainSubstring("/etc/kubernetes/pki/kubelet.crt"))
+	g.Expect(string(config)).To(ContainSubstring("/etc/kubernetes/pki/kubelet.key"))
+	g.Expect(string(config)).ToNot(ContainSubstring("kubelet-serving-openssl.cnf"))
+
+	updatedSecret := &corev1.Secret{}
+	err = vmCtx.Client.Get(context.Background(), client.ObjectKey{Name: "bootstrap-secret", Namespace: "cpaas-system"}, updatedSecret)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingCertKey]).NotTo(BeEmpty())
+	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingKeyKey]).NotTo(BeEmpty())
+
+	firstCert := append([]byte(nil), updatedSecret.Data[bootstrapSecretKubeletServingCertKey]...)
+	firstKey := append([]byte(nil), updatedSecret.Data[bootstrapSecretKubeletServingKeyKey]...)
+
+	config, err = vms.buildKubeletServingCertCloudConfig(context.Background(), vmCtx)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(config).ToNot(BeEmpty())
+
+	err = vmCtx.Client.Get(context.Background(), client.ObjectKey{Name: "bootstrap-secret", Namespace: "cpaas-system"}, updatedSecret)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingCertKey]).To(Equal(firstCert))
+	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingKeyKey]).To(Equal(firstKey))
+}
+
 func getAuthSession(ctx context.Context, server string) (*session.Session, error) {
 	password, _ := simulator.DefaultLogin.Password()
 	return session.GetOrCreate(
@@ -205,6 +296,36 @@ func getAuthSession(ctx context.Context, server string) (*session.Session, error
 			WithUserInfo(simulator.DefaultLogin.Username(), password).
 			WithServer(fmt.Sprintf("http://%s", server)).
 			WithDatacenter("*"))
+}
+
+func newTestCA(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate CA key: %v", err)
+	}
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("failed to generate CA serial number: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: "test-ca",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("failed to create CA cert: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(caKey)})
 }
 
 func getPoweredoffVM(ctx context.Context, c *vim25.Client) (*object.VirtualMachine, error) {

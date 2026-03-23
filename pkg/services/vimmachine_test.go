@@ -24,13 +24,16 @@ import (
 	gomegatypes "github.com/onsi/gomega/types"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
+	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/context/fake"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
@@ -369,6 +372,94 @@ func Test_mergeNetworkConfigurationToNetworkDeviceSpec(t *testing.T) {
 	})
 }
 
+func Test_mergeSlotNetwork(t *testing.T) {
+	t.Run("slot static ip overrides CAPV IPAM inputs", func(t *testing.T) {
+		g := NewWithT(t)
+		service := &VimMachineService{}
+		apiGroup := "ipam.cluster.x-k8s.io"
+
+		vm := &infrav1.VSphereVM{
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					Network: infrav1.NetworkSpec{
+						Devices: []infrav1.NetworkDeviceSpec{
+							{
+								NetworkName: "original-network",
+								DHCP4:       true,
+								AddressesFromPools: []corev1.TypedLocalObjectReference{
+									{
+										APIGroup: &apiGroup,
+										Kind:     "IPPool",
+										Name:     "pool-a",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		service.mergeSlotNetwork(vm, []infrav1.NetworkConfig{
+			{
+				NetworkName: "slot-network",
+				IP:          "192.168.1.10/24",
+				Gateway:     "192.168.1.1",
+				DNS:         []string{"8.8.8.8"},
+			},
+		})
+
+		g.Expect(vm.Spec.Network.Devices).To(HaveLen(1))
+		g.Expect(vm.Spec.Network.Devices[0].NetworkName).To(Equal("slot-network"))
+		g.Expect(vm.Spec.Network.Devices[0].IPAddrs).To(Equal([]string{"192.168.1.10/24"}))
+		g.Expect(vm.Spec.Network.Devices[0].Gateway4).To(Equal("192.168.1.1"))
+		g.Expect(vm.Spec.Network.Devices[0].DHCP4).To(BeFalse())
+		g.Expect(vm.Spec.Network.Devices[0].Nameservers).To(Equal([]string{"8.8.8.8"}))
+		g.Expect(vm.Spec.Network.Devices[0].AddressesFromPools).To(BeNil())
+	})
+
+	t.Run("slot without ip keeps CAPV network allocation inputs", func(t *testing.T) {
+		g := NewWithT(t)
+		service := &VimMachineService{}
+		apiGroup := "ipam.cluster.x-k8s.io"
+
+		vm := &infrav1.VSphereVM{
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					Network: infrav1.NetworkSpec{
+						Devices: []infrav1.NetworkDeviceSpec{
+							{
+								NetworkName: "original-network",
+								DHCP4:       true,
+								AddressesFromPools: []corev1.TypedLocalObjectReference{
+									{
+										APIGroup: &apiGroup,
+										Kind:     "IPPool",
+										Name:     "pool-a",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		service.mergeSlotNetwork(vm, []infrav1.NetworkConfig{
+			{
+				NetworkName: "slot-network",
+			},
+		})
+
+		g.Expect(vm.Spec.Network.Devices).To(HaveLen(1))
+		g.Expect(vm.Spec.Network.Devices[0].NetworkName).To(Equal("slot-network"))
+		g.Expect(vm.Spec.Network.Devices[0].DHCP4).To(BeTrue())
+		g.Expect(vm.Spec.Network.Devices[0].IPAddrs).To(BeEmpty())
+		g.Expect(vm.Spec.Network.Devices[0].AddressesFromPools).To(HaveLen(1))
+		g.Expect(vm.Spec.Network.Devices[0].AddressesFromPools[0].Name).To(Equal("pool-a"))
+	})
+}
+
 func Test_VimMachineService_GetHostInfo(t *testing.T) {
 	var (
 		hostAddr = "1.2.3.4"
@@ -496,6 +587,59 @@ func Test_VimMachineService_createOrPatchVSphereVM(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(vmName).To(Equal(fakeLongClusterName))
 	})
+
+	t.Run("uses resource slot datacenter over failure domain datacenter", func(t *testing.T) {
+		g := NewWithT(t)
+		controllerManagerContext := fake.NewControllerManagerContext(getVSphereVM(hostAddr, corev1.ConditionTrue), deplZone("one"), failureDomain("one"))
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.Machine.SetName(fakeLongClusterName)
+		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
+		failureDomain := "zone-one"
+		machineCtx.Machine.Spec.FailureDomain = &failureDomain
+		machineCtx.ResourceSlot = &infrav1.ResourceSlot{
+			Hostname:   "worker-01",
+			Datacenter: "dc-slot",
+		}
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		vm, err := vimMachineService.createOrPatchVSphereVM(ctx, machineCtx, getVSphereVM(hostAddr, corev1.ConditionTrue))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(vm.Spec.Datacenter).To(Equal("dc-slot"))
+	})
+
+	t.Run("falls back to pool datacenter when slot datacenter is empty", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereResourcePool{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pool-1",
+				Namespace: fake.Namespace,
+			},
+			Spec: infrav1.VSphereResourcePoolSpec{
+				Datacenter: "dc-pool",
+				Resources: []infrav1.ResourceSlot{{
+					Hostname: "worker-01",
+				}},
+			},
+		}
+		controllerManagerContext := fake.NewControllerManagerContext(getVSphereVM(hostAddr, corev1.ConditionTrue), deplZone("one"), failureDomain("one"), pool)
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.Machine.SetName(fakeLongClusterName)
+		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
+		failureDomain := "zone-one"
+		machineCtx.Machine.Spec.FailureDomain = &failureDomain
+		machineCtx.VSphereMachine.Spec.ResourcePoolRef = &corev1.ObjectReference{
+			Name:      pool.Name,
+			Namespace: pool.Namespace,
+		}
+		machineCtx.ResourceSlot = &infrav1.ResourceSlot{
+			Hostname: "worker-01",
+		}
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		vm, err := vimMachineService.createOrPatchVSphereVM(ctx, machineCtx, getVSphereVM(hostAddr, corev1.ConditionTrue))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(vm.Spec.Datacenter).To(Equal("dc-pool"))
+	})
 }
 
 func Test_VimMachineService_reconcileProviderID(t *testing.T) {
@@ -566,6 +710,117 @@ func Test_VimMachineService_reconcileProviderID(t *testing.T) {
 		_, err := vimMachineService.reconcileProviderID(ctx, machineCtx, vsphereVM)
 		g.Expect(err).To(HaveOccurred())
 	})
+}
+
+func TestVimMachineServiceResolveResourcePoolDatacenterConstraints(t *testing.T) {
+	deplZone := func(suffix string) *infrav1.VSphereDeploymentZone {
+		return &infrav1.VSphereDeploymentZone{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("zone-%s", suffix)},
+			Spec: infrav1.VSphereDeploymentZoneSpec{
+				FailureDomain: fmt.Sprintf("fd-%s", suffix),
+			},
+		}
+	}
+
+	failureDomain := func(suffix string) *infrav1.VSphereFailureDomain {
+		return &infrav1.VSphereFailureDomain{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("fd-%s", suffix)},
+			Spec: infrav1.VSphereFailureDomainSpec{
+				Topology: infrav1.Topology{
+					Datacenter: fmt.Sprintf("dc-%s", suffix),
+				},
+			},
+		}
+	}
+
+	t.Run("uses template datacenter as hard requirement and still validates failure domain references", func(t *testing.T) {
+		g := NewWithT(t)
+		controllerManagerContext := fake.NewControllerManagerContext(deplZone("one"), failureDomain("one"))
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.VSphereMachine.Spec.Datacenter = "dc-template"
+		machineCtx.Machine.Spec.FailureDomain = ptr.To("zone-one")
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		desiredDatacenter, err := vimMachineService.resolveDesiredDatacenter(ctx, machineCtx)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(desiredDatacenter).To(Equal("dc-template"))
+
+		allowedDatacenters, err := vimMachineService.resolveFailureDomainDatacenters(ctx, machineCtx)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(allowedDatacenters).To(Equal([]string{"dc-one"}))
+	})
+
+	t.Run("uses failure domain datacenter filter when template datacenter is empty", func(t *testing.T) {
+		g := NewWithT(t)
+		controllerManagerContext := fake.NewControllerManagerContext(deplZone("one"), failureDomain("one"))
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.VSphereMachine.Spec.Datacenter = ""
+		machineCtx.Machine.Spec.FailureDomain = ptr.To("zone-one")
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		desiredDatacenter, err := vimMachineService.resolveDesiredDatacenter(ctx, machineCtx)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(desiredDatacenter).To(BeEmpty())
+
+		allowedDatacenters, err := vimMachineService.resolveFailureDomainDatacenters(ctx, machineCtx)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(allowedDatacenters).To(Equal([]string{"dc-one"}))
+	})
+
+	t.Run("returns an error when a configured failure domain cannot be resolved", func(t *testing.T) {
+		g := NewWithT(t)
+		controllerManagerContext := fake.NewControllerManagerContext()
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.VSphereMachine.Spec.Datacenter = "dc-template"
+		machineCtx.Machine.Spec.FailureDomain = ptr.To("zone-missing")
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		_, err := vimMachineService.resolveDesiredDatacenter(ctx, machineCtx)
+		g.Expect(err).To(HaveOccurred())
+	})
+}
+
+func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+	pool := &infrav1.VSphereResourcePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pool-1",
+			Namespace: fake.Namespace,
+		},
+		Spec: infrav1.VSphereResourcePoolSpec{
+			Datacenter: "dc-pool",
+			Resources: []infrav1.ResourceSlot{
+				{Hostname: "worker-01"},
+			},
+		},
+	}
+	client := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
+	machineCtx := &capvcontext.VIMMachineContext{
+		BaseMachineContext: &capvcontext.BaseMachineContext{
+			Machine: &clusterv1.Machine{},
+		},
+		VSphereMachine: &infrav1.VSphereMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "machine-1",
+				Namespace: fake.Namespace,
+				UID:       "machine-uid",
+			},
+		},
+	}
+	machineCtx.VSphereMachine.Spec.ResourcePoolRef = &corev1.ObjectReference{
+		Name:      pool.Name,
+		Namespace: pool.Namespace,
+	}
+	machineCtx.VSphereMachine.Spec.Datacenter = ""
+
+	vimMachineService := &VimMachineService{Client: client}
+	err := vimMachineService.reconcileResourcePool(ctx, machineCtx)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(machineCtx.ResourceSlot).NotTo(BeNil())
+	g.Expect(machineCtx.ResourceSlot.Datacenter).To(Equal("dc-pool"))
+	g.Expect(machineCtx.VSphereMachine.Spec.Datacenter).To(Equal("dc-pool"))
 }
 
 func Test_VimMachineService_reconcileNetwork(t *testing.T) {
@@ -927,7 +1182,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template which doesn't respect max length: trim to max length",
 			machineName: "quick-start-d34gt4-md-0-wqc85-8nxwc-gfd5v", // 41 characters
-			template:    ptr.To[string]("{{ .machine.name }}-{{ .machine.name }}"),
+			template:    ptr.To("{{ .machine.name }}-{{ .machine.name }}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("quick-start-d34gt4-md-0-wqc85-8nxwc-gfd5v-quick-start-d34gt4-md"), // 63 characters
 			},
@@ -935,7 +1190,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template for 20 characters: keep machine name if name has 20 characters",
 			machineName: "quick-md-8nxwc-gfd5v", // 20 characters
-			template:    ptr.To[string]("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
+			template:    ptr.To("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("quick-md-8nxwc-gfd5v"), // 20 characters
 			},
@@ -943,7 +1198,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template for 20 characters: trim to 20 characters if name has more than 20 characters",
 			machineName: "quick-start-d34gt4-md-0-wqc85-8nxwc-gfd5v", // 41 characters
-			template:    ptr.To[string]("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
+			template:    ptr.To("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("quick-start-d3-gfd5v"), // 20 characters
 			},
@@ -951,7 +1206,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template for 20 characters: trim to 19 characters if name has more than 20 characters and last character of prefix is -",
 			machineName: "quick-start-d-34gt4-md-0-wqc85-8nxwc-gfd5v", // 42 characters
-			template:    ptr.To[string]("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
+			template:    ptr.To("{{ if le (len .machine.name) 20 }}{{ .machine.name }}{{else}}{{ trimSuffix \"-\" (trunc 14 .machine.name) }}-{{ trunc -5 .machine.name }}{{end}}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("quick-start-d-gfd5v"), // 19 characters
 			},
@@ -959,7 +1214,7 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 		{
 			name:        "template with a prefix and only 5 random character from the machine name",
 			machineName: "quick-start-d-34gt4-md-0-wqc85-8nxwc-gfd5v", // 42 characters
-			template:    ptr.To[string]("vm-{{ trunc -5 .machine.name }}"),
+			template:    ptr.To("vm-{{ trunc -5 .machine.name }}"),
 			want: []gomegatypes.GomegaMatcher{
 				Equal("vm-gfd5v"), // 8 characters
 			},

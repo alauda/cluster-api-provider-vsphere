@@ -23,4 +23,5 @@ const (
 
 const (
 	guestInfoKeyMetadata = "guestinfo.metadata"
+	guestInfoKeyUserData = "guestinfo.userdata"
 )

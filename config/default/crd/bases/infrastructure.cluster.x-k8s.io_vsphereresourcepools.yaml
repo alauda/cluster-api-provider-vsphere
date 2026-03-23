@@ -1,0 +1,218 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: (unknown)
+  name: vsphereresourcepools.infrastructure.cluster.x-k8s.io
+spec:
+  group: infrastructure.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: VSphereResourcePool
+    listKind: VSphereResourcePoolList
+    plural: vsphereresourcepools
+    singular: vsphereresourcepool
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: VSphereResourcePool is the Schema for the vsphereresourcepools
+          API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: VSphereResourcePoolSpec defines the desired state of VSphereResourcePool.
+            properties:
+              datacenter:
+                description: Datacenter is the default vSphere datacenter for slots in this pool.
+                type: string
+              releaseDelayHours:
+                description: |-
+                  ReleaseDelayHours is the time to wait before marking a released slot as "Available" for any machine.
+                  During this period, the slot can only be reused if specifically requested or via priority reuse.
+                  Default is 24.
+                type: integer
+              resources:
+                description: Resources is the list of pre-defined resource slots.
+                items:
+                  description: ResourceSlot defines a single resource slot in the
+                    pool.
+                  properties:
+                    datacenter:
+                      description: Datacenter is the vSphere datacenter for this slot.
+                      type: string
+                    hostname:
+                      description: Hostname is the unique identifier for this slot
+                        and will be assigned to the VM.
+                      type: string
+                    network:
+                      description: Network configurations.
+                      items:
+                        description: NetworkConfig defines the network configuration
+                          for a slot.
+                        properties:
+                          dns:
+                            description: DNS nameservers
+                            items:
+                              type: string
+                            type: array
+                          gateway:
+                            type: string
+                          ip:
+                            description: IPv4 configuration
+                            type: string
+                          ipv6:
+                            description: IPv6 configuration
+                            type: string
+                          ipv6Gateway:
+                            type: string
+                          networkName:
+                            description: NetworkName is the name of the vSphere network
+                              (PortGroup or DVPortGroup).
+                            type: string
+                        required:
+                        - networkName
+                        type: object
+                      type: array
+                    persistentDisks:
+                      description: PersistentDisks that survive VM deletion.
+                      items:
+                        description: PersistentDisk defines a disk that survives VM
+                          deletion.
+                        properties:
+                          datastore:
+                            description: Datastore is the vSphere datastore name.
+                            type: string
+                          diskUUID:
+                            description: DiskUUID is backfilled by the controller.
+                            type: string
+                          fsFormat:
+                            description: FSFormat is the filesystem format (default
+                              "ext4").
+                            type: string
+                          mountOptions:
+                            description: MountOptions for the filesystem mount.
+                            items:
+                              type: string
+                            type: array
+                          mountPath:
+                            description: MountPath is the mount path inside the VM
+                              guest OS (e.g., "/var/lib/etcd").
+                            type: string
+                          name:
+                            description: Name is the disk name.
+                            type: string
+                          sizeGiB:
+                            description: SizeGiB is the disk size.
+                            format: int32
+                            type: integer
+                          storagePolicy:
+                            description: StoragePolicy is the vSphere storage policy
+                              name.
+                            type: string
+                          unitNumber:
+                            description: |-
+                              UnitNumber is the SCSI unit number for the disk (0-15, excluding 7).
+                              This ensures consistent disk ordering across VM recreations.
+                            format: int32
+                            type: integer
+                          volumePath:
+                            description: |-
+                              VolumePath is backfilled by the controller after the disk is created.
+                              For vSphere, this is usually the datastore path to the .vmdk file.
+                            type: string
+                        required:
+                        - name
+                        - sizeGiB
+                        type: object
+                      type: array
+                  required:
+                  - hostname
+                  type: object
+                type: array
+              server:
+                description: Server is the vCenter server address.
+                type: string
+              thumbprint:
+                description: Thumbprint is the vCenter certificate thumbprint.
+                type: string
+            required:
+            - resources
+            type: object
+            x-kubernetes-validations:
+            - message: each resource slot must define datacenter itself or inherit spec.datacenter
+              rule: self.resources.all(r, has(r.datacenter) || has(self.datacenter))
+          status:
+            description: VSphereResourcePoolStatus defines the observed state of VSphereResourcePool.
+            properties:
+              resourceStatuses:
+                description: ResourceStatuses tracks the state of each slot.
+                items:
+                  description: ResourceSlotStatus tracks the state of a single slot.
+                  properties:
+                    hostname:
+                      description: Hostname matches the Hostname in the Spec.
+                      type: string
+                    lastReclaimError:
+                      description: LastReclaimError stores the latest reclaim task
+                        failure.
+                      type: string
+                    lastReleasedTime:
+                      description: LastReleasedTime is the timestamp when the MachineRef
+                        was cleared.
+                      format: date-time
+                      type: string
+                    machineRef:
+                      $ref: '#/definitions/k8s.io~1api~1core~1v1~0ObjectReference'
+                      description: MachineRef is the reference to the Machine currently
+                        using this slot.
+                    reclaimTaskRef:
+                      description: ReclaimTaskRef tracks the in-flight vCenter task
+                        for reclaiming slot resources.
+                      type: string
+                    reclaimTaskState:
+                      description: ReclaimTaskState tracks the lifecycle of the reclaim
+                        task.
+                      type: string
+                    reclaimVolumePath:
+                      description: ReclaimVolumePath tracks the persistent disk currently
+                        being reclaimed.
+                      type: string
+                    retryAfter:
+                      description: RetryAfter prevents tight retry loops after reclaim
+                        task failures.
+                      format: date-time
+                      type: string
+                    state:
+                      description: 'State can be: Available, InUse, Released'
+                      type: string
+                  required:
+                  - hostname
+                  - state
+                  type: object
+                type: array
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
