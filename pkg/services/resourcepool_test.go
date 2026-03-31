@@ -25,6 +25,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -356,6 +358,101 @@ func TestResolveResourcePoolDatacenter(t *testing.T) {
 	g.Expect(ResolveResourcePoolDatacenter(nil, slotWithoutDatacenter)).To(BeEmpty())
 }
 
+func TestTryBindPoolToConsumer(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+
+	ctx := context.Background()
+	pool := &infrav1.VSphereResourcePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
+		Spec:       infrav1.VSphereResourcePoolSpec{Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
+	}
+
+	t.Run("binds unbound pool", func(t *testing.T) {
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool.DeepCopy()).Build()
+		err := TryBindPoolToConsumer(ctx, c, &corev1.ObjectReference{Name: "pool-a", Namespace: "default"}, &corev1.ObjectReference{
+			APIVersion: controlplanev1.GroupVersion.String(),
+			Kind:       "KubeadmControlPlane",
+			Namespace:  "default",
+			Name:       "cp-a",
+		})
+		g.Expect(err).NotTo(HaveOccurred())
+		updated := &infrav1.VSphereResourcePool{}
+		g.Expect(c.Get(ctx, client.ObjectKey{Name: "pool-a", Namespace: "default"}, updated)).To(Succeed())
+		g.Expect(updated.Spec.ConsumerRef).NotTo(BeNil())
+		g.Expect(updated.Spec.ConsumerRef.Name).To(Equal("cp-a"))
+	})
+
+	t.Run("rejects binding to different consumer", func(t *testing.T) {
+		p := pool.DeepCopy()
+		p.Spec.ConsumerRef = &corev1.ObjectReference{
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       "MachineDeployment",
+			Namespace:  "default",
+			Name:       "md-a",
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(p).Build()
+		err := TryBindPoolToConsumer(ctx, c, &corev1.ObjectReference{Name: "pool-a", Namespace: "default"}, &corev1.ObjectReference{
+			APIVersion: controlplanev1.GroupVersion.String(),
+			Kind:       "KubeadmControlPlane",
+			Namespace:  "default",
+			Name:       "cp-a",
+		})
+		g.Expect(err).To(HaveOccurred())
+	})
+
+	t.Run("allows idempotent bind to same consumer", func(t *testing.T) {
+		p := pool.DeepCopy()
+		p.Spec.ConsumerRef = &corev1.ObjectReference{
+			APIVersion: controlplanev1.GroupVersion.String(),
+			Kind:       "KubeadmControlPlane",
+			Namespace:  "default",
+			Name:       "cp-a",
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(p).Build()
+		err := TryBindPoolToConsumer(ctx, c, &corev1.ObjectReference{Name: "pool-a", Namespace: "default"}, &corev1.ObjectReference{
+			APIVersion: controlplanev1.GroupVersion.String(),
+			Kind:       "KubeadmControlPlane",
+			Namespace:  "default",
+			Name:       "cp-a",
+		})
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+}
+
+func TestIsPoolFullyReusable(t *testing.T) {
+	g := NewWithT(t)
+	pool := &infrav1.VSphereResourcePool{
+		Spec: infrav1.VSphereResourcePoolSpec{
+			Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}},
+		},
+		Status: infrav1.VSphereResourcePoolStatus{
+			ResourceStatuses: []infrav1.ResourceSlotStatus{{Hostname: "slot-1", State: "Available"}},
+		},
+	}
+	g.Expect(IsPoolFullyReusable(pool)).To(BeTrue())
+
+	released := pool.DeepCopy()
+	now := metav1.Now()
+	released.Status.ResourceStatuses[0].State = "Released"
+	released.Status.ResourceStatuses[0].LastReleasedTime = &now
+	g.Expect(IsPoolFullyReusable(released)).To(BeFalse())
+
+	withTask := pool.DeepCopy()
+	withTask.Status.ResourceStatuses[0].ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{TaskRef: "task-1", State: "Running"}
+	g.Expect(IsPoolFullyReusable(withTask)).To(BeFalse())
+
+	withDisk := pool.DeepCopy()
+	withDisk.Spec.Resources[0].PersistentDisks = []infrav1.PersistentDisk{{Name: "disk-1", VolumePath: "[ds] vm/disk.vmdk"}}
+	g.Expect(IsPoolFullyReusable(withDisk)).To(BeFalse())
+
+	withRetry := pool.DeepCopy()
+	retryAfter := metav1.Now()
+	withRetry.Status.ResourceStatuses[0].ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{RetryAfter: &retryAfter, State: "Failed"}
+	g.Expect(IsPoolFullyReusable(withRetry)).To(BeFalse())
+}
+
 func TestEnsurePersistentDiskBootstrapData(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
@@ -514,4 +611,83 @@ func TestPersistSlotChangesPersistsUnitNumber(t *testing.T) {
 	g.Expect(*updatedPool.Spec.Resources[0].PersistentDisks[0].UnitNumber).To(Equal(unitNumber))
 	g.Expect(updatedPool.Spec.Resources[0].PersistentDisks[0].VolumePath).To(Equal("[datastore1] disk-1/disk-1.vmdk"))
 	g.Expect(updatedPool.Spec.Resources[0].PersistentDisks[0].DiskUUID).To(Equal("disk-uuid"))
+}
+
+func TestResolveMachineConsumerRef(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
+	_ = controlplanev1.AddToScheme(scheme)
+
+	ctx := context.Background()
+
+	t.Run("resolves kubeadmcontrolplane owner", func(t *testing.T) {
+		kcp := &controlplanev1.KubeadmControlPlane{
+			ObjectMeta: metav1.ObjectMeta{Name: "cp-a", Namespace: "default", UID: "kcp-uid"},
+		}
+		machine := &clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "machine-a",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: controlplanev1.GroupVersion.String(),
+					Kind:       "KubeadmControlPlane",
+					Name:       "cp-a",
+					UID:        "kcp-uid",
+				}},
+			},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(kcp, machine).Build()
+		ref, err := ResolveMachineConsumerRef(ctx, c, machine)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(ref).NotTo(BeNil())
+		g.Expect(ref.Kind).To(Equal("KubeadmControlPlane"))
+		g.Expect(ref.Name).To(Equal("cp-a"))
+	})
+
+	t.Run("resolves machinedeployment owner through machineset", func(t *testing.T) {
+		md := &clusterv1.MachineDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "md-a", Namespace: "default", UID: "md-uid"},
+		}
+		ms := &clusterv1.MachineSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ms-a",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: clusterv1.GroupVersion.String(),
+					Kind:       "MachineDeployment",
+					Name:       "md-a",
+					UID:        "md-uid",
+				}},
+			},
+		}
+		machine := &clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "machine-b",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: clusterv1.GroupVersion.String(),
+					Kind:       "MachineSet",
+					Name:       "ms-a",
+				}},
+			},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md, ms, machine).Build()
+		ref, err := ResolveMachineConsumerRef(ctx, c, machine)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(ref).NotTo(BeNil())
+		g.Expect(ref.Kind).To(Equal("MachineDeployment"))
+		g.Expect(ref.Name).To(Equal("md-a"))
+	})
+
+	t.Run("fails closed when owner cannot be resolved", func(t *testing.T) {
+		machine := &clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "machine-c", Namespace: "default"},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machine).Build()
+		ref, err := ResolveMachineConsumerRef(ctx, c, machine)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(ref).To(BeNil())
+	})
 }

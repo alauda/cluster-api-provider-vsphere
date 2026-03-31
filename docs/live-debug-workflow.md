@@ -119,6 +119,35 @@ env GOTOOLCHAIN=local \
   go build -o /tmp/capv-manager .
 ```
 
+### 3.1 Clean orphan VMDKs before reusing the same cluster name
+
+Before recreating `capv-test`, inspect the target datastores for leftover
+directories from older control-plane or worker VMs:
+
+```bash
+env GOVC_DATACENTER=Datacenter1 govc datastore.ls -l -R -ds vm-store capv-test*
+env GOVC_DATACENTER=Datacenter2 govc datastore.ls -l -R -ds vm-store capv-test*
+```
+
+If the old cluster has already been deleted from Kubernetes and the
+corresponding VMs are gone from inventory, but datastore directories such as
+`capv-test-sjm8d/`, `capv-test-4t9kv/`, or old worker directories still remain,
+remove those orphan directories before rebuilding:
+
+```bash
+env GOVC_DATACENTER=Datacenter2 govc datastore.rm -ds vm-store <orphan-dir>...
+```
+
+This matters because a rebuild can fail even when the old `VSphereResourcePool`
+status looks clean. In one live case, the second control-plane machine failed
+with:
+
+- `Insufficient disk space on datastore 'vm-store'.`
+
+The root cause was leftover `capv-test*` directories containing old `.vmdk`
+files on `Datacenter2/vm-store`, which prevented CAPV from provisioning the
+next persistent data disk for the replacement control-plane VM.
+
 ### 4. Run the manager locally
 
 ```bash
@@ -146,6 +175,23 @@ Notes:
   traffic through the proxy, making thumbprint-based trust look broken and
   producing misleading errors like
   `tls: failed to verify certificate: x509: "192.168.254.211" certificate is not trusted`.
+- The same proxy caveat applies when using a workload kubeconfig. If
+  `kubectl --kubeconfig=/tmp/capv-test.kubeconfig ...` fails with TLS errors
+  against the workload control-plane VIP even though:
+  - the kubeconfig `server:` points to the expected VIP
+  - the kubeconfig CA matches the cluster CA secret
+  - the API server certificate SAN already includes that VIP
+  then first retry with proxy variables removed:
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+  kubectl --kubeconfig=/tmp/capv-test.kubeconfig get --raw=/version
+```
+
+  In this environment, the local proxy on `127.0.0.1:8118` can intercept the
+  HTTPS connection and surface misleading errors such as
+  `x509: certificate signed by unknown authority`, even when the workload
+  kubeconfig and API server certificate are otherwise correct.
 
 ## Updating The Sample Environment
 

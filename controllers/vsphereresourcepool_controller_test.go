@@ -138,7 +138,9 @@ func TestResourcePoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvailable
 					Name:      "worker-1",
 					Namespace: "default",
 				},
-				ReclaimTaskState: reclaimTaskStateCompleted,
+				ReclaimStatus: &infrav1.ResourceSlotReclaimStatus{
+					State: reclaimTaskStateCompleted,
+				},
 			}},
 		},
 	}
@@ -165,9 +167,10 @@ func TestResourcePoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvailable
 	g.Expect(updated.Status.ResourceStatuses[0].State).To(Equal("Available"))
 	g.Expect(updated.Status.ResourceStatuses[0].MachineRef).To(BeNil())
 	g.Expect(updated.Status.ResourceStatuses[0].LastReleasedTime).To(BeNil())
-	g.Expect(updated.Status.ResourceStatuses[0].ReclaimTaskRef).To(BeEmpty())
-	g.Expect(updated.Status.ResourceStatuses[0].ReclaimVolumePath).To(BeEmpty())
-	g.Expect(updated.Status.ResourceStatuses[0].RetryAfter).To(BeNil())
+	g.Expect(updated.Status.ResourceStatuses[0].ReclaimStatus).NotTo(BeNil())
+	g.Expect(updated.Status.ResourceStatuses[0].ReclaimStatus.TaskRef).To(BeEmpty())
+	g.Expect(updated.Status.ResourceStatuses[0].ReclaimStatus.VolumePath).To(BeEmpty())
+	g.Expect(updated.Status.ResourceStatuses[0].ReclaimStatus.RetryAfter).To(BeNil())
 }
 
 func TestResolveSlotDatacenter(t *testing.T) {

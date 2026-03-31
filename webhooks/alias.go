@@ -62,6 +62,30 @@ func (webhook *VSphereMachineTemplate) SetupWebhookWithManager(mgr ctrl.Manager)
 	return (&webhooks.VSphereMachineTemplate{}).SetupWebhookWithManager(mgr)
 }
 
+// VSphereResourcePool implements a validation webhook for VSphereResourcePool.
+type VSphereResourcePool struct{}
+
+// SetupWebhookWithManager sets up VSphereResourcePool webhooks.
+func (webhook *VSphereResourcePool) SetupWebhookWithManager(mgr ctrl.Manager) error {
+	return (&webhooks.VSphereResourcePool{}).SetupWebhookWithManager(mgr)
+}
+
+// KubeadmControlPlane implements a validation webhook for KubeadmControlPlane.
+type KubeadmControlPlane struct{}
+
+// SetupWebhookWithManager sets up KubeadmControlPlane webhooks.
+func (webhook *KubeadmControlPlane) SetupWebhookWithManager(mgr ctrl.Manager) error {
+	return (&webhooks.KubeadmControlPlane{}).SetupWebhookWithManager(mgr)
+}
+
+// MachineDeployment implements a validation webhook for MachineDeployment.
+type MachineDeployment struct{}
+
+// SetupWebhookWithManager sets up MachineDeployment webhooks.
+func (webhook *MachineDeployment) SetupWebhookWithManager(mgr ctrl.Manager) error {
+	return (&webhooks.MachineDeployment{}).SetupWebhookWithManager(mgr)
+}
+
 // VSphereVM implements a validation and defaulting webhook for VSphereVM.
 type VSphereVM struct{}
 

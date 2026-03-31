@@ -784,6 +784,7 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T)
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
 	pool := &infrav1.VSphereResourcePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pool-1",
@@ -796,10 +797,39 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T)
 			},
 		},
 	}
-	client := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
+	md := &clusterv1.MachineDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "md-a",
+			Namespace: fake.Namespace,
+			UID:       "md-uid",
+		},
+	}
+	ms := &clusterv1.MachineSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ms-a",
+			Namespace: fake.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "MachineDeployment",
+				Name:       "md-a",
+				UID:        "md-uid",
+			}},
+		},
+	}
+	client := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, md, ms).WithStatusSubresource(pool).Build()
 	machineCtx := &capvcontext.VIMMachineContext{
 		BaseMachineContext: &capvcontext.BaseMachineContext{
-			Machine: &clusterv1.Machine{},
+			Machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine-1",
+					Namespace: fake.Namespace,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: clusterv1.GroupVersion.String(),
+						Kind:       "MachineSet",
+						Name:       "ms-a",
+					}},
+				},
+			},
 		},
 		VSphereMachine: &infrav1.VSphereMachine{
 			ObjectMeta: metav1.ObjectMeta{

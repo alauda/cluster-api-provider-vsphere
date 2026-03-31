@@ -25,9 +25,12 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/finalizers"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
@@ -132,6 +135,12 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 	requeueAfter := time.Duration(0)
 	specChanged := false
 
+	if bound, err := r.reconcileConsumerBinding(ctx, pool); err != nil {
+		return reconcile.Result{}, err
+	} else if bound {
+		specChanged = true
+	}
+
 	for i := range pool.Spec.Resources {
 		slot := &pool.Spec.Resources[i]
 		status, ok := statusMap[slot.Hostname]
@@ -151,12 +160,12 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 				"releasedAt", status.LastReleasedTime.Time,
 				"deadline", deadline,
 				"persistentDiskCount", len(slot.PersistentDisks),
-				"hasReclaimTask", status.ReclaimTaskRef != "",
+				"hasReclaimTask", status.ReclaimStatus != nil && status.ReclaimStatus.TaskRef != "",
 			)
-			if status.ReclaimTaskRef != "" {
+			if status.ReclaimStatus != nil && status.ReclaimStatus.TaskRef != "" {
 				specUpdated, wait, err := r.reconcileReclaimTask(ctx, pool, slot, &status)
 				if err != nil {
-					log.Error(err, "failed to reconcile reclaim task for slot", "hostname", slot.Hostname, "task", status.ReclaimTaskRef)
+					log.Error(err, "failed to reconcile reclaim task for slot", "hostname", slot.Hostname, "task", status.ReclaimStatus.TaskRef)
 				}
 				if specUpdated {
 					specChanged = true
@@ -164,13 +173,13 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 				if wait > 0 && (requeueAfter == 0 || wait < requeueAfter) {
 					requeueAfter = wait
 				}
-			} else if status.RetryAfter != nil && time.Now().Before(status.RetryAfter.Time) {
+			} else if status.ReclaimStatus != nil && status.ReclaimStatus.RetryAfter != nil && time.Now().Before(status.ReclaimStatus.RetryAfter.Time) {
 				log.Info("Released slot reclaim is waiting for retry window",
 					"hostname", slot.Hostname,
-					"retryAfter", status.RetryAfter.Time,
-					"lastReclaimError", status.LastReclaimError,
+					"retryAfter", status.ReclaimStatus.RetryAfter.Time,
+					"lastReclaimError", status.ReclaimStatus.LastError,
 				)
-				wait := time.Until(status.RetryAfter.Time)
+				wait := time.Until(status.ReclaimStatus.RetryAfter.Time)
 				if requeueAfter == 0 || wait < requeueAfter {
 					requeueAfter = wait
 				}
@@ -184,11 +193,7 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 					status.State = "Available"
 					status.MachineRef = nil
 					status.LastReleasedTime = nil
-					status.ReclaimTaskRef = ""
-					status.ReclaimTaskState = reclaimTaskStateCompleted
-					status.ReclaimVolumePath = ""
-					status.RetryAfter = nil
-					status.LastReclaimError = ""
+					status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{State: reclaimTaskStateCompleted}
 				}
 				if wait > 0 && (requeueAfter == 0 || wait < requeueAfter) {
 					requeueAfter = wait
@@ -230,6 +235,42 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 	pool.Status.ResourceStatuses = newStatuses
 
 	return reconcile.Result{RequeueAfter: requeueAfter}, nil
+}
+
+func (r resourcePoolReconciler) reconcileConsumerBinding(ctx context.Context, pool *infrav1.VSphereResourcePool) (bool, error) {
+	if pool.Spec.ConsumerRef == nil {
+		return false, nil
+	}
+
+	target := objectForConsumer(pool.Spec.ConsumerRef)
+	if target == nil {
+		return false, errors.Errorf("unsupported consumer kind %q on VSphereResourcePool %s/%s", pool.Spec.ConsumerRef.Kind, pool.Namespace, pool.Name)
+	}
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: pool.Spec.ConsumerRef.Namespace, Name: pool.Spec.ConsumerRef.Name}, target); err == nil {
+		return false, nil
+	} else if !apierrors.IsNotFound(err) {
+		return false, err
+	}
+
+	if !services.IsPoolFullyReusable(pool) {
+		return false, nil
+	}
+	pool.Spec.ConsumerRef = nil
+	return true, nil
+}
+
+func objectForConsumer(ref *corev1.ObjectReference) client.Object {
+	if ref == nil {
+		return nil
+	}
+	switch ref.Kind {
+	case "KubeadmControlPlane":
+		return &controlplanev1.KubeadmControlPlane{}
+	case "MachineDeployment":
+		return &clusterv1.MachineDeployment{}
+	default:
+		return nil
+	}
 }
 
 func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, status *infrav1.ResourceSlotStatus) (bool, time.Duration, error) {
@@ -278,16 +319,16 @@ func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, po
 				}
 				return false, 0, err
 			}
-			status.ReclaimTaskRef = task.Reference().Value
-			status.ReclaimTaskState = reclaimTaskStateRunning
-			status.ReclaimVolumePath = pd.VolumePath
-			status.LastReclaimError = ""
-			status.RetryAfter = nil
+			status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{
+				TaskRef:    task.Reference().Value,
+				State:      reclaimTaskStateRunning,
+				VolumePath: pd.VolumePath,
+			}
 			log.Info("Started datastore file deletion task",
 				"hostname", slot.Hostname,
 				"disk", pd.Name,
 				"path", pd.VolumePath,
-				"task", status.ReclaimTaskRef,
+				"task", status.ReclaimStatus.TaskRef,
 			)
 			return false, 15 * time.Second, nil
 		}
@@ -316,12 +357,16 @@ func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *
 	}
 
 	task := &mo.Task{}
-	taskRef := types.ManagedObjectReference{Type: "Task", Value: status.ReclaimTaskRef}
+	if status.ReclaimStatus == nil || status.ReclaimStatus.TaskRef == "" {
+		return false, 0, nil
+	}
+
+	taskRef := types.ManagedObjectReference{Type: "Task", Value: status.ReclaimStatus.TaskRef}
 	if err := s.RetrieveOne(ctx, taskRef, []string{"info"}, task); err != nil {
 		return false, 0, err
 	}
 
-	log = log.WithValues("hostname", slot.Hostname, "task", status.ReclaimTaskRef, "taskState", task.Info.State, "path", status.ReclaimVolumePath)
+	log = log.WithValues("hostname", slot.Hostname, "task", status.ReclaimStatus.TaskRef, "taskState", task.Info.State, "path", status.ReclaimStatus.VolumePath)
 	ctx = ctrl.LoggerInto(ctx, log)
 
 	switch task.Info.State {
@@ -332,7 +377,7 @@ func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *
 		log.Info("Reclaim task completed, clearing reclaimed disk metadata from slot")
 		specUpdated := false
 		for i := range slot.PersistentDisks {
-			if slot.PersistentDisks[i].VolumePath == status.ReclaimVolumePath {
+			if slot.PersistentDisks[i].VolumePath == status.ReclaimStatus.VolumePath {
 				log.Info("Clearing reclaimed persistent disk metadata",
 					"hostname", slot.Hostname,
 					"disk", slot.PersistentDisks[i].Name,
@@ -345,11 +390,7 @@ func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *
 				break
 			}
 		}
-		status.ReclaimTaskRef = ""
-		status.ReclaimTaskState = reclaimTaskStateCompleted
-		status.ReclaimVolumePath = ""
-		status.LastReclaimError = ""
-		status.RetryAfter = nil
+		status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{State: reclaimTaskStateCompleted}
 		return specUpdated, 1 * time.Second, nil
 	case types.TaskInfoStateError:
 		errMessage := "reclaim task failed"
@@ -357,12 +398,12 @@ func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *
 			errMessage = task.Info.Error.LocalizedMessage
 		}
 		log.Error(errors.New(errMessage), "Reclaim task failed")
-		status.ReclaimTaskRef = ""
-		status.ReclaimTaskState = reclaimTaskStateFailed
-		status.LastReclaimError = errMessage
 		retryAfter := metav1.NewTime(time.Now().Add(1 * time.Minute))
-		status.RetryAfter = &retryAfter
-		status.ReclaimVolumePath = ""
+		status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{
+			State:      reclaimTaskStateFailed,
+			RetryAfter: &retryAfter,
+			LastError:  errMessage,
+		}
 		return false, time.Until(retryAfter.Time), nil
 	default:
 		return false, 0, errors.Errorf("unknown reclaim task state %q", task.Info.State)
@@ -411,10 +452,10 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 		}
 
 		if status.State == "Released" {
-			if status.ReclaimTaskRef != "" {
+			if status.ReclaimStatus != nil && status.ReclaimStatus.TaskRef != "" {
 				log.Info("Deleting pool: released slot has in-flight reclaim task",
 					"hostname", slot.Hostname,
-					"task", status.ReclaimTaskRef,
+					"task", status.ReclaimStatus.TaskRef,
 				)
 				_, wait, err := r.reconcileReclaimTask(ctx, pool, slot, &status)
 				if err != nil {
@@ -438,11 +479,7 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 					)
 					status.State = "Available"
 					status.LastReleasedTime = nil
-					status.ReclaimTaskRef = ""
-					status.ReclaimTaskState = reclaimTaskStateCompleted
-					status.ReclaimVolumePath = ""
-					status.RetryAfter = nil
-					status.LastReclaimError = ""
+					status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{State: reclaimTaskStateCompleted}
 				}
 				if wait > 0 && (requeueAfter == 0 || wait < requeueAfter) {
 					requeueAfter = wait
@@ -454,11 +491,7 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 				)
 				status.State = "Available"
 				status.LastReleasedTime = nil
-				status.ReclaimTaskRef = ""
-				status.ReclaimTaskState = reclaimTaskStateCompleted
-				status.ReclaimVolumePath = ""
-				status.RetryAfter = nil
-				status.LastReclaimError = ""
+				status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{State: reclaimTaskStateCompleted}
 			}
 		}
 
