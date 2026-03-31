@@ -180,6 +180,7 @@ Important semantics:
 - CAPV must not set Kubernetes `ownerReferences` from the pool to the consumer.
 - Deleting the consumer must not trigger cascading deletion of the pool.
 - A pool may later be rebound to a different `MachineDeployment` or `KubeadmControlPlane`, but only after the previous consumer has fully released the pool.
+- A pool may be created with `consumerRef` unset. This is the normal initial state before any `KubeadmControlPlane` or `MachineDeployment` claims the pool.
 
 ### Allowed Reference Shape
 
@@ -197,6 +198,7 @@ Important semantics:
 
 ### Binding and Unbinding Rules
 
+- If `consumerRef` is unset, the pool is currently unbound and may be claimed by a single consumer.
 - If `consumerRef` is set, only `VSphereMachine` objects belonging to that consumer may allocate slots from the pool.
 - If the referenced consumer still exists, the binding remains active.
 - If the referenced consumer has been deleted, CAPV must keep the binding until all slots in the pool are fully reusable.
@@ -215,6 +217,19 @@ Important semantics:
 - A pool may be rebound to a different `MachineDeployment` or `KubeadmControlPlane`.
 - Rebinding is allowed only when the previous binding has been fully cleared.
 - CAPV must reject rebinding while the pool still has active `InUse` or `Released` slots, in-flight reclaim work, or reclaimable disk backing.
+
+### Binding Establishment
+
+- A `KubeadmControlPlane` or `MachineDeployment` declares its intended pool through the `VSphereMachineTemplate` it references.
+- Admission validates whether that declaration is compatible with the current pool state.
+- The actual binding is established by CAPV controller logic, not by webhook mutation and not by slot allocation.
+- CAPV establishes the binding when the first `VSphereMachine` for that consumer reconciles and attempts to use the pool.
+- Binding must use optimistic concurrency on `VSphereResourcePool.metadata.resourceVersion`.
+  If two consumers race for the same unbound pool:
+  - both may pass webhook validation when `consumerRef` is still empty
+  - only one controller update may successfully write `spec.consumerRef`
+  - the loser must re-read the pool, detect that it is now bound to another consumer, and fail
+- Therefore, configuration reference is not equivalent to a successful binding. The source of truth for the active binding is `VSphereResourcePool.spec.consumerRef`.
 
 ### Mutability Rules
 
@@ -236,6 +251,11 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
       - control-plane machines resolve to their `KubeadmControlPlane`
       - worker machines resolve to their `MachineDeployment`
     - If the effective consumer does not match the pool `consumerRef`, reconciliation fails.
+- If `VSphereResourcePool.spec.consumerRef` is empty, CAPV attempts to bind the pool to the machine's effective consumer using optimistic concurrency on the pool `resourceVersion`.
+  - If the update succeeds, the machine may continue allocation.
+  - If the update conflicts, CAPV re-reads the pool.
+  - If the pool is now bound to another consumer, reconciliation fails.
+  - If the pool is still unbound, CAPV may retry.
 - Before slot selection, CAPV resolves the machine's desired datacenter:
     - If `VSphereMachine.spec.datacenter` / template-derived clone spec datacenter is set, that becomes a required datacenter constraint.
     - If a `FailureDomain` is set, CAPV must still resolve it successfully. The failure domain contributes an additional allowed-datacenter constraint.
@@ -300,10 +320,11 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
     - **Spec cleanup**: After the reclaim task succeeds, the controller clears `VolumePath` and `DiskUUID` from the `PersistentDisk` spec and requeues.
     - **State Transition**: On a later reconcile, once the slot no longer has reclaimable persistent disk backing, the slot state is set back to `Available`, making it "clean" and ready to be picked up by any new machine (including those that don't need the previous data).
 - **Async reclaim task model**:
-    - Reclaim is asynchronous. The controller starts at most one vCenter task per slot and records it in `ReclaimTaskRef`.
-    - `ReclaimVolumePath` tracks the current disk being reclaimed for that slot.
+    - Reclaim is asynchronous. The controller starts at most one vCenter task per slot and records it in `reclaimStatus`.
+    - `reclaimStatus.taskRef` tracks the current vCenter task for that slot.
+    - `reclaimStatus.volumePath` tracks the current disk being reclaimed for that slot.
     - If a slot has multiple persistent disks, they are reclaimed one by one across reconciles, never with multiple concurrent reclaim tasks for the same slot.
-    - If a reclaim task fails, the controller records `LastReclaimError` and uses `RetryAfter` to avoid tight retry loops.
+    - If a reclaim task fails, the controller records `reclaimStatus.lastError` and uses `reclaimStatus.retryAfter` to avoid tight retry loops.
     - Reclaim completion is therefore not modeled as a single atomic transition; a slot may temporarily remain `Released` with reclaim metadata already cleaned from `spec` while it waits for the follow-up reconcile that marks it `Available`.
 
 ### 4. Resource Pool Deletion
@@ -364,7 +385,7 @@ Recommended admission split:
   ultimately points to an existing pool and that the pool `consumerRef` is either:
   - empty and compatible with the object being admitted, or
   - already bound to that same object.
-- `VSphereMachine` reconcile keeps a final runtime safety check in case an older object bypassed webhook validation or the referenced objects changed between admission and reconcile.
+- `VSphereMachine` reconcile establishes the actual binding when needed and keeps the final runtime safety check in case an older object bypassed webhook validation or the referenced objects changed between admission and reconcile.
 
 ### Duplicate Reference Detection
 
@@ -410,6 +431,9 @@ strategy:
     - CAPV must not add `ownerReferences` from the pool to the referenced `KubeadmControlPlane` or `MachineDeployment`.
     - Consumer deletion does not delete the pool.
     - Consumer deletion only makes the pool eligible for unbinding after all slot lifecycle and reclaim work has completed.
+    - `KubeadmControlPlane` / `MachineDeployment` webhook validation is only a pre-check. It does not establish the binding.
+    - The actual binding is created during `VSphereMachine` reconcile using optimistic concurrency on `VSphereResourcePool.resourceVersion`.
+    - Slot allocation reuses the same reconcile path after binding succeeds; no separate binding controller is required.
 - **Reclaim Tracking**:
     - Reclaim-related task metadata should be grouped under `status.resourceStatuses[].reclaimStatus`.
     - Suggested task state enum is `Running`, `Failed`, `Completed`.
@@ -464,6 +488,8 @@ The recommended implementation sequence is:
    - implement `KubeadmControlPlane` / `MachineDeployment` validation to ensure the referenced machine template does not indirectly point at a conflicting pool
 
 4. **Machine reconcile enforcement**
+   - establish `spec.consumerRef` using `Get + Update` optimistic concurrency when the pool is still unbound
+   - on conflict, re-read the pool, re-evaluate eligibility, and either retry or fail
    - before slot allocation, validate that the machine's effective consumer matches the referenced pool
    - reject allocation if the pool is bound to another consumer
 
@@ -473,35 +499,8 @@ The recommended implementation sequence is:
    - update reclaim logic to use `reclaimStatus`
 
 6. **Sample and docs updates**
-   - update sample manifests so each pool explicitly declares its consumer
+   - update sample manifests and docs to reflect that pools start unbound and are claimed by controller logic
    - update user-facing docs and proposals to reflect the new binding model
-
-## Compatibility and Migration
-
-Recommended rollout strategy:
-
-### Phase 1: Compatible introduction
-
-- `spec.consumerRef` is optional.
-- If omitted, CAPV preserves the current behavior for existing pools.
-- New validation is enforced only when `consumerRef` is present.
-- Samples and new environments should start setting `consumerRef`.
-
-### Phase 2: Strict mode
-
-- `spec.consumerRef` becomes required for newly created `VSphereResourcePool` objects.
-- Existing pools without `consumerRef` may continue to function, but CAPV should surface warnings or conditions prompting migration.
-
-### Migration of existing pools
-
-For an existing pool already serving a live `KubeadmControlPlane` or `MachineDeployment`:
-
-1. Determine the intended consumer.
-2. Patch `spec.consumerRef` to that object.
-3. Verify no other controller or template points to the same pool.
-4. Roll new machines and upgrades under the new binding rules.
-
-No ownerReference migration is required because the design explicitly does not use Kubernetes ownership semantics.
 
 ## Testing Matrix
 
@@ -543,6 +542,5 @@ The implementation should include at least the following tests.
 
 ## Open Questions
 
-- Should Phase 2 strict mode be enforced in admission immediately after introduction, or only after all in-repo samples have been migrated?
-- Should CAPV reject a `VSphereMachineTemplate` with `resourcePoolRef` pointing to an unbound pool when that template is referenced by a `KubeadmControlPlane` or `MachineDeployment`, or should binding be allowed to happen later via pool patching?
+- Should CAPV reject a `VSphereMachineTemplate` with `resourcePoolRef` pointing to an unbound pool when another object already references that same pool in persisted configuration, even before runtime binding has happened?
 - Should rebinding require all slots to be `Available`, or is a weaker condition acceptable if future requirements allow cross-consumer reuse of released slots without reclaim?

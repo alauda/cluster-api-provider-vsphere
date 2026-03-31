@@ -106,4 +106,5 @@ tilt-settings.json
 tilt-settings.yaml
 .tiltbuild
 .notes/
+.notes
 sample/

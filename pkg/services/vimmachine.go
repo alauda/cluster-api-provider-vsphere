@@ -601,14 +601,19 @@ func (v *VimMachineService) reconcileResourcePool(ctx context.Context, vimMachin
 		return errors.Wrap(err, "failed to resolve failure domain datacenters for resource pool allocation")
 	}
 
+	consumerRef, err := ResolveMachineConsumerRef(ctx, v.Client, vimMachineCtx.Machine)
+	if err != nil {
+		return errors.Wrap(err, "failed to resolve machine consumer for resource pool allocation")
+	}
+	if err := TryBindPoolToConsumer(ctx, v.Client, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef, consumerRef); err != nil {
+		return errors.Wrap(err, "failed to bind resource pool consumer")
+	}
+
 	slot, err := AllocateSlot(ctx, v.Client, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef, vimMachineCtx.VSphereMachine, desiredDatacenter, allowedFailureDomainDatacenters)
 	if err != nil {
 		return errors.Wrap(err, "failed to allocate slot from pool")
 	}
 	vimMachineCtx.ResourceSlot = slot
-	if vimMachineCtx.VSphereMachine.Spec.Datacenter == "" && slot != nil && slot.Datacenter != "" {
-		vimMachineCtx.VSphereMachine.Spec.Datacenter = slot.Datacenter
-	}
 	return nil
 }
 
@@ -617,7 +622,7 @@ func (v *VimMachineService) resolveDesiredDatacenter(ctx context.Context, vimMac
 		return "", nil
 	}
 
-	desiredDatacenter := vimMachineCtx.VSphereMachine.Spec.Datacenter
+	desiredDatacenter := normalizeDesiredDatacenter(vimMachineCtx.VSphereMachine.Spec.Datacenter)
 	if desiredDatacenter != "" {
 		if _, err := v.resolveFailureDomainDatacenters(ctx, vimMachineCtx); err != nil {
 			return "", err
@@ -691,6 +696,9 @@ func (v *VimMachineService) mergeSlotNetwork(vm *infrav1.VSphereVM, slotNetworks
 			sn := slotNetworks[i]
 			slotProvidesStaticIP := sn.IP != "" || sn.IPv6 != ""
 			dev.NetworkName = sn.NetworkName
+			if sn.DeviceName != "" {
+				dev.DeviceName = sn.DeviceName
+			}
 			if sn.IP != "" {
 				dev.IPAddrs = []string{sn.IP}
 				dev.DHCP4 = false

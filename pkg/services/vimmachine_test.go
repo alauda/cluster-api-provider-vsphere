@@ -403,6 +403,7 @@ func Test_mergeSlotNetwork(t *testing.T) {
 		service.mergeSlotNetwork(vm, []infrav1.NetworkConfig{
 			{
 				NetworkName: "slot-network",
+				DeviceName:  "ens192",
 				IP:          "192.168.1.10/24",
 				Gateway:     "192.168.1.1",
 				DNS:         []string{"8.8.8.8"},
@@ -411,6 +412,7 @@ func Test_mergeSlotNetwork(t *testing.T) {
 
 		g.Expect(vm.Spec.Network.Devices).To(HaveLen(1))
 		g.Expect(vm.Spec.Network.Devices[0].NetworkName).To(Equal("slot-network"))
+		g.Expect(vm.Spec.Network.Devices[0].DeviceName).To(Equal("ens192"))
 		g.Expect(vm.Spec.Network.Devices[0].IPAddrs).To(Equal([]string{"192.168.1.10/24"}))
 		g.Expect(vm.Spec.Network.Devices[0].Gateway4).To(Equal("192.168.1.1"))
 		g.Expect(vm.Spec.Network.Devices[0].DHCP4).To(BeFalse())
@@ -448,11 +450,13 @@ func Test_mergeSlotNetwork(t *testing.T) {
 		service.mergeSlotNetwork(vm, []infrav1.NetworkConfig{
 			{
 				NetworkName: "slot-network",
+				DeviceName:  "ens224",
 			},
 		})
 
 		g.Expect(vm.Spec.Network.Devices).To(HaveLen(1))
 		g.Expect(vm.Spec.Network.Devices[0].NetworkName).To(Equal("slot-network"))
+		g.Expect(vm.Spec.Network.Devices[0].DeviceName).To(Equal("ens224"))
 		g.Expect(vm.Spec.Network.Devices[0].DHCP4).To(BeTrue())
 		g.Expect(vm.Spec.Network.Devices[0].IPAddrs).To(BeEmpty())
 		g.Expect(vm.Spec.Network.Devices[0].AddressesFromPools).To(HaveLen(1))
@@ -784,6 +788,7 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T)
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
 	pool := &infrav1.VSphereResourcePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pool-1",
@@ -796,10 +801,39 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T)
 			},
 		},
 	}
-	client := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
+	md := &clusterv1.MachineDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "md-a",
+			Namespace: fake.Namespace,
+			UID:       "md-uid",
+		},
+	}
+	ms := &clusterv1.MachineSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ms-a",
+			Namespace: fake.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "MachineDeployment",
+				Name:       "md-a",
+				UID:        "md-uid",
+			}},
+		},
+	}
+	client := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, md, ms).WithStatusSubresource(pool).Build()
 	machineCtx := &capvcontext.VIMMachineContext{
 		BaseMachineContext: &capvcontext.BaseMachineContext{
-			Machine: &clusterv1.Machine{},
+			Machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine-1",
+					Namespace: fake.Namespace,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: clusterv1.GroupVersion.String(),
+						Kind:       "MachineSet",
+						Name:       "ms-a",
+					}},
+				},
+			},
 		},
 		VSphereMachine: &infrav1.VSphereMachine{
 			ObjectMeta: metav1.ObjectMeta{
@@ -814,6 +848,79 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T)
 		Namespace: pool.Namespace,
 	}
 	machineCtx.VSphereMachine.Spec.Datacenter = ""
+
+	vimMachineService := &VimMachineService{Client: client}
+	err := vimMachineService.reconcileResourcePool(ctx, machineCtx)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(machineCtx.ResourceSlot).NotTo(BeNil())
+	g.Expect(machineCtx.ResourceSlot.Datacenter).To(Equal("dc-pool"))
+	g.Expect(machineCtx.VSphereMachine.Spec.Datacenter).To(Equal("dc-pool"))
+}
+
+func TestVimMachineServiceReconcileResourcePoolBackfillsWildcardDatacenter(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
+	pool := &infrav1.VSphereResourcePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pool-1",
+			Namespace: fake.Namespace,
+		},
+		Spec: infrav1.VSphereResourcePoolSpec{
+			Datacenter: "dc-pool",
+			Resources: []infrav1.ResourceSlot{
+				{Hostname: "worker-01"},
+			},
+		},
+	}
+	md := &clusterv1.MachineDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "md-a",
+			Namespace: fake.Namespace,
+			UID:       "md-uid",
+		},
+	}
+	ms := &clusterv1.MachineSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ms-a",
+			Namespace: fake.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "MachineDeployment",
+				Name:       "md-a",
+				UID:        "md-uid",
+			}},
+		},
+	}
+	client := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, md, ms).WithStatusSubresource(pool).Build()
+	machineCtx := &capvcontext.VIMMachineContext{
+		BaseMachineContext: &capvcontext.BaseMachineContext{
+			Machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine-1",
+					Namespace: fake.Namespace,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: clusterv1.GroupVersion.String(),
+						Kind:       "MachineSet",
+						Name:       "ms-a",
+					}},
+				},
+			},
+		},
+		VSphereMachine: &infrav1.VSphereMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "machine-1",
+				Namespace: fake.Namespace,
+				UID:       "machine-uid",
+			},
+		},
+	}
+	machineCtx.VSphereMachine.Spec.ResourcePoolRef = &corev1.ObjectReference{
+		Name:      pool.Name,
+		Namespace: pool.Namespace,
+	}
+	machineCtx.VSphereMachine.Spec.Datacenter = "*"
 
 	vimMachineService := &VimMachineService{Client: client}
 	err := vimMachineService.reconcileResourcePool(ctx, machineCtx)

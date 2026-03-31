@@ -23,13 +23,171 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	infrautil "sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
+func ConsumerRefsEqual(a, b *corev1.ObjectReference) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.APIVersion == b.APIVersion &&
+		a.Kind == b.Kind &&
+		a.Namespace == b.Namespace &&
+		a.Name == b.Name
+}
+
+func PoolRefsEqual(a, b *corev1.ObjectReference) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Namespace == b.Namespace && a.Name == b.Name
+}
+
+func ResolveMachineConsumerRef(ctx context.Context, c client.Client, machine *clusterv1.Machine) (*corev1.ObjectReference, error) {
+	if machine == nil {
+		return nil, errors.New("machine is nil")
+	}
+
+	if owner, err := infrautil.FetchControlPlaneOwnerObject(ctx, infrautil.FetchObjectInput{Client: c, Object: machine}); err == nil {
+		kcp, ok := owner.(*controlplanev1.KubeadmControlPlane)
+		if !ok {
+			return nil, errors.Errorf("expected KubeadmControlPlane owner but got %T", owner)
+		}
+		return &corev1.ObjectReference{
+			APIVersion: controlplanev1.GroupVersion.String(),
+			Kind:       "KubeadmControlPlane",
+			Namespace:  kcp.Namespace,
+			Name:       kcp.Name,
+			UID:        kcp.UID,
+		}, nil
+	} else if !apierrors.IsNotFound(err) {
+		// util helpers currently encode missing-owner as generic errors, so only
+		// return early for non-notfound client errors.
+	}
+
+	if owner, err := infrautil.FetchMachineDeploymentOwnerObject(ctx, infrautil.FetchObjectInput{Client: c, Object: machine}); err == nil {
+		md, ok := owner.(*clusterv1.MachineDeployment)
+		if !ok {
+			return nil, errors.Errorf("expected MachineDeployment owner but got %T", owner)
+		}
+		return &corev1.ObjectReference{
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       "MachineDeployment",
+			Namespace:  md.Namespace,
+			Name:       md.Name,
+			UID:        md.UID,
+		}, nil
+	}
+
+	return nil, errors.Errorf("failed to resolve consumer for Machine %s/%s", machine.Namespace, machine.Name)
+}
+
+func ValidatePoolConsumer(pool *infrav1.VSphereResourcePool, consumerRef *corev1.ObjectReference) error {
+	if pool == nil || pool.Spec.ConsumerRef == nil || consumerRef == nil {
+		return nil
+	}
+	if ConsumerRefsEqual(pool.Spec.ConsumerRef, consumerRef) {
+		return nil
+	}
+	return errors.Errorf("resource pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Spec.ConsumerRef.Kind, pool.Spec.ConsumerRef.Namespace, pool.Spec.ConsumerRef.Name)
+}
+
+func TryBindPoolToConsumer(ctx context.Context, c client.Client, poolRef, consumerRef *corev1.ObjectReference) error {
+	if poolRef == nil || consumerRef == nil {
+		return nil
+	}
+
+	for range 3 {
+		pool := &infrav1.VSphereResourcePool{}
+		if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
+			return err
+		}
+
+		if pool.Spec.ConsumerRef == nil {
+			pool.Spec.ConsumerRef = &corev1.ObjectReference{
+				APIVersion: consumerRef.APIVersion,
+				Kind:       consumerRef.Kind,
+				Namespace:  consumerRef.Namespace,
+				Name:       consumerRef.Name,
+				UID:        consumerRef.UID,
+			}
+			if err := c.Update(ctx, pool); err != nil {
+				if apierrors.IsConflict(err) {
+					continue
+				}
+				return err
+			}
+			return nil
+		}
+
+		if err := ValidatePoolConsumer(pool, consumerRef); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	pool := &infrav1.VSphereResourcePool{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
+		return err
+	}
+	if err := ValidatePoolConsumer(pool, consumerRef); err != nil {
+		return err
+	}
+	return errors.New("resource pool binding conflict, exhausted retries")
+}
+
+func IsPoolFullyReusable(pool *infrav1.VSphereResourcePool) bool {
+	if pool == nil {
+		return true
+	}
+	statusMap := make(map[string]infrav1.ResourceSlotStatus, len(pool.Status.ResourceStatuses))
+	for _, status := range pool.Status.ResourceStatuses {
+		statusMap[status.Hostname] = status
+	}
+
+	for i := range pool.Spec.Resources {
+		slot := &pool.Spec.Resources[i]
+		status, ok := statusMap[slot.Hostname]
+		if ok {
+			if status.State == "InUse" || status.State == "Released" {
+				return false
+			}
+			if status.ReclaimStatus != nil {
+				if status.ReclaimStatus.TaskRef != "" || status.ReclaimStatus.RetryAfter != nil {
+					return false
+				}
+			}
+		}
+		if hasReclaimablePersistentDiskBacking(slot) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasReclaimablePersistentDiskBacking(slot *infrav1.ResourceSlot) bool {
+	for i := range slot.PersistentDisks {
+		if slot.PersistentDisks[i].VolumePath != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeDesiredDatacenter(datacenter string) string {
+	if datacenter == "*" {
+		return ""
+	}
+	return datacenter
+}
+
 func slotMatchesDatacenterConstraints(pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, desiredDatacenter string, allowedDatacenters map[string]struct{}) bool {
+	desiredDatacenter = normalizeDesiredDatacenter(desiredDatacenter)
 	resolvedDatacenter := ResolveResourcePoolDatacenter(pool, slot)
 	if desiredDatacenter != "" {
 		if resolvedDatacenter != desiredDatacenter {
@@ -89,6 +247,7 @@ func AllocateSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectRe
 	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
 		return nil, err
 	}
+	desiredDatacenter = normalizeDesiredDatacenter(desiredDatacenter)
 
 	allowedDatacenterSet := make(map[string]struct{}, len(allowedDatacenters))
 	for _, datacenter := range allowedDatacenters {

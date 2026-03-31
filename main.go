@@ -432,6 +432,10 @@ func setupVAPIControllers(ctx context.Context, controllerCtx *capvcontext.Contro
 		return err
 	}
 
+	if err := (&webhooks.VSphereResourcePool{}).SetupWebhookWithManager(mgr); err != nil {
+		return err
+	}
+
 	if err := (&webhooks.VSphereVM{}).SetupWebhookWithManager(mgr); err != nil {
 		return err
 	}
@@ -441,6 +445,14 @@ func setupVAPIControllers(ctx context.Context, controllerCtx *capvcontext.Contro
 	}
 
 	if err := (&webhooks.VSphereFailureDomain{}).SetupWebhookWithManager(mgr); err != nil {
+		return err
+	}
+
+	if err := (&webhooks.KubeadmControlPlane{}).SetupWebhookWithManager(mgr); err != nil {
+		return err
+	}
+
+	if err := (&webhooks.MachineDeployment{}).SetupWebhookWithManager(mgr); err != nil {
 		return err
 	}
 
