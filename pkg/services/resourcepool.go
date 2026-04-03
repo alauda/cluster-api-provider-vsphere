@@ -41,6 +41,22 @@ func ConsumerRefsEqual(a, b *corev1.ObjectReference) bool {
 		a.Name == b.Name
 }
 
+// ObjectForConsumerRef returns an empty typed object for the given consumer
+// reference kind, or nil if the kind is unsupported.
+func ObjectForConsumerRef(ref *corev1.ObjectReference) client.Object {
+	if ref == nil {
+		return nil
+	}
+	switch ref.Kind {
+	case "KubeadmControlPlane":
+		return &controlplanev1.KubeadmControlPlane{}
+	case "MachineDeployment":
+		return &clusterv1.MachineDeployment{}
+	default:
+		return nil
+	}
+}
+
 func PoolRefsEqual(a, b *corev1.ObjectReference) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
@@ -477,6 +493,53 @@ func FindResourcePoolForMachine(ctx context.Context, c client.Client, namespace 
 	return nil, nil
 }
 
+// ApplyDiskBackfill updates persistent disk metadata (UnitNumber, VolumePath,
+// DiskUUID) in pool.Spec for the slot matching updatedSlot.Hostname.  Returns
+// true if any field was changed.
+func ApplyDiskBackfill(pool *infrav1.VSphereResourcePool, updatedSlot *infrav1.ResourceSlot) bool {
+	if pool == nil || updatedSlot == nil {
+		return false
+	}
+	updated := false
+	for i := range pool.Spec.Resources {
+		if pool.Spec.Resources[i].Hostname != updatedSlot.Hostname {
+			continue
+		}
+		for j := range pool.Spec.Resources[i].PersistentDisks {
+			pdInSpec := &pool.Spec.Resources[i].PersistentDisks[j]
+			for _, updatedDisk := range updatedSlot.PersistentDisks {
+				if pdInSpec.Name != updatedDisk.Name {
+					continue
+				}
+				// Skip if both have UnitNumber set but they disagree — avoids
+				// cross-writing between disks that happen to share a name.
+				if pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber {
+					continue
+				}
+				if pdInSpec.VolumePath != updatedDisk.VolumePath {
+					pdInSpec.VolumePath = updatedDisk.VolumePath
+					updated = true
+				}
+				if pdInSpec.DiskUUID != updatedDisk.DiskUUID {
+					pdInSpec.DiskUUID = updatedDisk.DiskUUID
+					updated = true
+				}
+				if (pdInSpec.UnitNumber == nil) != (updatedDisk.UnitNumber == nil) || (pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber) {
+					if updatedDisk.UnitNumber == nil {
+						pdInSpec.UnitNumber = nil
+					} else {
+						unitNumber := *updatedDisk.UnitNumber
+						pdInSpec.UnitNumber = &unitNumber
+					}
+					updated = true
+				}
+			}
+		}
+		break
+	}
+	return updated
+}
+
 // PersistSlotChanges updates the VSphereResourcePool Spec with the backfilled slot information.
 func PersistSlotChanges(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, updatedSlot *infrav1.ResourceSlot) error {
 	if poolRef == nil || updatedSlot == nil {
@@ -488,51 +551,14 @@ func PersistSlotChanges(ctx context.Context, c client.Client, poolRef *corev1.Ob
 		return err
 	}
 
-	updated := false
-	for i := range pool.Spec.Resources {
-		if pool.Spec.Resources[i].Hostname == updatedSlot.Hostname {
-			// Backfill VolumePath and DiskUUID with UnitNumber validation
-			for j := range pool.Spec.Resources[i].PersistentDisks {
-				pdInSpec := &pool.Spec.Resources[i].PersistentDisks[j]
-				for _, updatedDisk := range updatedSlot.PersistentDisks {
-					// Match by Name AND UnitNumber to ensure we are updating the correct disk
-					if pdInSpec.Name == updatedDisk.Name {
-						// Only update if UnitNumber matches (or if one is nil and we trust the name)
-						if pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber {
-							continue
-						}
-
-						if pdInSpec.VolumePath != updatedDisk.VolumePath {
-							pdInSpec.VolumePath = updatedDisk.VolumePath
-							updated = true
-						}
-						if pdInSpec.DiskUUID != updatedDisk.DiskUUID {
-							pdInSpec.DiskUUID = updatedDisk.DiskUUID
-							updated = true
-						}
-						if (pdInSpec.UnitNumber == nil) != (updatedDisk.UnitNumber == nil) || (pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber) {
-							if updatedDisk.UnitNumber == nil {
-								pdInSpec.UnitNumber = nil
-							} else {
-								unitNumber := *updatedDisk.UnitNumber
-								pdInSpec.UnitNumber = &unitNumber
-							}
-							updated = true
-						}
-					}
-				}
-			}
-			break
-		}
+	if !ApplyDiskBackfill(pool, updatedSlot) {
+		return nil
 	}
-
-	if updated {
-		if err := c.Update(ctx, pool); err != nil {
-			if apierrors.IsConflict(err) {
-				return errors.Wrapf(err, "transient conflict while persisting slot changes to pool %s/%s, will retry", pool.Namespace, pool.Name)
-			}
-			return err
+	if err := c.Update(ctx, pool); err != nil {
+		if apierrors.IsConflict(err) {
+			return errors.Wrapf(err, "transient conflict while persisting slot changes to pool %s/%s, will retry", pool.Namespace, pool.Name)
 		}
+		return err
 	}
 	return nil
 }

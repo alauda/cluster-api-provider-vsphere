@@ -46,6 +46,7 @@ import (
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/cluster"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/clustermodules"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/extra"
@@ -1234,39 +1235,7 @@ func persistResourceSlotBackfill(ctx context.Context, vmCtx *capvcontext.VMConte
 			return errors.Wrapf(err, "failed to get resource pool for vm %s", vmCtx.VSphereVM.Name)
 		}
 
-		updated := false
-		for i := range pool.Spec.Resources {
-			if pool.Spec.Resources[i].Hostname != vmCtx.ResourceSlot.Hostname {
-				continue
-			}
-			for j := range pool.Spec.Resources[i].PersistentDisks {
-				pdInSpec := &pool.Spec.Resources[i].PersistentDisks[j]
-				for _, updatedDisk := range vmCtx.ResourceSlot.PersistentDisks {
-					if pdInSpec.Name != updatedDisk.Name {
-						continue
-					}
-					if (pdInSpec.UnitNumber == nil) != (updatedDisk.UnitNumber == nil) || (pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber) {
-						if updatedDisk.UnitNumber == nil {
-							pdInSpec.UnitNumber = nil
-						} else {
-							unitNumber := *updatedDisk.UnitNumber
-							pdInSpec.UnitNumber = &unitNumber
-						}
-						updated = true
-					}
-					if pdInSpec.VolumePath != updatedDisk.VolumePath {
-						pdInSpec.VolumePath = updatedDisk.VolumePath
-						updated = true
-					}
-					if pdInSpec.DiskUUID != updatedDisk.DiskUUID {
-						pdInSpec.DiskUUID = updatedDisk.DiskUUID
-						updated = true
-					}
-				}
-			}
-		}
-
-		if !updated {
+		if !services.ApplyDiskBackfill(pool, vmCtx.ResourceSlot) {
 			return nil
 		}
 

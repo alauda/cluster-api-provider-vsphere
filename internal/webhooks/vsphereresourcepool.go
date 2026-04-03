@@ -71,7 +71,7 @@ func (webhook *VSphereResourcePool) validateConsumerRef(ctx context.Context, old
 		allErrs = append(allErrs, field.Forbidden(consumerPath, "cannot rebind directly to a different consumer; wait until the pool is unbound"))
 	}
 	if oldObj != nil && oldObj.Spec.ConsumerRef != nil && newObj.Spec.ConsumerRef == nil {
-		target := consumerObjectForRef(oldObj.Spec.ConsumerRef)
+		target := services.ObjectForConsumerRef(oldObj.Spec.ConsumerRef)
 		if target != nil {
 			key := client.ObjectKey{Namespace: oldObj.Namespace, Name: oldObj.Spec.ConsumerRef.Name}
 			if err := webhook.Client.Get(ctx, key, target); err == nil {
@@ -105,7 +105,7 @@ func (webhook *VSphereResourcePool) validateConsumerRef(ctx context.Context, old
 		allErrs = append(allErrs, field.Required(consumerPath.Child("name"), "must be set"))
 	}
 
-	if target := consumerObjectForRef(ref); target != nil {
+	if target := services.ObjectForConsumerRef(ref); target != nil {
 		key := client.ObjectKey{Namespace: newObj.Namespace, Name: ref.Name}
 		if err := webhook.Client.Get(ctx, key, target); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -135,16 +135,3 @@ func (webhook *VSphereResourcePool) validateConsumerRef(ctx context.Context, old
 	return allErrs
 }
 
-func consumerObjectForRef(ref *corev1.ObjectReference) client.Object {
-	if ref == nil {
-		return nil
-	}
-	switch ref.Kind {
-	case "KubeadmControlPlane":
-		return &controlplanev1.KubeadmControlPlane{}
-	case "MachineDeployment":
-		return &clusterv1.MachineDeployment{}
-	default:
-		return nil
-	}
-}

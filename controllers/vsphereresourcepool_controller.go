@@ -25,12 +25,9 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/finalizers"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
@@ -242,7 +239,7 @@ func (r resourcePoolReconciler) reconcileConsumerBinding(ctx context.Context, po
 		return false, nil
 	}
 
-	target := objectForConsumer(pool.Spec.ConsumerRef)
+	target := services.ObjectForConsumerRef(pool.Spec.ConsumerRef)
 	if target == nil {
 		return false, errors.Errorf("unsupported consumer kind %q on VSphereResourcePool %s/%s", pool.Spec.ConsumerRef.Kind, pool.Namespace, pool.Name)
 	}
@@ -259,19 +256,6 @@ func (r resourcePoolReconciler) reconcileConsumerBinding(ctx context.Context, po
 	return true, nil
 }
 
-func objectForConsumer(ref *corev1.ObjectReference) client.Object {
-	if ref == nil {
-		return nil
-	}
-	switch ref.Kind {
-	case "KubeadmControlPlane":
-		return &controlplanev1.KubeadmControlPlane{}
-	case "MachineDeployment":
-		return &clusterv1.MachineDeployment{}
-	default:
-		return nil
-	}
-}
 
 func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, status *infrav1.ResourceSlotStatus) (bool, time.Duration, error) {
 	log := ctrl.LoggerFrom(ctx)
