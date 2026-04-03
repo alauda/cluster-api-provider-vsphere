@@ -474,7 +474,7 @@ func mergeCloudConfigBodies(baseBody []byte, extraBody []byte) ([]byte, error) {
 	mergeMap(baseConfig, extraConfig, "disk_setup")
 	mergeSequenceBefore(baseConfig, extraConfig, "fs_setup")
 	mergeSequenceBefore(baseConfig, extraConfig, "mounts")
-	mergeSequenceBefore(baseConfig, extraConfig, "write_files")
+	mergeWriteFiles(baseConfig, extraConfig)
 	mergeSequenceBefore(baseConfig, extraConfig, "runcmd")
 
 	return yaml.Marshal(baseConfig)
@@ -508,6 +508,68 @@ func mergeSequenceBefore(base map[interface{}]interface{}, extra map[interface{}
 	base[key] = extraSeq
 }
 
+// mergeWriteFiles merges write_files entries from extra into base, replacing
+// base entries that share the same "path" with the extra version.  This ensures
+// that updated file content (e.g. refreshed DiskUUID in persistent-disks.tsv)
+// overwrites the stale entry instead of being appended alongside it.
+func mergeWriteFiles(base, extra map[interface{}]interface{}) {
+	const key = "write_files"
+	extraVal, ok := extra[key]
+	if !ok {
+		return
+	}
+	extraSeq, ok := extraVal.([]interface{})
+	if !ok {
+		base[key] = extraVal
+		return
+	}
+
+	baseVal, ok := base[key]
+	if !ok {
+		base[key] = extraSeq
+		return
+	}
+	baseSeq, ok := baseVal.([]interface{})
+	if !ok {
+		base[key] = extraSeq
+		return
+	}
+
+	// Index extra entries by path for O(1) lookup.
+	extraPaths := map[string]struct{}{}
+	for _, item := range extraSeq {
+		if p := writeFilePath(item); p != "" {
+			extraPaths[p] = struct{}{}
+		}
+	}
+
+	// Start with extra entries (they take precedence), then append base entries
+	// whose path is not overridden by extra.
+	merged := make([]interface{}, 0, len(extraSeq)+len(baseSeq))
+	merged = append(merged, extraSeq...)
+	for _, item := range baseSeq {
+		p := writeFilePath(item)
+		if p != "" {
+			if _, overridden := extraPaths[p]; overridden {
+				continue
+			}
+		} else if containsYAMLEqual(merged, item) {
+			continue
+		}
+		merged = append(merged, item)
+	}
+	base[key] = merged
+}
+
+func writeFilePath(item interface{}) string {
+	m, ok := item.(map[interface{}]interface{})
+	if !ok {
+		return ""
+	}
+	p, _ := m["path"].(string)
+	return p
+}
+
 func mergeMap(base map[interface{}]interface{}, extra map[interface{}]interface{}, key string) {
 	extraVal, ok := extra[key]
 	if !ok {
@@ -537,7 +599,7 @@ func capvDiskPath(name string) string {
 
 func persistentDiskReconcileScript() string {
 	return `#!/bin/sh
-set -eu
+set -u
 
 CONFIG_FILE="/etc/capv/persistent-disks.tsv"
 DEVICE_DIR="/dev/disk/by-capv"
@@ -629,9 +691,27 @@ ${device_path}"
 find_device_by_unit() {
   unit_number="${1:-}"
   [ -n "${unit_number}" ] || return 1
-  device_path="$(readlink -f /dev/disk/by-path/*-scsi-0:0:${unit_number}:0 2>/dev/null | head -n 1 || true)"
-  [ -n "${device_path}" ] || return 1
-  printf '%s\n' "${device_path}"
+  raw_device="$(readlink -f /dev/disk/by-path/*-scsi-0:0:${unit_number}:0 2>/dev/null | head -n 1 || true)"
+  [ -n "${raw_device}" ] || return 1
+
+  # When multipath is active the raw SCSI device (e.g. /dev/sdc) is claimed by
+  # device-mapper.  Formatting or mounting the raw device fails with "apparently
+  # in use".  Walk the holders to find the corresponding dm node.
+  raw_base="$(basename "${raw_device}")"
+  holder_dir="/sys/block/${raw_base}/holders"
+  if [ -d "${holder_dir}" ]; then
+    for holder in "${holder_dir}"/*; do
+      [ -e "${holder}" ] || continue
+      holder_name="$(basename "${holder}")"
+      dm_uuid_file="/sys/block/${holder_name}/dm/uuid"
+      if [ -f "${dm_uuid_file}" ] && grep -qi '^mpath-' "${dm_uuid_file}"; then
+        printf '/dev/%s\n' "${holder_name}"
+        return 0
+      fi
+    done
+  fi
+
+  printf '%s\n' "${raw_device}"
 }
 
 while true; do
@@ -663,7 +743,10 @@ while true; do
         echo "missing formatter ${mkfs_cmd} for disk ${disk_name}" >&2
         continue
       fi
-      "${mkfs_cmd}" -F "${device_path}"
+      if ! "${mkfs_cmd}" -F "${device_path}"; then
+        echo "failed to format ${device_path} for disk ${disk_name}" >&2
+        continue
+      fi
     fi
 
     if [ -n "${mount_path}" ]; then

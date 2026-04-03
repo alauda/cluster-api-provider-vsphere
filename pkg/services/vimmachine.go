@@ -659,26 +659,34 @@ func (v *VimMachineService) persistResourcePoolChanges(ctx context.Context, vimM
 		return nil
 	}
 
-	pool := &infrav1.VSphereResourcePool{}
-	if err := v.Client.Get(ctx, client.ObjectKey{Namespace: vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef.Namespace, Name: vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef.Name}, pool); err != nil {
-		return err
-	}
-
-	updated := false
-	for i := range pool.Spec.Resources {
-		if pool.Spec.Resources[i].Hostname == vimMachineCtx.ResourceSlot.Hostname {
-			// Update the persistent disks status in the pool based on what was backfilled in the context
-			pool.Spec.Resources[i].PersistentDisks = vimMachineCtx.ResourceSlot.PersistentDisks
-			updated = true
-			break
+	poolKey := client.ObjectKey{Namespace: vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef.Namespace, Name: vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef.Name}
+	for range 3 {
+		pool := &infrav1.VSphereResourcePool{}
+		if err := v.Client.Get(ctx, poolKey, pool); err != nil {
+			return err
 		}
-	}
 
-	if updated {
-		// Note: Updating Spec here might be controversial, but it's required to persist VolumePath
-		return v.Client.Update(ctx, pool)
+		updated := false
+		for i := range pool.Spec.Resources {
+			if pool.Spec.Resources[i].Hostname == vimMachineCtx.ResourceSlot.Hostname {
+				pool.Spec.Resources[i].PersistentDisks = vimMachineCtx.ResourceSlot.PersistentDisks
+				updated = true
+				break
+			}
+		}
+
+		if !updated {
+			return nil
+		}
+		if err := v.Client.Update(ctx, pool); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return err
+		}
+		return nil
 	}
-	return nil
+	return errors.New("transient conflict while persisting resource pool changes, exhausted retries")
 }
 
 func (v *VimMachineService) mergeSlotNetwork(vm *infrav1.VSphereVM, slotNetworks []infrav1.NetworkConfig) {

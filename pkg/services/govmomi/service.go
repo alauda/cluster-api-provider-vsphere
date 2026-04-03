@@ -33,6 +33,7 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apitypes "k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -1031,14 +1032,32 @@ func (vms *VMService) detachPersistentDisks(ctx context.Context, virtualMachineC
 		return nil
 	}
 
+	scsiKeys := findSCSIControllerKeys(devices)
+
 	for _, d := range disks {
 		disk := d.(*types.VirtualDisk)
+		// Only consider disks on SCSI controllers; persistent data disks are
+		// never placed on IDE/SATA controllers.
+		if len(scsiKeys) > 0 {
+			if _, onSCSI := scsiKeys[disk.GetVirtualDevice().ControllerKey]; !onSCSI {
+				continue
+			}
+		}
 		if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
 			for _, pd := range virtualMachineCtx.ResourceSlot.PersistentDisks {
 				match := false
-				if pd.VolumePath != "" && backing.FileName == pd.VolumePath {
-					match = true
+				if pd.VolumePath != "" {
+					// VolumePath is the most precise identifier — use it as the primary match.
+					if backing.FileName == pd.VolumePath {
+						match = true
+						if pd.UnitNumber != nil && disk.UnitNumber != nil && *pd.UnitNumber != *disk.UnitNumber {
+							log.Info("WARNING: persistent disk VolumePath matches but UnitNumber differs",
+								"disk", pd.Name, "path", backing.FileName,
+								"expectedUnit", *pd.UnitNumber, "actualUnit", *disk.UnitNumber)
+						}
+					}
 				} else if pd.UnitNumber != nil && disk.UnitNumber != nil && *pd.UnitNumber == *disk.UnitNumber {
+					// Fall back to UnitNumber only when VolumePath is not available.
 					match = true
 				}
 
@@ -1078,12 +1097,13 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 	}
 
 	disks := devices.SelectByType((*types.VirtualDisk)(nil))
+	scsiKeys := findSCSIControllerKeys(devices)
 	updated := false
 	usedDiskKeys := map[int32]struct{}{}
 
 	for i := range virtualMachineCtx.ResourceSlot.PersistentDisks {
 		pd := &virtualMachineCtx.ResourceSlot.PersistentDisks[i]
-		disk := findPersistentDiskDevice(pd, disks, usedDiskKeys)
+		disk := findPersistentDiskDevice(pd, disks, usedDiskKeys, scsiKeys)
 		if disk == nil {
 			continue
 		}
@@ -1113,14 +1133,54 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 	return nil
 }
 
-func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDeviceList, usedDiskKeys map[int32]struct{}) *types.VirtualDisk {
+// findSCSIControllerKeys returns the keys of all SCSI controllers found in devices.
+func findSCSIControllerKeys(devices object.VirtualDeviceList) map[int32]struct{} {
+	keys := map[int32]struct{}{}
+	for _, device := range devices {
+		if sc, ok := device.(types.BaseVirtualSCSIController); ok {
+			keys[sc.GetVirtualSCSIController().Key] = struct{}{}
+		}
+	}
+	return keys
+}
+
+// findPersistentDiskDevice locates the VM disk that corresponds to a persistent
+// disk spec.  It uses a three-tier match strategy:
+//  1. VolumePath (exact VMDK file path — globally unique, most reliable)
+//  2. UnitNumber on a SCSI controller (stable across VM recreations when the
+//     same unit is reused)
+//  3. Capacity on a SCSI controller (last resort; returns nil if ambiguous)
+//
+// Tiers 2 and 3 are restricted to SCSI controllers because CAPV always places
+// persistent data disks on SCSI.  This prevents false matches against the OS
+// disk when it lives on an IDE or SATA controller.
+func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDeviceList, usedDiskKeys map[int32]struct{}, scsiKeys map[int32]struct{}) *types.VirtualDisk {
 	if pd == nil {
 		return nil
 	}
 
+	// Tier 1: match by VolumePath (any controller — the path is unique).
+	if pd.VolumePath != "" {
+		for _, d := range disks {
+			disk := d.(*types.VirtualDisk)
+			if _, used := usedDiskKeys[disk.Key]; used {
+				continue
+			}
+			if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+				if backing.FileName == pd.VolumePath {
+					return disk
+				}
+			}
+		}
+	}
+
+	// Tier 2: match by UnitNumber on a SCSI controller.
 	if pd.UnitNumber != nil {
 		for _, d := range disks {
 			disk := d.(*types.VirtualDisk)
+			if _, onSCSI := scsiKeys[disk.GetVirtualDevice().ControllerKey]; !onSCSI {
+				continue
+			}
 			if disk.UnitNumber == nil || *disk.UnitNumber != *pd.UnitNumber {
 				continue
 			}
@@ -1131,10 +1191,14 @@ func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDe
 		}
 	}
 
+	// Tier 3: match by capacity on a SCSI controller (must be unambiguous).
 	expectedCapacityKB := int64(pd.SizeGiB) * 1024 * 1024
 	var match *types.VirtualDisk
 	for _, d := range disks {
 		disk := d.(*types.VirtualDisk)
+		if _, onSCSI := scsiKeys[disk.GetVirtualDevice().ControllerKey]; !onSCSI {
+			continue
+		}
 		if _, used := usedDiskKeys[disk.Key]; used {
 			continue
 		}
@@ -1159,53 +1223,60 @@ func persistResourceSlotBackfill(ctx context.Context, vmCtx *capvcontext.VMConte
 		return err
 	}
 
-	pool := &infrav1.VSphereResourcePool{}
-	if err := vmCtx.Client.Get(ctx, client.ObjectKey{
+	poolKey := client.ObjectKey{
 		Namespace: machine.Spec.ResourcePoolRef.Namespace,
 		Name:      machine.Spec.ResourcePoolRef.Name,
-	}, pool); err != nil {
-		return errors.Wrapf(err, "failed to get resource pool for vm %s", vmCtx.VSphereVM.Name)
 	}
 
-	updated := false
-	for i := range pool.Spec.Resources {
-		if pool.Spec.Resources[i].Hostname != vmCtx.ResourceSlot.Hostname {
-			continue
+	for range 3 {
+		pool := &infrav1.VSphereResourcePool{}
+		if err := vmCtx.Client.Get(ctx, poolKey, pool); err != nil {
+			return errors.Wrapf(err, "failed to get resource pool for vm %s", vmCtx.VSphereVM.Name)
 		}
-		for j := range pool.Spec.Resources[i].PersistentDisks {
-			pdInSpec := &pool.Spec.Resources[i].PersistentDisks[j]
-			for _, updatedDisk := range vmCtx.ResourceSlot.PersistentDisks {
-				if pdInSpec.Name != updatedDisk.Name {
-					continue
-				}
-				if (pdInSpec.UnitNumber == nil) != (updatedDisk.UnitNumber == nil) || (pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber) {
-					if updatedDisk.UnitNumber == nil {
-						pdInSpec.UnitNumber = nil
-					} else {
-						unitNumber := *updatedDisk.UnitNumber
-						pdInSpec.UnitNumber = &unitNumber
+
+		updated := false
+		for i := range pool.Spec.Resources {
+			if pool.Spec.Resources[i].Hostname != vmCtx.ResourceSlot.Hostname {
+				continue
+			}
+			for j := range pool.Spec.Resources[i].PersistentDisks {
+				pdInSpec := &pool.Spec.Resources[i].PersistentDisks[j]
+				for _, updatedDisk := range vmCtx.ResourceSlot.PersistentDisks {
+					if pdInSpec.Name != updatedDisk.Name {
+						continue
 					}
-					updated = true
-				}
-				if pdInSpec.VolumePath != updatedDisk.VolumePath {
-					pdInSpec.VolumePath = updatedDisk.VolumePath
-					updated = true
-				}
-				if pdInSpec.DiskUUID != updatedDisk.DiskUUID {
-					pdInSpec.DiskUUID = updatedDisk.DiskUUID
-					updated = true
+					if (pdInSpec.UnitNumber == nil) != (updatedDisk.UnitNumber == nil) || (pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber) {
+						if updatedDisk.UnitNumber == nil {
+							pdInSpec.UnitNumber = nil
+						} else {
+							unitNumber := *updatedDisk.UnitNumber
+							pdInSpec.UnitNumber = &unitNumber
+						}
+						updated = true
+					}
+					if pdInSpec.VolumePath != updatedDisk.VolumePath {
+						pdInSpec.VolumePath = updatedDisk.VolumePath
+						updated = true
+					}
+					if pdInSpec.DiskUUID != updatedDisk.DiskUUID {
+						pdInSpec.DiskUUID = updatedDisk.DiskUUID
+						updated = true
+					}
 				}
 			}
 		}
-	}
 
-	if !updated {
+		if !updated {
+			return nil
+		}
+
+		if err := vmCtx.Client.Update(ctx, pool); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return errors.Wrapf(err, "failed to persist resource pool disk backfill for vm %s", vmCtx.VSphereVM.Name)
+		}
 		return nil
 	}
-
-	if err := vmCtx.Client.Update(ctx, pool); err != nil {
-		return errors.Wrapf(err, "failed to persist resource pool disk backfill for vm %s", vmCtx.VSphereVM.Name)
-	}
-
-	return nil
+	return errors.Errorf("transient conflict while persisting resource pool disk backfill for vm %s, exhausted retries", vmCtx.VSphereVM.Name)
 }

@@ -521,11 +521,13 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 		vd := dev.GetVirtualDevice()
 		vd.ControllerKey = controllerKey
 
-		// MODIFICATION: Assign unit number, favoring fixed unit number if provided
+		// Assign unit number, favoring fixed unit number from persistent disk spec if provided.
 		var unitNumber int32
 		if pd != nil && pd.UnitNumber != nil {
 			unitNumber = *pd.UnitNumber
-			unitNumberAssigner.markUsed(unitNumber)
+			if err := unitNumberAssigner.markUsed(unitNumber); err != nil {
+				return nil, errors.Wrapf(err, "invalid unit number for persistent disk %q", pd.Name)
+			}
 		} else {
 			unitNumber, err = unitNumberAssigner.assign()
 			if err != nil {
@@ -622,7 +624,7 @@ func newUnitNumberAssigner(controller types.BaseVirtualController, existingDevic
 	// Mark all unit numbers of existing devices as used
 	for _, device := range existingDevices {
 		d := device.GetVirtualDevice()
-		if d.ControllerKey == controllerKey && d.UnitNumber != nil {
+		if d.ControllerKey == controllerKey && d.UnitNumber != nil && *d.UnitNumber >= 0 && int(*d.UnitNumber) < len(used) {
 			used[*d.UnitNumber] = true
 		}
 	}
@@ -631,11 +633,16 @@ func newUnitNumberAssigner(controller types.BaseVirtualController, existingDevic
 	return &unitNumberAssigner{used: used, offset: 0}, nil
 }
 
-// ADDITION: markUsed marks a specific unit number as used.
-func (a *unitNumberAssigner) markUsed(unit int32) {
-	if unit >= 0 && int(unit) < len(a.used) {
-		a.used[unit] = true
+// markUsed marks a specific unit number as used.
+func (a *unitNumberAssigner) markUsed(unit int32) error {
+	if unit < 0 || int(unit) >= len(a.used) {
+		return fmt.Errorf("unit number %d is out of valid range [0, %d)", unit, len(a.used))
 	}
+	if a.used[unit] {
+		return fmt.Errorf("unit number %d is already in use", unit)
+	}
+	a.used[unit] = true
+	return nil
 }
 
 func (a *unitNumberAssigner) assign() (int32, error) {

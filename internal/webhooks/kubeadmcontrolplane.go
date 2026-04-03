@@ -112,10 +112,14 @@ func rejectOtherObjectsReferencingPool(ctx context.Context, c client.Client, poo
 			continue
 		}
 		template := &infrav1.VSphereMachineTemplate{}
-		if err := c.Get(ctx, client.ObjectKey{Namespace: kcp.Namespace, Name: kcp.Spec.MachineTemplate.InfrastructureRef.Name}, template); err == nil {
-			if services.ConsumerRefsEqual(template.Spec.Template.Spec.ResourcePoolRef, poolRef) {
-				return errors.Errorf("resource pool %s/%s is already referenced by KubeadmControlPlane %s/%s", poolRef.Namespace, poolRef.Name, kcp.Namespace, kcp.Name)
+		if err := c.Get(ctx, client.ObjectKey{Namespace: kcp.Namespace, Name: kcp.Spec.MachineTemplate.InfrastructureRef.Name}, template); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
 			}
+			return err
+		}
+		if services.ConsumerRefsEqual(template.Spec.Template.Spec.ResourcePoolRef, poolRef) {
+			return errors.Errorf("resource pool %s/%s is already referenced by KubeadmControlPlane %s/%s", poolRef.Namespace, poolRef.Name, kcp.Namespace, kcp.Name)
 		}
 	}
 
@@ -132,10 +136,14 @@ func rejectOtherObjectsReferencingPool(ctx context.Context, c client.Client, poo
 			continue
 		}
 		template := &infrav1.VSphereMachineTemplate{}
-		if err := c.Get(ctx, client.ObjectKey{Namespace: md.Namespace, Name: md.Spec.Template.Spec.InfrastructureRef.Name}, template); err == nil {
-			if services.ConsumerRefsEqual(template.Spec.Template.Spec.ResourcePoolRef, poolRef) {
-				return errors.Errorf("resource pool %s/%s is already referenced by MachineDeployment %s/%s", poolRef.Namespace, poolRef.Name, md.Namespace, md.Name)
+		if err := c.Get(ctx, client.ObjectKey{Namespace: md.Namespace, Name: md.Spec.Template.Spec.InfrastructureRef.Name}, template); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
 			}
+			return err
+		}
+		if services.ConsumerRefsEqual(template.Spec.Template.Spec.ResourcePoolRef, poolRef) {
+			return errors.Errorf("resource pool %s/%s is already referenced by MachineDeployment %s/%s", poolRef.Namespace, poolRef.Name, md.Namespace, md.Name)
 		}
 	}
 	return nil
