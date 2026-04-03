@@ -277,7 +277,10 @@ func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, po
 	log := ctrl.LoggerFrom(ctx)
 	slotDatacenter := services.ResolveResourcePoolDatacenter(pool, slot)
 
-	// 1. Establish session
+	if slotDatacenter == "" {
+		return false, 0, errors.Errorf("datacenter must be specified on slot %q or VSphereResourcePool %s/%s for resource reclamation", slot.Hostname, pool.Namespace, pool.Name)
+	}
+
 	params := session.NewParams().
 		WithUserInfo(r.ControllerManagerContext.Username, r.ControllerManagerContext.Password).
 		WithServer(pool.Spec.Server).
@@ -299,14 +302,8 @@ func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, po
 				"diskUUID", pd.DiskUUID,
 				"unitNumber", pd.UnitNumber,
 			)
-			// Delete the .vmdk file
 			m := object.NewFileManager(s.Client.Client)
-
-			dcName := slotDatacenter
-			if dcName == "" {
-				return false, 0, errors.Errorf("datacenter must be specified on slot %q or VSphereResourcePool %s/%s for resource reclamation", slot.Hostname, pool.Namespace, pool.Name)
-			}
-			dc, err := s.Finder.Datacenter(ctx, dcName)
+			dc, err := s.Finder.Datacenter(ctx, slotDatacenter)
 			if err != nil {
 				return false, 0, errors.Wrapf(err, "failed to find datacenter %s for reclamation", dcName)
 			}
