@@ -351,3 +351,131 @@ func storagePolicyModel() (*simulator.Model, error) {
 	model.Host = 1
 	return model, nil
 }
+
+func TestFindSCSIControllerKeys(t *testing.T) {
+	g := NewWithT(t)
+
+	scsi1 := &types.ParaVirtualSCSIController{
+		VirtualSCSIController: types.VirtualSCSIController{
+			VirtualController: types.VirtualController{
+				VirtualDevice: types.VirtualDevice{Key: 1000},
+			},
+		},
+	}
+	scsi2 := &types.ParaVirtualSCSIController{
+		VirtualSCSIController: types.VirtualSCSIController{
+			VirtualController: types.VirtualController{
+				VirtualDevice: types.VirtualDevice{Key: 1001},
+			},
+		},
+	}
+	ide := &types.VirtualIDEController{
+		VirtualController: types.VirtualController{
+			VirtualDevice: types.VirtualDevice{Key: 200},
+		},
+	}
+
+	keys := findSCSIControllerKeys(object.VirtualDeviceList{scsi1, ide, scsi2})
+	g.Expect(keys).To(HaveLen(2))
+	g.Expect(keys).To(HaveKey(int32(1000)))
+	g.Expect(keys).To(HaveKey(int32(1001)))
+
+	empty := findSCSIControllerKeys(object.VirtualDeviceList{ide})
+	g.Expect(empty).To(BeEmpty())
+}
+
+func TestFindPersistentDiskDevice(t *testing.T) {
+	scsiKey := int32(1000)
+	ideKey := int32(200)
+	scsiKeys := map[int32]struct{}{scsiKey: {}}
+
+	newDisk := func(key, controllerKey int32, unitNumber *int32, capacityGiB int32, fileName string) *types.VirtualDisk {
+		backing := &types.VirtualDiskFlatVer2BackingInfo{
+			VirtualDeviceFileBackingInfo: types.VirtualDeviceFileBackingInfo{FileName: fileName},
+		}
+		return &types.VirtualDisk{
+			VirtualDevice: types.VirtualDevice{
+				Key:           key,
+				ControllerKey: controllerKey,
+				UnitNumber:    unitNumber,
+				Backing:       backing,
+			},
+			CapacityInKB: int64(capacityGiB) * 1024 * 1024,
+		}
+	}
+	int32Ptr := func(v int32) *int32 { return &v }
+
+	t.Run("tier1: match by VolumePath ignoring controller", func(t *testing.T) {
+		g := NewWithT(t)
+		// Disk on IDE controller but VolumePath matches — tier 1 should find it.
+		disk := newDisk(1, ideKey, int32Ptr(0), 20, "[ds] vm/data.vmdk")
+		disks := object.VirtualDeviceList{disk}
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, VolumePath: "[ds] vm/data.vmdk"}
+		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).NotTo(BeNil())
+		g.Expect(result.Key).To(Equal(int32(1)))
+	})
+
+	t.Run("tier2: match by UnitNumber on SCSI only", func(t *testing.T) {
+		g := NewWithT(t)
+		osDisk := newDisk(1, ideKey, int32Ptr(0), 300, "[ds] vm/os.vmdk")
+		dataDisk := newDisk(2, scsiKey, int32Ptr(0), 20, "[ds] vm/data.vmdk")
+		disks := object.VirtualDeviceList{osDisk, dataDisk}
+
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, UnitNumber: int32Ptr(0)}
+		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).NotTo(BeNil())
+		g.Expect(result.Key).To(Equal(int32(2)), "should match SCSI disk, not IDE OS disk")
+	})
+
+	t.Run("tier2: skips IDE disk even with matching unit number", func(t *testing.T) {
+		g := NewWithT(t)
+		osDisk := newDisk(1, ideKey, int32Ptr(1), 20, "[ds] vm/os.vmdk")
+		disks := object.VirtualDeviceList{osDisk}
+
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, UnitNumber: int32Ptr(1)}
+		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).To(BeNil(), "should not match IDE disk by unit number")
+	})
+
+	t.Run("tier3: capacity match on SCSI only", func(t *testing.T) {
+		g := NewWithT(t)
+		osDisk := newDisk(1, ideKey, int32Ptr(0), 20, "[ds] vm/os.vmdk")
+		dataDisk := newDisk(2, scsiKey, int32Ptr(0), 20, "[ds] vm/data.vmdk")
+		disks := object.VirtualDeviceList{osDisk, dataDisk}
+
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
+		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).NotTo(BeNil())
+		g.Expect(result.Key).To(Equal(int32(2)), "should match SCSI disk by capacity, not IDE")
+	})
+
+	t.Run("tier3: ambiguous capacity returns nil", func(t *testing.T) {
+		g := NewWithT(t)
+		d1 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
+		d2 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
+		disks := object.VirtualDeviceList{d1, d2}
+
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
+		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).To(BeNil(), "should return nil when two SCSI disks have same capacity")
+	})
+
+	t.Run("skips already used disk keys", func(t *testing.T) {
+		g := NewWithT(t)
+		d1 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
+		d2 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
+		disks := object.VirtualDeviceList{d1, d2}
+
+		used := map[int32]struct{}{1: {}}
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, UnitNumber: int32Ptr(0)}
+		result := findPersistentDiskDevice(pd, disks, used, scsiKeys)
+		g.Expect(result).To(BeNil(), "disk key 1 is used, unit 0 should not match")
+	})
+
+	t.Run("nil pd returns nil", func(t *testing.T) {
+		g := NewWithT(t)
+		result := findPersistentDiskDevice(nil, object.VirtualDeviceList{}, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).To(BeNil())
+	})
+}

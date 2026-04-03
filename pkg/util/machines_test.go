@@ -1294,6 +1294,99 @@ func toInt32Ptr(v int32) *int32 {
 	return &v
 }
 
+func Test_MergeCloudConfigUserData_WriteFilesReplaceByPath(t *testing.T) {
+	// Simulates the scenario where DiskUUID changes between reconciles:
+	// the updated write_files entry should replace the old one, not append.
+	oldDiskConfig, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+		Name:       "data-1",
+		UnitNumber: toInt32Ptr(1),
+		MountPath:  "/var/lib/data",
+		DiskUUID:   "old-uuid",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDiskConfig, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+		Name:       "data-1",
+		UnitNumber: toInt32Ptr(1),
+		MountPath:  "/var/lib/data",
+		DiskUUID:   "new-uuid",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := []byte(`#cloud-config
+
+runcmd:
+- echo ok
+`)
+	// First merge: old disk config into base.
+	first, err := util.MergeCloudConfigUserData(base, oldDiskConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(first), "old-uuid") {
+		t.Fatalf("expected old-uuid in first merge, got: %s", string(first))
+	}
+
+	// Second merge: new disk config into result that already has old config.
+	second, err := util.MergeCloudConfigUserData(first, newDiskConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := string(second)
+	if strings.Contains(result, "old-uuid") {
+		t.Fatalf("old-uuid should have been replaced, got: %s", result)
+	}
+	if !strings.Contains(result, "new-uuid") {
+		t.Fatalf("expected new-uuid in second merge, got: %s", result)
+	}
+	// Each file path should appear exactly once.
+	if strings.Count(result, "/etc/capv/persistent-disks.tsv") != 1 {
+		t.Fatalf("expected TSV file entry exactly once, got: %s", result)
+	}
+	if strings.Count(result, "/usr/local/bin/capv-persistent-disk-reconcile.sh") != 1 {
+		t.Fatalf("expected reconcile script entry exactly once, got: %s", result)
+	}
+}
+
+func Test_MergeCloudConfigUserData_PreservesNonOverlappingFiles(t *testing.T) {
+	base := []byte(`#cloud-config
+
+write_files:
+- path: /tmp/custom-file
+  content: keep-me
+runcmd:
+- echo ok
+`)
+	diskConfig, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+		Name:       "data-1",
+		UnitNumber: toInt32Ptr(1),
+		MountPath:  "/var/lib/data",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	merged, err := util.MergeCloudConfigUserData(base, diskConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := string(merged)
+
+	if !strings.Contains(result, "/tmp/custom-file") {
+		t.Fatalf("expected non-overlapping write_files entry to be preserved, got: %s", result)
+	}
+	if !strings.Contains(result, "keep-me") {
+		t.Fatalf("expected non-overlapping file content to be preserved, got: %s", result)
+	}
+	if !strings.Contains(result, "/etc/capv/persistent-disks.tsv") {
+		t.Fatalf("expected disk config file to be present, got: %s", result)
+	}
+}
+
 func TestConvertProviderIDToUUID(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 

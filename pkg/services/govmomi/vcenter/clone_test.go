@@ -537,3 +537,54 @@ func initSimulator(t *testing.T) (*simulator.Model, *session.Session, *simulator
 
 	return model, authSession, server
 }
+
+func TestMarkUsed(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	scsiController := &types.ParaVirtualSCSIController{
+		VirtualSCSIController: types.VirtualSCSIController{
+			VirtualController: types.VirtualController{
+				VirtualDevice: types.VirtualDevice{Key: 1000},
+			},
+			ScsiCtlrUnitNumber: 7,
+		},
+	}
+	devices := object.VirtualDeviceList{scsiController}
+
+	t.Run("marks valid unit number", func(t *testing.T) {
+		assigner, err := newUnitNumberAssigner(scsiController, devices)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+
+		err = assigner.markUsed(3)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+
+		// Unit 3 should now be taken, assign should skip it.
+		for i := int32(0); i < 3; i++ {
+			_, _ = assigner.assign()
+		}
+		unit, err := assigner.assign()
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(unit).NotTo(gomega.Equal(int32(3)), "unit 3 should be skipped")
+	})
+
+	t.Run("rejects out of range unit number", func(t *testing.T) {
+		assigner, err := newUnitNumberAssigner(scsiController, devices)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+
+		err = assigner.markUsed(30)
+		g.Expect(err).To(gomega.HaveOccurred())
+		g.Expect(err.Error()).To(gomega.ContainSubstring("out of valid range"))
+
+		err = assigner.markUsed(-1)
+		g.Expect(err).To(gomega.HaveOccurred())
+	})
+
+	t.Run("rejects already used unit number", func(t *testing.T) {
+		assigner, err := newUnitNumberAssigner(scsiController, devices)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+
+		err = assigner.markUsed(7) // SCSI controller unit
+		g.Expect(err).To(gomega.HaveOccurred())
+		g.Expect(err.Error()).To(gomega.ContainSubstring("already in use"))
+	})
+}

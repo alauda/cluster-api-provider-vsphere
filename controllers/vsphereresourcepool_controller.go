@@ -289,7 +289,7 @@ func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, po
 			m := object.NewFileManager(s.Client.Client)
 			dc, err := s.Finder.Datacenter(ctx, slotDatacenter)
 			if err != nil {
-				return false, 0, errors.Wrapf(err, "failed to find datacenter %s for reclamation", dcName)
+				return false, 0, errors.Wrapf(err, "failed to find datacenter %s for reclamation", slotDatacenter)
 			}
 
 			task, err := m.DeleteDatastoreFile(ctx, pd.VolumePath, dc)

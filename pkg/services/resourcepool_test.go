@@ -719,3 +719,114 @@ func TestResolveMachineConsumerRef(t *testing.T) {
 		g.Expect(ref).To(BeNil())
 	})
 }
+
+func TestApplyDiskBackfill(t *testing.T) {
+	int32Ptr := func(v int32) *int32 { return &v }
+
+	t.Run("backfills VolumePath DiskUUID UnitNumber", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereResourcePool{
+			Spec: infrav1.VSphereResourcePoolSpec{
+				Resources: []infrav1.ResourceSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "disk-a", SizeGiB: 20},
+					},
+				}},
+			},
+		}
+		updated := ApplyDiskBackfill(pool, &infrav1.ResourceSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
+			},
+		})
+		g.Expect(updated).To(BeTrue())
+		g.Expect(pool.Spec.Resources[0].PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk.vmdk"))
+		g.Expect(pool.Spec.Resources[0].PersistentDisks[0].DiskUUID).To(Equal("uuid-1"))
+		g.Expect(*pool.Spec.Resources[0].PersistentDisks[0].UnitNumber).To(Equal(int32(1)))
+	})
+
+	t.Run("returns false when nothing changed", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereResourcePool{
+			Spec: infrav1.VSphereResourcePoolSpec{
+				Resources: []infrav1.ResourceSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
+					},
+				}},
+			},
+		}
+		updated := ApplyDiskBackfill(pool, &infrav1.ResourceSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
+			},
+		})
+		g.Expect(updated).To(BeFalse())
+	})
+
+	t.Run("skips disk with mismatched UnitNumber", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereResourcePool{
+			Spec: infrav1.VSphereResourcePoolSpec{
+				Resources: []infrav1.ResourceSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(0)},
+					},
+				}},
+			},
+		}
+		updated := ApplyDiskBackfill(pool, &infrav1.ResourceSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(1), VolumePath: "[ds] wrong/disk.vmdk"},
+			},
+		})
+		g.Expect(updated).To(BeFalse(), "should skip update when UnitNumber disagrees")
+		g.Expect(pool.Spec.Resources[0].PersistentDisks[0].VolumePath).To(BeEmpty())
+	})
+
+	t.Run("no-op for non-matching hostname", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereResourcePool{
+			Spec: infrav1.VSphereResourcePoolSpec{
+				Resources: []infrav1.ResourceSlot{{
+					Hostname:        "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20}},
+				}},
+			},
+		}
+		updated := ApplyDiskBackfill(pool, &infrav1.ResourceSlot{
+			Hostname: "host-other",
+			PersistentDisks: []infrav1.PersistentDisk{
+				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk"},
+			},
+		})
+		g.Expect(updated).To(BeFalse())
+	})
+
+	t.Run("nil pool or slot returns false", func(t *testing.T) {
+		g := NewWithT(t)
+		g.Expect(ApplyDiskBackfill(nil, &infrav1.ResourceSlot{})).To(BeFalse())
+		g.Expect(ApplyDiskBackfill(&infrav1.VSphereResourcePool{}, nil)).To(BeFalse())
+	})
+}
+
+func TestObjectForConsumerRef(t *testing.T) {
+	g := NewWithT(t)
+
+	g.Expect(ObjectForConsumerRef(nil)).To(BeNil())
+
+	kcp := ObjectForConsumerRef(&corev1.ObjectReference{Kind: "KubeadmControlPlane"})
+	g.Expect(kcp).NotTo(BeNil())
+
+	md := ObjectForConsumerRef(&corev1.ObjectReference{Kind: "MachineDeployment"})
+	g.Expect(md).NotTo(BeNil())
+
+	unknown := ObjectForConsumerRef(&corev1.ObjectReference{Kind: "Pod"})
+	g.Expect(unknown).To(BeNil())
+}
