@@ -1078,8 +1078,8 @@ func Test_GetPersistentDiskCloudConfig(t *testing.T) {
 		t.Fatalf("expected reconcile script to stop relying on single-match counting, got: %s", scriptText)
 	}
 	runcmd, ok := actualMap["runcmd"].([]interface{})
-	if !ok || len(runcmd) != 2 {
-		t.Fatalf("expected 2 runcmd entries, got: %#v", actualMap["runcmd"])
+	if !ok || len(runcmd) != 3 {
+		t.Fatalf("expected 3 runcmd entries, got: %#v", actualMap["runcmd"])
 	}
 	actualStr := string(actual)
 	for _, expected := range []string{

@@ -388,6 +388,8 @@ func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk) ([]b
 
 	reconcileScript := persistentDiskReconcileScript()
 	serviceUnit := persistentDiskServiceUnit()
+	containerdDropin := persistentDiskContainerdDropin()
+	kubeletDropin := persistentDiskKubeletDropin()
 
 	config := map[interface{}]interface{}{
 		"write_files": []interface{}{
@@ -412,10 +414,31 @@ func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk) ([]b
 				"encoding":    "b64",
 				"content":     base64.StdEncoding.EncodeToString([]byte(serviceUnit)),
 			},
+			map[interface{}]interface{}{
+				"path":        "/etc/systemd/system/containerd.service.d/10-wait-disks.conf",
+				"permissions": "0644",
+				"owner":       "root:root",
+				"encoding":    "b64",
+				"content":     base64.StdEncoding.EncodeToString([]byte(containerdDropin)),
+			},
+			map[interface{}]interface{}{
+				"path":        "/etc/systemd/system/kubelet.service.d/10-wait-disks.conf",
+				"permissions": "0644",
+				"owner":       "root:root",
+				"encoding":    "b64",
+				"content":     base64.StdEncoding.EncodeToString([]byte(kubeletDropin)),
+			},
 		},
 		"runcmd": []interface{}{
 			[]interface{}{"systemctl", "daemon-reload"},
 			[]interface{}{"systemctl", "enable", "--now", "capv-persistent-disk-reconcile.service"},
+			// Restart containerd after persistent disks are mounted.  containerd
+			// starts early at boot (before cloud-init writes the drop-in files),
+			// so it initializes its data directories on the root filesystem.
+			// When the disk service later mounts persistent storage over
+			// /var/lib/containerd, containerd's in-memory state becomes stale.
+			// A restart forces containerd to re-initialize on the persistent disk.
+			[]interface{}{"systemctl", "restart", "containerd"},
 		},
 	}
 	return yaml.Marshal(config)
@@ -758,10 +781,16 @@ while true; do
           mount "${link_path}" "${mount_path}" || true
         fi
       fi
+      # ext4 creates lost+found on mkfs; etcd refuses to start if its
+      # data-dir is not empty, so remove it after mounting.
+      rm -rf "${mount_path}/lost+found"
     fi
   done < "${CONFIG_FILE}"
 
-  sleep 30
+  # First pass complete — all disks mounted. Exit successfully so that
+  # systemd marks this oneshot unit as "active (exited)", unblocking
+  # dependent services (containerd, kubelet) that require the mounts.
+  exit 0
 done
 `
 }
@@ -770,16 +799,30 @@ func persistentDiskServiceUnit() string {
 	return `[Unit]
 Description=CAPV Persistent Disk Reconcile
 After=local-fs.target
+Before=containerd.service kubelet.service
 Wants=local-fs.target
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/local/bin/capv-persistent-disk-reconcile.sh
-Restart=always
-RestartSec=15
 
 [Install]
 WantedBy=multi-user.target
+`
+}
+
+func persistentDiskContainerdDropin() string {
+	return `[Unit]
+After=capv-persistent-disk-reconcile.service
+Requires=capv-persistent-disk-reconcile.service
+`
+}
+
+func persistentDiskKubeletDropin() string {
+	return `[Unit]
+After=capv-persistent-disk-reconcile.service
+Requires=capv-persistent-disk-reconcile.service
 `
 }
 
