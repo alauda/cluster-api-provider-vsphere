@@ -66,6 +66,10 @@ type NetworkConfig struct {
     // NetworkName is the name of the vSphere network (PortGroup or DVPortGroup).
     NetworkName string `json:"networkName"`
 
+    // DeviceName explicitly assigns a guest OS interface name to the network device.
+    // +optional
+    DeviceName string `json:"deviceName,omitempty"`
+
     // IPv4 configuration
     IP      string `json:"ip,omitempty"`
     Gateway string `json:"gateway,omitempty"`
@@ -192,7 +196,7 @@ Important semantics:
 - `Kind` must be one of:
   - `KubeadmControlPlane`
   - `MachineDeployment`
-- `Namespace` must equal the `VSphereResourcePool` namespace.
+- `Namespace` may be omitted (defaults to the `VSphereResourcePool` namespace). If explicitly set, it must equal the pool namespace. Cross-namespace consumer references are not supported.
 - `Name` must be non-empty.
 - CAPV may read `UID` when present, but the primary identity for admission and lookup remains `APIVersion/Kind/Namespace/Name`.
 
@@ -234,8 +238,8 @@ Important semantics:
 ### Mutability Rules
 
 - `spec.consumerRef` may be added to an unbound pool.
-- `spec.consumerRef` may be cleared only by CAPV after the previous consumer no longer exists and the pool is fully reusable.
-- User-initiated clearing of `spec.consumerRef` should be rejected while the referenced consumer still exists.
+- `spec.consumerRef` may be cleared (by CAPV controller or manually) only after the previous consumer no longer exists and the pool is fully reusable.
+- Clearing `spec.consumerRef` is rejected while the referenced consumer still exists or while the pool is not fully reusable.
 - User-initiated rebinding from one consumer to another should be rejected unless the pool is already unbound.
 - `spec.resources[*].hostname` should remain immutable after creation.
 - `spec.resources[*].network` and `spec.resources[*].persistentDisks` remain declarative inputs, except for controller-managed backfill fields such as `volumePath`, `diskUUID`, and `unitNumber`.
@@ -283,32 +287,39 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
     - `PersistentDisks` from the slot are merged into `VSphereVM.spec.dataDisks`.
     - `Network` from the slot is merged into `VSphereVM.spec.network.devices`.
 - **IP precedence**:
-    - If the slot provides `IP` or `IPv6`, CAPV writes the slot-provided IP, gateway, and DNS values into the VM spec before create, and clears `AddressesFromPools` for that NIC. This means slot-defined addressing takes precedence over CAPV IPAM.
+    - If the slot provides `IP` or `IPv6`, CAPV writes the slot-provided IP, gateway, and DNS values into the VM spec before create, disables `DHCP4`/`DHCP6` accordingly, and clears `AddressesFromPools` for that NIC. This means slot-defined addressing takes precedence over CAPV IPAM and DHCP.
     - If the slot does not provide an IP, CAPV preserves the original network configuration and continues to use the existing CAPV DHCP / static IP / IPAM logic.
 - **Creation gate for CAPV IPAM**:
     - If `AddressesFromPools` remains configured after slot merge, CAPV creates and waits for `IPAddressClaim` objects to be fulfilled before creating the backend VM.
     - This guarantees that CAPV-managed IP allocation completes before VM creation, while still allowing slot-defined IPs to bypass IPAM entirely.
 - **Metadata Injection**: 
-    - The controller injects disk metadata (UnitNumber, MountPath, FSFormat) into the VM's `ExtraConfig` under `guestinfo.metadata`.
     - **Hostname Overriding**: Instead of using the `VSphereVM` name, the controller explicitly passes the **slot's Hostname** to the metadata generator. This ensures `local-hostname` and `instance-id` in `guestinfo.metadata` match the slot definition, which `cloud-init` then uses to set the OS hostname.
 - **Slot hostname annotation**:
     - The controller also writes `infrastructure.cluster.x-k8s.io/resource-slot-hostname=<slot.Hostname>` onto the `VSphereVM`.
     - This provides a durable hint that allows the `VSphereVM` reconcile path to recover the slot definition from the pool spec even if the slot-to-machine status binding is temporarily unavailable.
-- **Bootstrap secret augmentation**:
-    - In addition to `guestinfo.metadata`, CAPV merges persistent-disk cloud-config fragments back into the bootstrap secret referenced by the machine.
-    - This is how disk formatting, mount configuration, helper scripts, and related guest-side setup are persisted into the machine bootstrap payload for the current implementation.
-- If it's a `PersistentDisk`, the controller ensures the disk exists. If `VolumePath` is empty, it creates a new disk and fills `VolumePath`. If not empty, it attaches the existing disk.
-- If a persistent disk is reused and its SCSI `UnitNumber` was not yet recorded in the slot spec, the controller backfills it and persists it to the resource pool spec.
+- **User-data augmentation**:
+    - CAPV merges persistent-disk cloud-config fragments and kubelet serving certificate configuration into the VM's `guestinfo.userdata` (ExtraConfig) before first power-on.
+    - Persistent-disk cloud-config includes `write_files` (e.g., `/etc/capv/persistent-disks.tsv`), helper scripts, systemd services, and related `disk_setup`/`fs_setup`/`mounts` directives.
+    - Kubelet serving certificate cloud-config generates `kubelet.crt`/`kubelet.key` using the cluster CA, with SANs derived from the machine's network addresses.
+    - This is how disk formatting, mount configuration, and certificate setup are delivered to the guest OS via cloud-init for the current implementation.
+- **Persistent disk provisioning**: If `VolumePath` is empty, CAPV creates a new disk and fills `VolumePath`. If not empty, CAPV attaches the existing disk.
+- **Persistent disk discovery and backfill**: After the VM is created, CAPV discovers attached disks using a three-tier matching strategy:
+    1. **VolumePath**: Exact VMDK file path match (globally unique, most reliable, matches against any controller type).
+    2. **UnitNumber**: SCSI unit number match (stable across VM recreations, restricted to SCSI controllers).
+    3. **Capacity**: Disk size match on SCSI controllers (last resort, returns no match if ambiguous).
+    - Tiers 2 and 3 are restricted to SCSI controllers to prevent false matches against OS disks on IDE or SATA controllers.
+    - Discovered `UnitNumber`, `VolumePath`, and `DiskUUID` are backfilled into the resource pool spec for persistence across VM recreations.
 
 ### 2. Rolling Update (maxSurge=0)
 - `MachineDeployment` deletes `Machine-v1`.
 - `VSphereMachine-v1` is deleted, and its `VSphereVM` is destroyed.
 - **Crucially**: The `PersistentDisk` is **detached** but **NOT deleted** from the datastore.
-- The `ResourceSlot` status is updated to `State: Released`, `LastReleasedTime: now`.
+- The `ResourceSlot` status is updated to `State: Released`, `LastReleasedTime: now`. The `MachineRef` is intentionally preserved for orphan detection, release verification, and audit purposes; it is only overwritten when the slot is re-allocated to a new machine.
 - `MachineDeployment` creates `Machine-v2`.
 - `Machine-v2` requests a slot. The controller prefers `Released` slots before `Available` slots, so in a serial rolling update it will typically reuse the first released slot.
 - `Machine-v2` therefore usually reuses the released slot's IP, Hostname, and existing `PersistentDisk` via `VolumePath`, but the current implementation does not guarantee an identity-based match back to a specific previous machine instance.
-- If the owner `VSphereMachine` object is already gone by the time the `VSphereVM` delete path runs, CAPV can still find the pool from the slot status binding and safely release the slot.
+- If the owner `VSphereMachine` object is already gone by the time the `VSphereVM` delete path runs, CAPV locates the pool by scanning all `VSphereResourcePool` objects in the namespace and matching the `MachineRef` in slot status entries. This allows CAPV to safely release the slot even without a direct pool reference from the deleted machine.
+- **Orphan detection**: The `VSphereResourcePool` controller periodically checks slots in `InUse` state. If a slot's `MachineRef` points to a `VSphereMachine` that no longer exists, the controller automatically transitions the slot to `Released`.
 - During later `VSphereVM` reconciles, if the slot cannot be resolved from the current status binding, CAPV can fall back to the `resource-slot-hostname` annotation and reload the slot definition from `VSphereResourcePool.spec.resources`.
 
 ### 3. Resource Cleanup (Automatic Reclaim)
@@ -443,9 +454,9 @@ strategy:
     - If the primary disk controller is not SCSI, CAPV falls back to the first SCSI controller found on the template VM.
     - CAPV does not currently enforce a specific PCI address such as `0000:00:10.0`; however, the guest-side persistent-disk bootstrap logic assumes the Linux `/dev/disk/by-path/*-scsi-0:0:<unit>:0` naming pattern.
 - **Cloud-config-Driven Mounting**:
-    - The current implementation persists disk metadata into the bootstrap secret by generating additional cloud-config content.
-    - CAPV merges `disk_setup`, `fs_setup`, `mounts`, `write_files`, and helper commands into the machine bootstrap data based on the `PersistentDisk` list.
-    - This means the behavior is currently tied to the cloud-config bootstrap path used by the machine bootstrap secret; the document should not imply a generic mount implementation independent of bootstrap format.
+    - The current implementation merges disk metadata into the VM's `guestinfo.userdata` by generating additional cloud-config content.
+    - CAPV merges `disk_setup`, `fs_setup`, `mounts`, `write_files`, and helper commands into the VM user-data based on the `PersistentDisk` list.
+    - This means the behavior is currently tied to the cloud-config bootstrap format; the document should not imply a generic mount implementation independent of bootstrap format.
     - **UnitNumber Device Resolution**: `UnitNumber` is used as the durable identifier for resolving data disks inside the guest, but CAPV does not rely on kernel-assigned names like `/dev/sdb` or `/dev/sdc`.
     - The guest-side helper scripts resolve disks primarily through `/dev/disk/by-path` (and related symlink discovery) instead of assuming stable `/dev/sdX` names.
 
@@ -468,39 +479,6 @@ strategy:
     - The `VSphereVM` controller needs to be aware of `PersistentDisks` that should not be deleted upon VM destruction.
     - The `VSphereVM` controller is responsible for gating backend VM creation on CAPV IPAM fulfillment when slot IPs are not provided.
     - A dedicated controller for `VSphereResourcePool` manages status tracking, delayed reclaim, async reclaim task polling, and safe deletion semantics.
-
-## Implementation Plan
-
-The recommended implementation sequence is:
-
-1. **API changes**
-   - add `spec.consumerRef` to `VSphereResourcePool`
-   - replace the flat reclaim task fields on `ResourceSlotStatus` with `reclaimStatus`
-   - regenerate CRDs and deepcopy code
-
-2. **Shared helpers**
-   - add helper(s) to resolve the effective consumer of a `VSphereMachine`
-   - add helper(s) to determine whether a pool is fully reusable
-   - add helper(s) to compare `consumerRef` values by `(apiVersion, kind, namespace, name)`
-
-3. **Admission validation**
-   - implement `VSphereResourcePool` validating webhook for `consumerRef` shape, uniqueness, and rebinding rules
-   - implement `KubeadmControlPlane` / `MachineDeployment` validation to ensure the referenced machine template does not indirectly point at a conflicting pool
-
-4. **Machine reconcile enforcement**
-   - establish `spec.consumerRef` using `Get + Update` optimistic concurrency when the pool is still unbound
-   - on conflict, re-read the pool, re-evaluate eligibility, and either retry or fail
-   - before slot allocation, validate that the machine's effective consumer matches the referenced pool
-   - reject allocation if the pool is bound to another consumer
-
-5. **Pool reconcile enforcement**
-   - keep `consumerRef` while the referenced consumer is gone but slots are not yet fully reusable
-   - clear `consumerRef` only after all slots are reusable
-   - update reclaim logic to use `reclaimStatus`
-
-6. **Sample and docs updates**
-   - update sample manifests and docs to reflect that pools start unbound and are claimed by controller logic
-   - update user-facing docs and proposals to reflect the new binding model
 
 ## Testing Matrix
 

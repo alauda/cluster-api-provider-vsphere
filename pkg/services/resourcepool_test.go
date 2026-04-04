@@ -18,7 +18,6 @@ package services
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -481,64 +480,6 @@ func TestIsPoolFullyReusable(t *testing.T) {
 	g.Expect(IsPoolFullyReusable(withRetry)).To(BeFalse())
 }
 
-func TestEnsurePersistentDiskBootstrapData(t *testing.T) {
-	g := NewWithT(t)
-	scheme := runtime.NewScheme()
-	_ = infrav1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-
-	ctx := context.Background()
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "bootstrap-secret",
-			Namespace: "default",
-		},
-		Data: map[string][]byte{
-			"format": []byte("cloud-config"),
-			"value": []byte(`## template: jinja
-#cloud-config
-
-runcmd:
-- echo ok
-`),
-		},
-	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-
-	err := ensurePersistentDiskBootstrapData(ctx, c, &corev1.ObjectReference{
-		Kind:      "Secret",
-		Name:      secret.Name,
-		Namespace: secret.Namespace,
-	}, []infrav1.PersistentDisk{{
-		Name:       "data-1",
-		UnitNumber: toInt32Ptr(0),
-		MountPath:  "/var/cpaas",
-	}})
-	g.Expect(err).NotTo(HaveOccurred())
-
-	updatedSecret := &corev1.Secret{}
-	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(secret), updatedSecret)).To(Succeed())
-	value := string(updatedSecret.Data["value"])
-	g.Expect(value).To(ContainSubstring("write_files:"))
-	g.Expect(value).To(ContainSubstring("/etc/capv/persistent-disks.tsv"))
-	g.Expect(value).To(ContainSubstring("capv-persistent-disk-reconcile.service"))
-
-	// Ensure merge is idempotent.
-	err = ensurePersistentDiskBootstrapData(ctx, c, &corev1.ObjectReference{
-		Kind:      "Secret",
-		Name:      secret.Name,
-		Namespace: secret.Namespace,
-	}, []infrav1.PersistentDisk{{
-		Name:       "data-1",
-		UnitNumber: toInt32Ptr(0),
-		MountPath:  "/var/cpaas",
-	}})
-	g.Expect(err).NotTo(HaveOccurred())
-
-	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(secret), updatedSecret)).To(Succeed())
-	value = string(updatedSecret.Data["value"])
-	g.Expect(strings.Count(value, "/etc/capv/persistent-disks.tsv")).To(Equal(1))
-}
 
 func TestFindResourcePoolForMachine(t *testing.T) {
 	g := NewWithT(t)

@@ -159,7 +159,7 @@ type ResourceSlotStatus struct {
 	// +optional
 	MachineRef *corev1.ObjectReference `json:"machineRef,omitempty"`
 
-	// LastReleasedTime is the timestamp when the MachineRef was cleared.
+	// LastReleasedTime is the timestamp when the slot transitioned to Released.
 	// +optional
 	LastReleasedTime *metav1.Time `json:"lastReleasedTime,omitempty"`
 
