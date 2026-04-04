@@ -283,6 +283,18 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 	// in that case nil vsphereMachine can cause panic and CrashLoopBackOff the pod
 	// preventing vspheremachine_controller from setting the ownerref
 	if err != nil {
+		// When the VSphereVM is being deleted, the owner VSphereMachine may already
+		// be gone. Allow the deletion to proceed so the finalizer can be removed.
+		if !vsphereVM.DeletionTimestamp.IsZero() && apierrors.IsNotFound(err) {
+			log.Info("Owner VSphereMachine not found during deletion, proceeding with cleanup")
+			vmContext := &capvcontext.VMContext{
+				ControllerManagerContext: r.ControllerManagerContext,
+				VSphereVM:                vsphereVM,
+				Session:                  authSession,
+				PatchHelper:              patchHelper,
+			}
+			return r.reconcileDelete(ctx, vmContext)
+		}
 		return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine for VSphereVM")
 	}
 	if vsphereMachine == nil {
