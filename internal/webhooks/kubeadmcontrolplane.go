@@ -90,8 +90,8 @@ func (webhook *KubeadmControlPlane) validatePoolRef(ctx context.Context, obj *co
 		Name:       obj.Name,
 		UID:        obj.UID,
 	}
-	if pool.Spec.ConsumerRef != nil && !services.ConsumerRefsEqual(pool.Spec.ConsumerRef, self) {
-		allErrs = append(allErrs, field.Forbidden(templatePath, fmt.Sprintf("resource pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Spec.ConsumerRef.Kind, pool.Spec.ConsumerRef.Namespace, pool.Spec.ConsumerRef.Name)))
+	if pool.Status.ConsumerRef != nil && !services.ConsumerRefsEqual(pool.Status.ConsumerRef, self) {
+		allErrs = append(allErrs, field.Forbidden(templatePath, fmt.Sprintf("resource pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Status.ConsumerRef.Kind, pool.Status.ConsumerRef.Namespace, pool.Status.ConsumerRef.Name)))
 	}
 
 	if err := rejectOtherObjectsReferencingPool(ctx, webhook.Client, poolRef, self); err != nil {

@@ -115,6 +115,10 @@ func (o *Options) defaults() {
 func (o *Options) getCredentials() map[string]string {
 	file, err := os.ReadFile(o.CredentialsFile)
 	if err != nil {
+		if os.IsNotExist(err) {
+			o.Logger.V(4).Info("Credentials file not found, skipping global vCenter credentials", "path", o.CredentialsFile)
+			return map[string]string{}
+		}
 		o.Logger.Error(err, "error opening credentials file")
 		return map[string]string{}
 	}

@@ -74,7 +74,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "", nil)
+		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "", nil)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(slot.Hostname).To(Equal("host-1"))
 	})
@@ -101,7 +101,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "", nil)
+		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "", nil)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(slot.Hostname).To(Equal("host-released"))
 
@@ -130,7 +130,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		_, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "", nil)
+		_, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "", nil)
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring("no available slots"))
 	})
@@ -152,7 +152,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "dc-target", nil)
+		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "dc-target", nil)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(slot.Hostname).To(Equal("host-target"))
 	})
@@ -173,7 +173,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		_, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "dc-target", nil)
+		_, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "dc-target", nil)
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring(`matching datacenter "dc-target"`))
 	})
@@ -194,7 +194,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		_, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "dc-template", []string{"dc-fd"})
+		_, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "dc-template", []string{"dc-fd"})
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring(`matching datacenter "dc-template" and failure domain datacenters`))
 	})
@@ -222,7 +222,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "", []string{"dc-fd"})
+		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "", []string{"dc-fd"})
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(slot.Hostname).To(Equal("host-b"))
 		g.Expect(slot.Datacenter).To(Equal("dc-fd"))
@@ -251,7 +251,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "*", []string{"dc-fd"})
+		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "*", []string{"dc-fd"})
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(slot.Hostname).To(Equal("host-b"))
 		g.Expect(slot.Datacenter).To(Equal("dc-fd"))
@@ -273,7 +273,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		_, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "", []string{"dc-fd"})
+		_, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "", []string{"dc-fd"})
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring("matching failure domain datacenters"))
 	})
@@ -294,7 +294,7 @@ func TestAllocateSlot(t *testing.T) {
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
-		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, "", []string{"dc-pool"})
+		slot, err := AllocateSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, machine, nil, "", []string{"dc-pool"})
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(slot.Datacenter).To(Equal("dc-pool"))
 	})
@@ -395,69 +395,6 @@ func TestResolveResourcePoolDatacenter(t *testing.T) {
 	g.Expect(ResolveResourcePoolDatacenter(pool, slotWithOwnDatacenter)).To(Equal("dc-slot"))
 	g.Expect(ResolveResourcePoolDatacenter(pool, slotWithoutDatacenter)).To(Equal("dc-pool"))
 	g.Expect(ResolveResourcePoolDatacenter(nil, slotWithoutDatacenter)).To(BeEmpty())
-}
-
-func TestTryBindPoolToConsumer(t *testing.T) {
-	g := NewWithT(t)
-	scheme := runtime.NewScheme()
-	_ = infrav1.AddToScheme(scheme)
-
-	ctx := context.Background()
-	pool := &infrav1.VSphereResourcePool{
-		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-		Spec:       infrav1.VSphereResourcePoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
-	}
-
-	t.Run("binds unbound pool", func(t *testing.T) {
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool.DeepCopy()).Build()
-		err := TryBindPoolToConsumer(ctx, c, &corev1.ObjectReference{Name: "pool-a", Namespace: "default"}, &corev1.ObjectReference{
-			APIVersion: controlplanev1.GroupVersion.String(),
-			Kind:       "KubeadmControlPlane",
-			Namespace:  "default",
-			Name:       "cp-a",
-		})
-		g.Expect(err).NotTo(HaveOccurred())
-		updated := &infrav1.VSphereResourcePool{}
-		g.Expect(c.Get(ctx, client.ObjectKey{Name: "pool-a", Namespace: "default"}, updated)).To(Succeed())
-		g.Expect(updated.Spec.ConsumerRef).NotTo(BeNil())
-		g.Expect(updated.Spec.ConsumerRef.Name).To(Equal("cp-a"))
-	})
-
-	t.Run("rejects binding to different consumer", func(t *testing.T) {
-		p := pool.DeepCopy()
-		p.Spec.ConsumerRef = &corev1.ObjectReference{
-			APIVersion: clusterv1.GroupVersion.String(),
-			Kind:       "MachineDeployment",
-			Namespace:  "default",
-			Name:       "md-a",
-		}
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(p).Build()
-		err := TryBindPoolToConsumer(ctx, c, &corev1.ObjectReference{Name: "pool-a", Namespace: "default"}, &corev1.ObjectReference{
-			APIVersion: controlplanev1.GroupVersion.String(),
-			Kind:       "KubeadmControlPlane",
-			Namespace:  "default",
-			Name:       "cp-a",
-		})
-		g.Expect(err).To(HaveOccurred())
-	})
-
-	t.Run("allows idempotent bind to same consumer", func(t *testing.T) {
-		p := pool.DeepCopy()
-		p.Spec.ConsumerRef = &corev1.ObjectReference{
-			APIVersion: controlplanev1.GroupVersion.String(),
-			Kind:       "KubeadmControlPlane",
-			Namespace:  "default",
-			Name:       "cp-a",
-		}
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(p).Build()
-		err := TryBindPoolToConsumer(ctx, c, &corev1.ObjectReference{Name: "pool-a", Namespace: "default"}, &corev1.ObjectReference{
-			APIVersion: controlplanev1.GroupVersion.String(),
-			Kind:       "KubeadmControlPlane",
-			Namespace:  "default",
-			Name:       "cp-a",
-		})
-		g.Expect(err).NotTo(HaveOccurred())
-	})
 }
 
 func TestIsPoolFullyReusable(t *testing.T) {

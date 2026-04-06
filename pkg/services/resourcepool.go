@@ -104,57 +104,13 @@ func ResolveMachineConsumerRef(ctx context.Context, c client.Client, machine *cl
 }
 
 func ValidatePoolConsumer(pool *infrav1.VSphereResourcePool, consumerRef *corev1.ObjectReference) error {
-	if pool == nil || pool.Spec.ConsumerRef == nil || consumerRef == nil {
+	if pool == nil || pool.Status.ConsumerRef == nil || consumerRef == nil {
 		return nil
 	}
-	if ConsumerRefsEqual(pool.Spec.ConsumerRef, consumerRef) {
+	if ConsumerRefsEqual(pool.Status.ConsumerRef, consumerRef) {
 		return nil
 	}
-	return errors.Errorf("resource pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Spec.ConsumerRef.Kind, pool.Spec.ConsumerRef.Namespace, pool.Spec.ConsumerRef.Name)
-}
-
-func TryBindPoolToConsumer(ctx context.Context, c client.Client, poolRef, consumerRef *corev1.ObjectReference) error {
-	if poolRef == nil || consumerRef == nil {
-		return nil
-	}
-
-	for range 3 {
-		pool := &infrav1.VSphereResourcePool{}
-		if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
-			return err
-		}
-
-		if pool.Spec.ConsumerRef == nil {
-			pool.Spec.ConsumerRef = &corev1.ObjectReference{
-				APIVersion: consumerRef.APIVersion,
-				Kind:       consumerRef.Kind,
-				Namespace:  consumerRef.Namespace,
-				Name:       consumerRef.Name,
-				UID:        consumerRef.UID,
-			}
-			if err := c.Update(ctx, pool); err != nil {
-				if apierrors.IsConflict(err) {
-					continue
-				}
-				return err
-			}
-			return nil
-		}
-
-		if err := ValidatePoolConsumer(pool, consumerRef); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	pool := &infrav1.VSphereResourcePool{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
-		return err
-	}
-	if err := ValidatePoolConsumer(pool, consumerRef); err != nil {
-		return err
-	}
-	return errors.New("resource pool binding conflict, exhausted retries")
+	return errors.Errorf("resource pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Status.ConsumerRef.Kind, pool.Status.ConsumerRef.Namespace, pool.Status.ConsumerRef.Name)
 }
 
 func IsPoolFullyReusable(pool *infrav1.VSphereResourcePool) bool {
@@ -258,9 +214,31 @@ func ResolveResourcePoolDatacenterFromRef(ctx context.Context, c client.Client, 
 }
 
 // AllocateSlot finds an available or released slot in the pool for the given machine.
-func AllocateSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machine *infrav1.VSphereMachine, desiredDatacenter string, allowedDatacenters []string) (*infrav1.ResourceSlot, error) {
+// It retries internally on conflict errors to avoid propagating transient conflicts
+// caused by concurrent updates from the resource pool controller.
+// consumerRef is checked against the pool's current consumer binding to prevent
+// machines from different consumers allocating slots from the same pool.
+func AllocateSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machine *infrav1.VSphereMachine, consumerRef *corev1.ObjectReference, desiredDatacenter string, allowedDatacenters []string) (*infrav1.ResourceSlot, error) {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		slot, err := allocateSlotOnce(ctx, c, poolRef, machine, consumerRef, desiredDatacenter, allowedDatacenters)
+		if err == nil {
+			return slot, nil
+		}
+		if !apierrors.IsConflict(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, errors.Wrapf(lastErr, "transient conflict while allocating slot from pool %s/%s, will retry", poolRef.Namespace, poolRef.Name)
+}
+
+func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machine *infrav1.VSphereMachine, consumerRef *corev1.ObjectReference, desiredDatacenter string, allowedDatacenters []string) (*infrav1.ResourceSlot, error) {
 	pool := &infrav1.VSphereResourcePool{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
+		return nil, err
+	}
+	if err := ValidatePoolConsumer(pool, consumerRef); err != nil {
 		return nil, err
 	}
 	desiredDatacenter = normalizeDesiredDatacenter(desiredDatacenter)
@@ -371,11 +349,19 @@ func AllocateSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectRe
 		})
 	}
 
-	// Persist the assignment.
-	if err := c.Status().Update(ctx, pool); err != nil {
-		if apierrors.IsConflict(err) {
-			return nil, errors.Wrapf(err, "transient conflict while allocating slot from pool %s/%s, will retry", pool.Namespace, pool.Name)
+	// Set consumerRef atomically with slot assignment to prevent races
+	if pool.Status.ConsumerRef == nil && consumerRef != nil {
+		pool.Status.ConsumerRef = &corev1.ObjectReference{
+			APIVersion: consumerRef.APIVersion,
+			Kind:       consumerRef.Kind,
+			Namespace:  consumerRef.Namespace,
+			Name:       consumerRef.Name,
+			UID:        consumerRef.UID,
 		}
+	}
+
+	// Persist the assignment and consumer binding in a single update.
+	if err := c.Status().Update(ctx, pool); err != nil {
 		return nil, err
 	}
 

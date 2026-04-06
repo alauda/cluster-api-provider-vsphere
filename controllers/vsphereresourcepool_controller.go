@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"reflect"
 	"time"
 
 	"github.com/pkg/errors"
@@ -247,10 +248,6 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	if pool.Status.ResourceStatuses == nil {
-		pool.Status.ResourceStatuses = []infrav1.ResourceSlotStatus{}
-	}
-
 	statusMap := make(map[string]infrav1.ResourceSlotStatus)
 	for _, s := range pool.Status.ResourceStatuses {
 		statusMap[s.Hostname] = s
@@ -265,11 +262,7 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 	requeueAfter := time.Duration(0)
 	specChanged := false
 
-	if bound, err := r.reconcileConsumerBinding(ctx, pool); err != nil {
-		return reconcile.Result{}, err
-	} else if bound {
-		specChanged = true
-	}
+	r.reconcileConsumerBinding(ctx, pool)
 
 	for i := range pool.Spec.Resources {
 		slot := &pool.Spec.Resources[i]
@@ -362,21 +355,21 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 		return reconcile.Result{Requeue: true}, nil
 	}
 
-	pool.Status.ResourceStatuses = newStatuses
+	if !reflect.DeepEqual(pool.Status.ResourceStatuses, newStatuses) {
+		pool.Status.ResourceStatuses = newStatuses
+	}
 
 	return reconcile.Result{RequeueAfter: requeueAfter}, nil
 }
 
-func (r resourcePoolReconciler) reconcileConsumerBinding(ctx context.Context, pool *infrav1.VSphereResourcePool) (bool, error) {
-	if pool.Spec.ConsumerRef == nil {
-		return false, nil
+func (r resourcePoolReconciler) reconcileConsumerBinding(_ context.Context, pool *infrav1.VSphereResourcePool) {
+	if pool.Status.ConsumerRef == nil {
+		return
 	}
-
 	if !services.IsPoolFullyReusable(pool) {
-		return false, nil
+		return
 	}
-	pool.Spec.ConsumerRef = nil
-	return true, nil
+	pool.Status.ConsumerRef = nil
 }
 
 

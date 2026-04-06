@@ -605,11 +605,7 @@ func (v *VimMachineService) reconcileResourcePool(ctx context.Context, vimMachin
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve machine consumer for resource pool allocation")
 	}
-	if err := TryBindPoolToConsumer(ctx, v.Client, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef, consumerRef); err != nil {
-		return errors.Wrap(err, "failed to bind resource pool consumer")
-	}
-
-	slot, err := AllocateSlot(ctx, v.Client, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef, vimMachineCtx.VSphereMachine, desiredDatacenter, allowedFailureDomainDatacenters)
+	slot, err := AllocateSlot(ctx, v.Client, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef, vimMachineCtx.VSphereMachine, consumerRef, desiredDatacenter, allowedFailureDomainDatacenters)
 	if err != nil {
 		return errors.Wrap(err, "failed to allocate slot from pool")
 	}

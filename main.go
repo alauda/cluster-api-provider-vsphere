@@ -408,14 +408,18 @@ func main() {
 	}
 
 	// initialize notifier for capv-manager-bootstrap-credentials
-	watch, err := manager.InitializeWatch(mgr.GetControllerManagerContext(), &managerOpts)
-	if err != nil {
-		setupLog.Error(err, "failed to initialize watch on CAPV credentials file")
-		os.Exit(1)
+	if _, err := os.Stat(managerOpts.CredentialsFile); err == nil {
+		watch, err := manager.InitializeWatch(mgr.GetControllerManagerContext(), &managerOpts)
+		if err != nil {
+			setupLog.Error(err, "failed to initialize watch on CAPV credentials file")
+			os.Exit(1)
+		}
+		defer func(watch *fsnotify.Watcher) {
+			_ = watch.Close()
+		}(watch)
+	} else {
+		setupLog.Info("Credentials file not found, skipping credentials watch", "path", managerOpts.CredentialsFile)
 	}
-	defer func(watch *fsnotify.Watcher) {
-		_ = watch.Close()
-	}(watch)
 	defer session.Clear()
 }
 
