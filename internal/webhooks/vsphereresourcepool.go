@@ -39,7 +39,10 @@ func (webhook *VSphereResourcePool) ValidateCreate(ctx context.Context, raw runt
 	if !ok {
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereResourcePool but got a %T", raw))
 	}
-	return nil, AggregateObjErrors(obj.GroupVersionKind().GroupKind(), obj.Name, webhook.validateConsumerRef(ctx, nil, obj))
+	var allErrs field.ErrorList
+	allErrs = append(allErrs, webhook.validateClusterRef(nil, obj)...)
+	allErrs = append(allErrs, webhook.validateConsumerRef(ctx, nil, obj)...)
+	return nil, AggregateObjErrors(obj.GroupVersionKind().GroupKind(), obj.Name, allErrs)
 }
 
 func (webhook *VSphereResourcePool) ValidateUpdate(ctx context.Context, oldRaw runtime.Object, newRaw runtime.Object) (admission.Warnings, error) {
@@ -51,11 +54,40 @@ func (webhook *VSphereResourcePool) ValidateUpdate(ctx context.Context, oldRaw r
 	if !ok {
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereResourcePool but got a %T", newRaw))
 	}
-	return nil, AggregateObjErrors(newObj.GroupVersionKind().GroupKind(), newObj.Name, webhook.validateConsumerRef(ctx, oldObj, newObj))
+	var allErrs field.ErrorList
+	allErrs = append(allErrs, webhook.validateClusterRef(oldObj, newObj)...)
+	allErrs = append(allErrs, webhook.validateConsumerRef(ctx, oldObj, newObj)...)
+	return nil, AggregateObjErrors(newObj.GroupVersionKind().GroupKind(), newObj.Name, allErrs)
 }
 
 func (webhook *VSphereResourcePool) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
 	return nil, nil
+}
+
+func (webhook *VSphereResourcePool) validateClusterRef(oldObj, newObj *infrav1.VSphereResourcePool) field.ErrorList {
+	var allErrs field.ErrorList
+	clusterRefPath := field.NewPath("spec", "clusterRef")
+	ref := newObj.Spec.ClusterRef
+
+	if ref.Name == "" {
+		allErrs = append(allErrs, field.Required(clusterRefPath.Child("name"), "must be set"))
+	}
+	if ref.APIVersion != "" && ref.APIVersion != clusterv1.GroupVersion.String() {
+		allErrs = append(allErrs, field.Invalid(clusterRefPath.Child("apiVersion"), ref.APIVersion, fmt.Sprintf("must be %s", clusterv1.GroupVersion.String())))
+	}
+	if ref.Kind != "" && ref.Kind != "Cluster" {
+		allErrs = append(allErrs, field.Invalid(clusterRefPath.Child("kind"), ref.Kind, "must be Cluster"))
+	}
+	if ref.Namespace != "" && ref.Namespace != newObj.Namespace {
+		allErrs = append(allErrs, field.Invalid(clusterRefPath.Child("namespace"), ref.Namespace, "must match pool namespace"))
+	}
+
+	// ClusterRef can only be changed when consumerRef is nil
+	if oldObj != nil && oldObj.Spec.ClusterRef.Name != newObj.Spec.ClusterRef.Name && oldObj.Spec.ConsumerRef != nil {
+		allErrs = append(allErrs, field.Forbidden(clusterRefPath, "cannot change clusterRef while consumerRef is set"))
+	}
+
+	return allErrs
 }
 
 func (webhook *VSphereResourcePool) validateConsumerRef(ctx context.Context, oldObj, newObj *infrav1.VSphereResourcePool) field.ErrorList {
@@ -69,16 +101,8 @@ func (webhook *VSphereResourcePool) validateConsumerRef(ctx context.Context, old
 	if oldObj != nil && oldObj.Spec.ConsumerRef != nil && newObj.Spec.ConsumerRef != nil && !services.ConsumerRefsEqual(oldObj.Spec.ConsumerRef, newObj.Spec.ConsumerRef) {
 		allErrs = append(allErrs, field.Forbidden(consumerPath, "cannot rebind directly to a different consumer; wait until the pool is unbound"))
 	}
-	if oldObj != nil && oldObj.Spec.ConsumerRef != nil && newObj.Spec.ConsumerRef == nil {
-		target := services.ObjectForConsumerRef(oldObj.Spec.ConsumerRef)
-		if target != nil {
-			key := client.ObjectKey{Namespace: oldObj.Namespace, Name: oldObj.Spec.ConsumerRef.Name}
-			if err := webhook.Client.Get(ctx, key, target); err == nil {
-				allErrs = append(allErrs, field.Forbidden(consumerPath, "cannot clear consumerRef while the referenced consumer still exists"))
-			} else if err != nil && !apierrors.IsNotFound(err) {
-				allErrs = append(allErrs, field.InternalError(consumerPath, err))
-			}
-		}
+	if oldObj != nil && oldObj.Spec.ConsumerRef != nil && newObj.Spec.ConsumerRef == nil && !services.IsPoolFullyReusable(oldObj) {
+		allErrs = append(allErrs, field.Forbidden(consumerPath, "cannot clear consumerRef until the pool is fully reusable"))
 	}
 	if ref == nil {
 		return allErrs

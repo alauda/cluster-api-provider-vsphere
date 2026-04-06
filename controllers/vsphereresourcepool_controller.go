@@ -28,6 +28,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/finalizers"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
@@ -35,11 +37,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
 )
@@ -67,9 +71,51 @@ func AddVSphereResourcePoolControllerToManager(ctx context.Context, controllerMa
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1.VSphereResourcePool{}).
+		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(reconciler.clusterToResourcePools)).
+		Watches(&infrav1.VSphereCluster{}, handler.EnqueueRequestsFromMapFunc(reconciler.vsphereClusterToResourcePools)).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
 		Complete(reconciler)
+}
+
+// clusterToResourcePools maps a Cluster to the VSphereResourcePools that reference it.
+func (r resourcePoolReconciler) clusterToResourcePools(ctx context.Context, o client.Object) []reconcile.Request {
+	pools := &infrav1.VSphereResourcePoolList{}
+	if err := r.Client.List(ctx, pools, client.InNamespace(o.GetNamespace())); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range pools.Items {
+		if pools.Items[i].Spec.ClusterRef.Name == o.GetName() {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: client.ObjectKeyFromObject(&pools.Items[i]),
+			})
+		}
+	}
+	return requests
+}
+
+// vsphereClusterToResourcePools maps a VSphereCluster to the VSphereResourcePools
+// whose ClusterRef points to a Cluster that uses this VSphereCluster as infrastructure.
+func (r resourcePoolReconciler) vsphereClusterToResourcePools(ctx context.Context, o client.Object) []reconcile.Request {
+	// Find the Cluster that owns this VSphereCluster
+	clusters := &clusterv1.ClusterList{}
+	if err := r.Client.List(ctx, clusters, client.InNamespace(o.GetNamespace())); err != nil {
+		return nil
+	}
+	var ownerClusterName string
+	for i := range clusters.Items {
+		if clusters.Items[i].Spec.InfrastructureRef != nil && clusters.Items[i].Spec.InfrastructureRef.Name == o.GetName() {
+			ownerClusterName = clusters.Items[i].Name
+			break
+		}
+	}
+	if ownerClusterName == "" {
+		return nil
+	}
+	return r.clusterToResourcePools(ctx, &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName, Namespace: o.GetNamespace()},
+	})
 }
 
 type resourcePoolReconciler struct {
@@ -111,8 +157,95 @@ func (r resourcePoolReconciler) Reconcile(ctx context.Context, req reconcile.Req
 	return r.reconcileNormal(ctx, pool)
 }
 
+// vcenterParams holds the resolved vCenter connection parameters from the ClusterRef chain.
+type vcenterParams struct {
+	server     string
+	thumbprint string
+	username   string
+	password   string
+}
+
+// resolveVCenterParams resolves vCenter connection parameters via the ClusterRef credential chain:
+// pool.Spec.ClusterRef → Cluster (same namespace) → VSphereCluster → IdentityRef → credentials.
+// It sets ClusterRefReadyCondition and VCenterAvailableCondition on the pool.
+func (r resourcePoolReconciler) resolveVCenterParams(ctx context.Context, pool *infrav1.VSphereResourcePool) (*vcenterParams, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Step 1: Get Cluster (same namespace as pool)
+	cluster := &clusterv1.Cluster{}
+	clusterKey := client.ObjectKey{
+		Namespace: pool.Namespace,
+		Name:      pool.Spec.ClusterRef.Name,
+	}
+	if err := r.Client.Get(ctx, clusterKey, cluster); err != nil {
+		conditions.MarkFalse(pool, infrav1.ClusterRefReadyCondition,
+			infrav1.ClusterNotFoundReason, clusterv1.ConditionSeverityWarning,
+			"Cluster %s/%s not found: %v", clusterKey.Namespace, clusterKey.Name, err)
+		return nil, errors.Wrapf(err, "failed to get Cluster %s/%s referenced by VSphereResourcePool %s/%s",
+			clusterKey.Namespace, clusterKey.Name, pool.Namespace, pool.Name)
+	}
+
+	// Step 2: Get VSphereCluster
+	if cluster.Spec.InfrastructureRef == nil {
+		conditions.MarkFalse(pool, infrav1.ClusterRefReadyCondition,
+			infrav1.VSphereClusterNotFoundReason, clusterv1.ConditionSeverityWarning,
+			"Cluster %s/%s has nil InfrastructureRef", cluster.Namespace, cluster.Name)
+		return nil, errors.Errorf("Cluster %s/%s has nil InfrastructureRef", cluster.Namespace, cluster.Name)
+	}
+	vsphereCluster := &infrav1.VSphereCluster{}
+	vsphereClusterKey := client.ObjectKey{
+		Namespace: cluster.Namespace,
+		Name:      cluster.Spec.InfrastructureRef.Name,
+	}
+	if err := r.Client.Get(ctx, vsphereClusterKey, vsphereCluster); err != nil {
+		conditions.MarkFalse(pool, infrav1.ClusterRefReadyCondition,
+			infrav1.VSphereClusterNotFoundReason, clusterv1.ConditionSeverityWarning,
+			"VSphereCluster %s/%s not found: %v", vsphereClusterKey.Namespace, vsphereClusterKey.Name, err)
+		return nil, errors.Wrapf(err, "failed to get VSphereCluster %s/%s", vsphereClusterKey.Namespace, vsphereClusterKey.Name)
+	}
+
+	conditions.MarkTrue(pool, infrav1.ClusterRefReadyCondition)
+
+	// Step 3: Resolve credentials
+	params := &vcenterParams{
+		server:     vsphereCluster.Spec.Server,
+		thumbprint: vsphereCluster.Spec.Thumbprint,
+		username:   r.ControllerManagerContext.Username,
+		password:   r.ControllerManagerContext.Password,
+	}
+
+	if vsphereCluster.Spec.IdentityRef != nil {
+		creds, err := identity.GetCredentials(ctx, r.Client, vsphereCluster, r.ControllerManagerContext.Namespace)
+		if err != nil {
+			conditions.MarkFalse(pool, infrav1.VCenterAvailableCondition,
+				infrav1.IdentityCredentialsUnavailableReason, clusterv1.ConditionSeverityWarning,
+				"Failed to resolve credentials from IdentityRef: %v", err)
+			return nil, errors.Wrap(err, "failed to get credentials from IdentityRef")
+		}
+		params.username = creds.Username
+		params.password = creds.Password
+	} else if params.username == "" || params.password == "" {
+		conditions.MarkFalse(pool, infrav1.VCenterAvailableCondition,
+			infrav1.IdentityCredentialsUnavailableReason, clusterv1.ConditionSeverityWarning,
+			"VSphereCluster has no IdentityRef and controller manager credentials are not configured")
+		return nil, errors.New("VSphereCluster has no IdentityRef and controller manager credentials are not configured")
+	} else {
+		log.V(4).Info("VSphereCluster has no IdentityRef, falling back to controller manager credentials")
+	}
+
+	conditions.MarkTrue(pool, infrav1.VCenterAvailableCondition)
+
+	return params, nil
+}
+
 func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infrav1.VSphereResourcePool) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
+
+	// Resolve vCenter params via ClusterRef chain before any vCenter operations
+	vcp, err := r.resolveVCenterParams(ctx, pool)
+	if err != nil {
+		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 
 	if pool.Status.ResourceStatuses == nil {
 		pool.Status.ResourceStatuses = []infrav1.ResourceSlotStatus{}
@@ -160,7 +293,7 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 				"hasReclaimTask", status.ReclaimStatus != nil && status.ReclaimStatus.TaskRef != "",
 			)
 			if status.ReclaimStatus != nil && status.ReclaimStatus.TaskRef != "" {
-				specUpdated, wait, err := r.reconcileReclaimTask(ctx, pool, slot, &status)
+				specUpdated, wait, err := r.reconcileReclaimTask(ctx, pool, slot, &status, vcp)
 				if err != nil {
 					log.Error(err, "failed to reconcile reclaim task for slot", "hostname", slot.Hostname, "task", status.ReclaimStatus.TaskRef)
 				}
@@ -182,7 +315,7 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 				}
 			} else if time.Now().After(deadline) {
 				log.Info("Reclaiming stale slot", "hostname", slot.Hostname)
-				reclaimed, wait, err := r.reclaimPhysicalResources(ctx, pool, slot, &status)
+				reclaimed, wait, err := r.reclaimPhysicalResources(ctx, pool, slot, &status, vcp)
 				if err != nil {
 					log.Error(err, "failed to reclaim physical resources for slot", "hostname", slot.Hostname)
 				}
@@ -239,16 +372,6 @@ func (r resourcePoolReconciler) reconcileConsumerBinding(ctx context.Context, po
 		return false, nil
 	}
 
-	target := services.ObjectForConsumerRef(pool.Spec.ConsumerRef)
-	if target == nil {
-		return false, errors.Errorf("unsupported consumer kind %q on VSphereResourcePool %s/%s", pool.Spec.ConsumerRef.Kind, pool.Namespace, pool.Name)
-	}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: pool.Spec.ConsumerRef.Namespace, Name: pool.Spec.ConsumerRef.Name}, target); err == nil {
-		return false, nil
-	} else if !apierrors.IsNotFound(err) {
-		return false, err
-	}
-
 	if !services.IsPoolFullyReusable(pool) {
 		return false, nil
 	}
@@ -257,7 +380,7 @@ func (r resourcePoolReconciler) reconcileConsumerBinding(ctx context.Context, po
 }
 
 
-func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, status *infrav1.ResourceSlotStatus) (bool, time.Duration, error) {
+func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, status *infrav1.ResourceSlotStatus, vcp *vcenterParams) (bool, time.Duration, error) {
 	log := ctrl.LoggerFrom(ctx)
 	slotDatacenter := services.ResolveResourcePoolDatacenter(pool, slot)
 
@@ -266,9 +389,9 @@ func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, po
 	}
 
 	params := session.NewParams().
-		WithUserInfo(r.ControllerManagerContext.Username, r.ControllerManagerContext.Password).
-		WithServer(pool.Spec.Server).
-		WithThumbprint(pool.Spec.Thumbprint).
+		WithUserInfo(vcp.username, vcp.password).
+		WithServer(vcp.server).
+		WithThumbprint(vcp.thumbprint).
 		WithDatacenter(slotDatacenter)
 
 	s, err := session.GetOrCreate(ctx, params)
@@ -322,14 +445,14 @@ func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, po
 	return true, 0, nil
 }
 
-func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, status *infrav1.ResourceSlotStatus) (bool, time.Duration, error) {
+func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, status *infrav1.ResourceSlotStatus, vcp *vcenterParams) (bool, time.Duration, error) {
 	log := ctrl.LoggerFrom(ctx)
 	slotDatacenter := services.ResolveResourcePoolDatacenter(pool, slot)
 
 	params := session.NewParams().
-		WithUserInfo(r.ControllerManagerContext.Username, r.ControllerManagerContext.Password).
-		WithServer(pool.Spec.Server).
-		WithThumbprint(pool.Spec.Thumbprint).
+		WithUserInfo(vcp.username, vcp.password).
+		WithServer(vcp.server).
+		WithThumbprint(vcp.thumbprint).
 		WithDatacenter(slotDatacenter)
 
 	s, err := session.GetOrCreate(ctx, params)
@@ -394,6 +517,33 @@ func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *
 func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infrav1.VSphereResourcePool) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
+	// Check if any vCenter operations are needed (released slots with reclaimable disks)
+	needsVCenter := false
+	for i := range pool.Spec.Resources {
+		slot := &pool.Spec.Resources[i]
+		for _, s := range pool.Status.ResourceStatuses {
+			if s.Hostname == slot.Hostname && s.State == "Released" {
+				if (s.ReclaimStatus != nil && s.ReclaimStatus.TaskRef != "") || hasReclaimablePersistentDisk(slot) {
+					needsVCenter = true
+					break
+				}
+			}
+		}
+		if needsVCenter {
+			break
+		}
+	}
+
+	var vcp *vcenterParams
+	if needsVCenter {
+		var err error
+		vcp, err = r.resolveVCenterParams(ctx, pool)
+		if err != nil {
+			log.Error(err, "Cannot resolve vCenter credentials for deletion reclaim, will retry")
+			return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	}
+
 	statusMap := make(map[string]infrav1.ResourceSlotStatus, len(pool.Status.ResourceStatuses))
 	for _, status := range pool.Status.ResourceStatuses {
 		statusMap[status.Hostname] = status
@@ -438,7 +588,7 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 					"hostname", slot.Hostname,
 					"task", status.ReclaimStatus.TaskRef,
 				)
-				_, wait, err := r.reconcileReclaimTask(ctx, pool, slot, &status)
+				_, wait, err := r.reconcileReclaimTask(ctx, pool, slot, &status, vcp)
 				if err != nil {
 					return reconcile.Result{}, err
 				}
@@ -450,7 +600,7 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 					"hostname", slot.Hostname,
 					"persistentDiskCount", len(slot.PersistentDisks),
 				)
-				reclaimed, wait, err := r.reclaimPhysicalResources(ctx, pool, slot, &status)
+				reclaimed, wait, err := r.reclaimPhysicalResources(ctx, pool, slot, &status, vcp)
 				if err != nil {
 					return reconcile.Result{}, err
 				}

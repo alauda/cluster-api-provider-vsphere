@@ -20,22 +20,23 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 )
 
 // VSphereResourcePoolSpec defines the desired state of VSphereResourcePool.
 type VSphereResourcePoolSpec struct {
+	// ClusterRef references the CAPI Cluster (in the same namespace) whose
+	// VSphereCluster provides vCenter server, thumbprint, and credential
+	// chain (IdentityRef) for this pool's vCenter operations (e.g. disk
+	// reclaim). Required. Can only be changed when consumerRef is nil.
+	// The pool will not reconcile until the referenced Cluster and its
+	// VSphereCluster infrastructure are available.
+	ClusterRef corev1.ObjectReference `json:"clusterRef"`
+
 	// Datacenter is the default vSphere datacenter for slots in this pool.
 	// It is used when a slot does not define its own Datacenter.
 	// +optional
 	Datacenter string `json:"datacenter,omitempty"`
-
-	// Server is the vCenter server address.
-	// +optional
-	Server string `json:"server,omitempty"`
-
-	// Thumbprint is the vCenter certificate thumbprint.
-	// +optional
-	Thumbprint string `json:"thumbprint,omitempty"`
 
 	// Resources is the list of pre-defined resource slots.
 	Resources []ResourceSlot `json:"resources"`
@@ -145,6 +146,10 @@ type VSphereResourcePoolStatus struct {
 	// ResourceStatuses tracks the state of each slot.
 	// +optional
 	ResourceStatuses []ResourceSlotStatus `json:"resourceStatuses,omitempty"`
+
+	// Conditions defines current state of the resource pool.
+	// +optional
+	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
 }
 
 // ResourceSlotStatus tracks the state of a single slot.
@@ -202,6 +207,16 @@ type VSphereResourcePool struct {
 
 	Spec   VSphereResourcePoolSpec   `json:"spec,omitempty"`
 	Status VSphereResourcePoolStatus `json:"status,omitempty"`
+}
+
+// GetConditions returns the conditions for a VSphereResourcePool.
+func (r *VSphereResourcePool) GetConditions() clusterv1.Conditions {
+	return r.Status.Conditions
+}
+
+// SetConditions sets the conditions on a VSphereResourcePool.
+func (r *VSphereResourcePool) SetConditions(conditions clusterv1.Conditions) {
+	r.Status.Conditions = conditions
 }
 
 // +kubebuilder:object:root=true
@@ -348,6 +363,13 @@ func (in *VSphereResourcePoolStatus) DeepCopyInto(out *VSphereResourcePoolStatus
 	if in.ResourceStatuses != nil {
 		in, out := &in.ResourceStatuses, &out.ResourceStatuses
 		*out = make([]ResourceSlotStatus, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+	if in.Conditions != nil {
+		in, out := &in.Conditions, &out.Conditions
+		*out = make(clusterv1.Conditions, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}

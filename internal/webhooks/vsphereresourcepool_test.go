@@ -84,6 +84,7 @@ func TestVSphereResourcePoolValidateCreate(t *testing.T) {
 				&infrav1.VSphereResourcePool{
 					ObjectMeta: metav1.ObjectMeta{Name: "pool-other", Namespace: "default"},
 					Spec: infrav1.VSphereResourcePoolSpec{
+						ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 						ConsumerRef: &corev1.ObjectReference{
 							APIVersion: clusterv1.GroupVersion.String(),
 							Kind:       "MachineDeployment",
@@ -158,6 +159,33 @@ func TestVSphereResourcePoolValidateUpdate(t *testing.T) {
 		g.Expect(err).To(HaveOccurred())
 	})
 
+	t.Run("rejects changing clusterRef while consumerRef is set", func(t *testing.T) {
+		oldPool := poolWithConsumerRef(&corev1.ObjectReference{
+			APIVersion: controlplanev1.GroupVersion.String(),
+			Kind:       "KubeadmControlPlane",
+			Namespace:  "default",
+			Name:       "cp-1",
+		})
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.ClusterRef.Name = "other-cluster"
+		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(kcp).Build()}
+		_, err := webhook.ValidateUpdate(context.Background(), oldPool, newPool)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("clusterRef"))
+	})
+
+	t.Run("allows changing clusterRef when consumerRef is nil", func(t *testing.T) {
+		oldPool := poolWithConsumerRef(nil)
+		oldPool.Status = infrav1.VSphereResourcePoolStatus{
+			ResourceStatuses: []infrav1.ResourceSlotStatus{{Hostname: "slot-1", State: "Available"}},
+		}
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.ClusterRef.Name = "other-cluster"
+		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		_, err := webhook.ValidateUpdate(context.Background(), oldPool, newPool)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+
 	t.Run("allows clearing consumer after consumer is gone and pool is reusable", func(t *testing.T) {
 		oldPool := poolWithConsumerRef(&corev1.ObjectReference{
 			APIVersion: controlplanev1.GroupVersion.String(),
@@ -188,6 +216,7 @@ func poolWithConsumerRef(ref *corev1.ObjectReference) *infrav1.VSphereResourcePo
 	return &infrav1.VSphereResourcePool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			ConsumerRef: ref,
 			Resources:   []infrav1.ResourceSlot{{Hostname: "slot-1"}},
 		},

@@ -225,6 +225,29 @@ const (
 	IPAddressClaimNotFoundReason = "IPAddressClaimNotFound"
 )
 
+// Conditions and condition Reasons for the VSphereResourcePool object.
+
+const (
+	// ClusterRefReadyCondition reports whether the referenced Cluster and
+	// its VSphereCluster infrastructure are found and available.
+	ClusterRefReadyCondition clusterv1.ConditionType = "ClusterRefReady"
+
+	// ClusterRefReadyReason documents that the referenced Cluster and VSphereCluster are available.
+	ClusterRefReadyReason = "ClusterRefReady"
+
+	// ClusterNotFoundReason (Severity=Warning) documents that the Cluster referenced
+	// by ClusterRef cannot be found.
+	ClusterNotFoundReason = "ClusterNotFound"
+
+	// VSphereClusterNotFoundReason (Severity=Warning) documents that the VSphereCluster
+	// referenced by the Cluster's InfrastructureRef cannot be found.
+	VSphereClusterNotFoundReason = "VSphereClusterNotFound"
+
+	// IdentityCredentialsUnavailableReason (Severity=Warning) documents that the
+	// vCenter credentials could not be resolved from the VSphereCluster's IdentityRef.
+	IdentityCredentialsUnavailableReason = "IdentityCredentialsUnavailable"
+)
+
 const (
 	// GuestSoftPowerOffSucceededCondition documents the status of performing guest initiated
 	// graceful shutdown.

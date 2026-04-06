@@ -9,13 +9,207 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
+	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 )
+
+func TestResolveVCenterParams(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
+
+	t.Run("cluster not found", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereResourcePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "missing-cluster"},
+				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			},
+		}
+		r := resourcePoolReconciler{
+			Client:                   fake.NewClientBuilder().WithScheme(scheme).Build(),
+			ControllerManagerContext: &capvcontext.ControllerManagerContext{},
+		}
+		_, err := r.resolveVCenterParams(context.Background(), pool)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("missing-cluster"))
+		c := conditions.Get(pool, infrav1.ClusterRefReadyCondition)
+		g.Expect(c).NotTo(BeNil())
+		g.Expect(c.Status).To(Equal(corev1.ConditionFalse))
+		g.Expect(c.Reason).To(Equal(infrav1.ClusterNotFoundReason))
+	})
+
+	t.Run("VSphereCluster not found", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "default"},
+			Spec: clusterv1.ClusterSpec{
+				InfrastructureRef: &corev1.ObjectReference{Name: "my-vsphere-cluster"},
+			},
+		}
+		pool := &infrav1.VSphereResourcePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
+				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			},
+		}
+		r := resourcePoolReconciler{
+			Client:                   fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build(),
+			ControllerManagerContext: &capvcontext.ControllerManagerContext{},
+		}
+		_, err := r.resolveVCenterParams(context.Background(), pool)
+		g.Expect(err).To(HaveOccurred())
+		c := conditions.Get(pool, infrav1.ClusterRefReadyCondition)
+		g.Expect(c).NotTo(BeNil())
+		g.Expect(c.Status).To(Equal(corev1.ConditionFalse))
+		g.Expect(c.Reason).To(Equal(infrav1.VSphereClusterNotFoundReason))
+	})
+
+	t.Run("nil InfrastructureRef", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "default"},
+		}
+		pool := &infrav1.VSphereResourcePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
+				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			},
+		}
+		r := resourcePoolReconciler{
+			Client:                   fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build(),
+			ControllerManagerContext: &capvcontext.ControllerManagerContext{},
+		}
+		_, err := r.resolveVCenterParams(context.Background(), pool)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("nil InfrastructureRef"))
+	})
+
+	t.Run("nil IdentityRef falls back to global creds", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "default"},
+			Spec: clusterv1.ClusterSpec{
+				InfrastructureRef: &corev1.ObjectReference{Name: "my-vsphere-cluster"},
+			},
+		}
+		vsphereCluster := &infrav1.VSphereCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-vsphere-cluster", Namespace: "default"},
+			Spec:       infrav1.VSphereClusterSpec{Server: "vcenter.example.com", Thumbprint: "AA:BB"},
+		}
+		pool := &infrav1.VSphereResourcePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
+				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			},
+		}
+		r := resourcePoolReconciler{
+			Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, vsphereCluster).Build(),
+			ControllerManagerContext: &capvcontext.ControllerManagerContext{
+				Username: "admin",
+				Password: "pass",
+			},
+		}
+		params, err := r.resolveVCenterParams(context.Background(), pool)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(params.server).To(Equal("vcenter.example.com"))
+		g.Expect(params.thumbprint).To(Equal("AA:BB"))
+		g.Expect(params.username).To(Equal("admin"))
+		g.Expect(params.password).To(Equal("pass"))
+		g.Expect(conditions.IsTrue(pool, infrav1.ClusterRefReadyCondition)).To(BeTrue())
+		g.Expect(conditions.IsTrue(pool, infrav1.VCenterAvailableCondition)).To(BeTrue())
+	})
+
+	t.Run("nil IdentityRef and empty global creds", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "default"},
+			Spec: clusterv1.ClusterSpec{
+				InfrastructureRef: &corev1.ObjectReference{Name: "my-vsphere-cluster"},
+			},
+		}
+		vsphereCluster := &infrav1.VSphereCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-vsphere-cluster", Namespace: "default"},
+			Spec:       infrav1.VSphereClusterSpec{Server: "vcenter.example.com"},
+		}
+		pool := &infrav1.VSphereResourcePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
+				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			},
+		}
+		r := resourcePoolReconciler{
+			Client:                   fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, vsphereCluster).Build(),
+			ControllerManagerContext: &capvcontext.ControllerManagerContext{},
+		}
+		_, err := r.resolveVCenterParams(context.Background(), pool)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("controller manager credentials are not configured"))
+		c := conditions.Get(pool, infrav1.VCenterAvailableCondition)
+		g.Expect(c).NotTo(BeNil())
+		g.Expect(c.Status).To(Equal(corev1.ConditionFalse))
+	})
+
+	t.Run("IdentityRef resolves credentials from secret", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "default"},
+			Spec: clusterv1.ClusterSpec{
+				InfrastructureRef: &corev1.ObjectReference{Name: "my-vsphere-cluster"},
+			},
+		}
+		vsphereCluster := &infrav1.VSphereCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-vsphere-cluster", Namespace: "default"},
+			Spec: infrav1.VSphereClusterSpec{
+				Server:     "vcenter.example.com",
+				Thumbprint: "CC:DD",
+				IdentityRef: &infrav1.VSphereIdentityReference{
+					Kind: infrav1.SecretKind,
+					Name: "vcenter-creds",
+				},
+			},
+		}
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "vcenter-creds", Namespace: "default"},
+			Data: map[string][]byte{
+				"username": []byte("secret-user"),
+				"password": []byte("secret-pass"),
+			},
+		}
+		pool := &infrav1.VSphereResourcePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
+				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			},
+		}
+		r := resourcePoolReconciler{
+			Client:                   fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, vsphereCluster, secret).Build(),
+			ControllerManagerContext: &capvcontext.ControllerManagerContext{Namespace: "default"},
+		}
+		params, err := r.resolveVCenterParams(context.Background(), pool)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(params.server).To(Equal("vcenter.example.com"))
+		g.Expect(params.thumbprint).To(Equal("CC:DD"))
+		g.Expect(params.username).To(Equal("secret-user"))
+		g.Expect(params.password).To(Equal("secret-pass"))
+		g.Expect(conditions.IsTrue(pool, infrav1.ClusterRefReadyCondition)).To(BeTrue())
+		g.Expect(conditions.IsTrue(pool, infrav1.VCenterAvailableCondition)).To(BeTrue())
+	})
+}
 
 func TestResourcePoolReconcileDeleteBlocksWhenMachineStillExists(t *testing.T) {
 	g := NewWithT(t)
@@ -35,6 +229,7 @@ func TestResourcePoolReconcileDeleteBlocksWhenMachineStillExists(t *testing.T) {
 			Finalizers: []string{ResourcePoolFinalizer},
 		},
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Resources: []infrav1.ResourceSlot{{Hostname: "host-1"}},
 		},
 		Status: infrav1.VSphereResourcePoolStatus{
@@ -75,6 +270,7 @@ func TestResourcePoolReconcileDeleteRemovesFinalizerAfterSafeReclaim(t *testing.
 			Finalizers: []string{ResourcePoolFinalizer},
 		},
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Resources: []infrav1.ResourceSlot{{Hostname: "host-1"}},
 		},
 		Status: infrav1.VSphereResourcePoolStatus{
@@ -118,6 +314,7 @@ func TestResourcePoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvailable
 			Finalizers: []string{ResourcePoolFinalizer},
 		},
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Resources: []infrav1.ResourceSlot{{
 				Hostname: "host-1",
 				PersistentDisks: []infrav1.PersistentDisk{{
@@ -178,6 +375,7 @@ func TestResolveSlotDatacenter(t *testing.T) {
 
 	pool := &infrav1.VSphereResourcePool{
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Datacenter: "Datacenter1",
 		},
 	}

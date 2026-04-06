@@ -619,6 +619,7 @@ func Test_VimMachineService_createOrPatchVSphereVM(t *testing.T) {
 				Namespace: fake.Namespace,
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
 				Resources: []infrav1.ResourceSlot{{
 					Hostname: "worker-01",
@@ -795,6 +796,7 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T)
 			Namespace: fake.Namespace,
 		},
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Datacenter: "dc-pool",
 			Resources: []infrav1.ResourceSlot{
 				{Hostname: "worker-01"},
@@ -868,6 +870,7 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsWildcardDatacenter(t *te
 			Namespace: fake.Namespace,
 		},
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Datacenter: "dc-pool",
 			Resources: []infrav1.ResourceSlot{
 				{Hostname: "worker-01"},

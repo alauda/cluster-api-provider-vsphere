@@ -21,15 +21,17 @@ type VSphereResourcePool struct {
 }
 
 type VSphereResourcePoolSpec struct {
+    // ClusterRef references the CAPI Cluster (in the same namespace) whose
+    // VSphereCluster provides vCenter server, thumbprint, and credential
+    // chain (IdentityRef) for this pool's vCenter operations (e.g. disk
+    // reclaim). Required. Can only be changed when consumerRef is nil.
+    // The pool will not reconcile until the referenced Cluster and its
+    // VSphereCluster infrastructure are available.
+    ClusterRef corev1.ObjectReference `json:"clusterRef"`
+
     // Datacenter is the default vSphere datacenter for slots in this pool.
     // It is used when a slot does not define its own Datacenter.
     Datacenter string `json:"datacenter,omitempty"`
-
-    // Server is the vCenter server address.
-    Server string `json:"server,omitempty"`
-
-    // Thumbprint is the vCenter certificate thumbprint.
-    Thumbprint string `json:"thumbprint,omitempty"`
 
     // Resources is the list of pre-defined resource slots.
     Resources []ResourceSlot `json:"resources"`
@@ -119,6 +121,12 @@ type PersistentDisk struct {
 type VSphereResourcePoolStatus struct {
     // ResourceStatuses tracks the state of each slot.
     ResourceStatuses []ResourceSlotStatus `json:"resourceStatuses,omitempty"`
+
+    // Conditions defines current state of the resource pool.
+    // Supported condition types:
+    //   - ClusterRefReady: the referenced Cluster and VSphereCluster are found and available.
+    //   - VCenterAvailable: vCenter credentials can be resolved and a session can be established.
+    Conditions clusterv1.Conditions `json:"conditions,omitempty"`
 }
 
 type ResourceSlotStatus struct {
@@ -327,7 +335,7 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
 - **Retention Period**: By default, a released slot is "reserved" for its previous owner (or for manual recovery) for a period defined by `ReleaseDelayHours` (e.g., 24-48 hours).
 - **Reclamation**: If `now - LastReleasedTime > ReleaseDelayHours`:
     - **Disk Cleanup**: The controller automatically deletes the associated `PersistentDisk` from the vSphere datastore to reclaim space.
-      The reclaim path resolves the datacenter from the slot first; if the slot does not define one, it falls back to the pool-level default datacenter.
+      The reclaim path resolves vCenter connection parameters via the `ClusterRef` credential chain, and resolves the datacenter from the slot first; if the slot does not define one, it falls back to the pool-level default datacenter.
     - **Spec cleanup**: After the reclaim task succeeds, the controller clears `VolumePath` and `DiskUUID` from the `PersistentDisk` spec and requeues.
     - **State Transition**: On a later reconcile, once the slot no longer has reclaimable persistent disk backing, the slot state is set back to `Available`, making it "clean" and ready to be picked up by any new machine (including those that don't need the previous data).
 - **Async reclaim task model**:
@@ -354,9 +362,13 @@ To ensure `VSphereResourcePool` and workload controllers are effectively used in
 
 When creating or updating a `VSphereResourcePool`:
 
+- `spec.clusterRef.name` must be set.
+- `spec.clusterRef.apiVersion`, if set, must be `cluster.x-k8s.io/v1beta1`.
+- `spec.clusterRef.kind`, if set, must be `Cluster`.
+- `spec.clusterRef.namespace`, if set, must match the pool namespace.
+- `spec.clusterRef` can only be changed when `spec.consumerRef` is nil.
 - If `spec.consumerRef` is set, `kind` must be either `KubeadmControlPlane` or `MachineDeployment`.
 - `apiVersion` must match the supported group for that kind.
-- `namespace` must match the pool namespace.
 - The referenced consumer object must exist.
 - If another `VSphereResourcePool` in the same namespace already points at the same consumer, validation fails.
   This prevents multiple pools from being bound to the same `KubeadmControlPlane` or `MachineDeployment`.
@@ -429,6 +441,15 @@ strategy:
 ```
 
 ## Implementation Notes
+- **Credential Resolution via ClusterRef**:
+    - `VSphereResourcePool.spec.clusterRef` is required. It references the CAPI `Cluster` object in the same namespace.
+    - `clusterRef` can only be changed when `consumerRef` is nil (i.e. the pool is not bound to any consumer).
+    - vCenter server address and thumbprint are derived from the `VSphereCluster` referenced by `Cluster.spec.infrastructureRef`.
+    - vCenter credentials are resolved via the chain: `ClusterRef` → `Cluster` → `VSphereCluster` → `IdentityRef` → `Secret`.
+    - If `VSphereCluster.spec.identityRef` is not set, the controller falls back to the global controller manager credentials. If neither is available, the pool reports `VCenterAvailable=False`.
+    - The pool will not reconcile until the referenced Cluster and VSphereCluster are available.
+    - Two conditions track this readiness: `ClusterRefReady` (Cluster and VSphereCluster exist) and `VCenterAvailable` (credentials resolved successfully).
+    - The controller watches `Cluster` and `VSphereCluster` objects to react to changes without polling.
 - **Datacenter Resolution**:
     - `VSphereResourcePool.spec.datacenter` is treated as a default value for the pool.
     - `ResourceSlot.datacenter`, when set, takes precedence over the pool-level datacenter.

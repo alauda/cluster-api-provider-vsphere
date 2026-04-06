@@ -53,6 +53,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-1"},
 				},
@@ -85,6 +86,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-available"},
 					{Hostname: "host-released"},
@@ -117,6 +119,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Resources: []infrav1.ResourceSlot{{Hostname: "host-1"}},
 			},
 			Status: infrav1.VSphereResourcePoolStatus{
@@ -139,6 +142,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-default",
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-default"},
@@ -160,6 +164,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-default",
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-default"},
@@ -180,6 +185,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-a", Datacenter: "dc-template"},
 					{Hostname: "host-b", Datacenter: "dc-fd"},
@@ -200,6 +206,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-a"},
@@ -228,6 +235,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-a"},
@@ -256,6 +264,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-a"},
@@ -276,6 +285,7 @@ func TestAllocateSlot(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
 				Resources: []infrav1.ResourceSlot{
 					{Hostname: "host-a"},
@@ -337,6 +347,7 @@ func TestGetSlotForMachine(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Resources: []infrav1.ResourceSlot{
 				{Hostname: "host-a"},
 				{Hostname: "host-b"},
@@ -368,6 +379,7 @@ func TestResolveResourcePoolDatacenter(t *testing.T) {
 
 	pool := &infrav1.VSphereResourcePool{
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Datacenter: "dc-pool",
 		},
 	}
@@ -393,7 +405,7 @@ func TestTryBindPoolToConsumer(t *testing.T) {
 	ctx := context.Background()
 	pool := &infrav1.VSphereResourcePool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-		Spec:       infrav1.VSphereResourcePoolSpec{Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
+		Spec:       infrav1.VSphereResourcePoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
 	}
 
 	t.Run("binds unbound pool", func(t *testing.T) {
@@ -452,6 +464,7 @@ func TestIsPoolFullyReusable(t *testing.T) {
 	g := NewWithT(t)
 	pool := &infrav1.VSphereResourcePool{
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}},
 		},
 		Status: infrav1.VSphereResourcePoolStatus{
@@ -548,6 +561,7 @@ func TestPersistSlotChangesPersistsUnitNumber(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: infrav1.VSphereResourcePoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Resources: []infrav1.ResourceSlot{
 				{
 					Hostname: "host-1",
@@ -668,6 +682,7 @@ func TestApplyDiskBackfill(t *testing.T) {
 		g := NewWithT(t)
 		pool := &infrav1.VSphereResourcePool{
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Resources: []infrav1.ResourceSlot{{
 					Hostname: "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{
@@ -692,6 +707,7 @@ func TestApplyDiskBackfill(t *testing.T) {
 		g := NewWithT(t)
 		pool := &infrav1.VSphereResourcePool{
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Resources: []infrav1.ResourceSlot{{
 					Hostname: "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{
@@ -713,6 +729,7 @@ func TestApplyDiskBackfill(t *testing.T) {
 		g := NewWithT(t)
 		pool := &infrav1.VSphereResourcePool{
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Resources: []infrav1.ResourceSlot{{
 					Hostname: "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{
@@ -735,6 +752,7 @@ func TestApplyDiskBackfill(t *testing.T) {
 		g := NewWithT(t)
 		pool := &infrav1.VSphereResourcePool{
 			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Resources: []infrav1.ResourceSlot{{
 					Hostname:        "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20}},
