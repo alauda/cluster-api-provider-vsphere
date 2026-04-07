@@ -130,7 +130,17 @@ kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> \
 # 期望：1 个 InUse，其余 Available
 ```
 
-**2.5 Slot 与 Machine 匹配**
+**2.5 VSphereMachine ResourcePoolReady Condition**
+```bash
+# 所有使用静态池的 VSphereMachine 应有 ResourcePoolReady=True
+kubectl get vspheremachines -n <namespace> \
+  -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {range .status.conditions[?(@.type=="ResourcePoolReady")]}{.status} ({.reason}){end}{"\n"}{end}'
+# 期望：已分配 slot 的 VSphereMachine 显示 True (SlotAllocated)
+#        被 consumerRef 拦截的 VSphereMachine 显示 False (PoolBoundToOtherConsumer)
+```
+
+**2.6 Slot-Machine 匹配**
 ```bash
 kubectl get vsphereresourcepool <cp-pool-name> -n <namespace> -o json | \
   jq -r '.status.resourceStatuses[] | select(.state=="InUse") | "\(.hostname) -> \(.machineRef.name)"'
@@ -295,8 +305,8 @@ kubectl get vspheremachines -n <namespace> \
   -o json | jq -r '.items[] | select(.status.ready != true) | .metadata.name' | head -1
 
 kubectl get vspheremachine <stuck-machine-name> -n <namespace> \
-  -o jsonpath='{range .status.conditions[*]}{.type}: {.message}{"\n"}{end}'
-# 期望：包含 "no available slots" 相关信息
+  -o jsonpath='{range .status.conditions[*]}{.type}: {.status} ({.reason}) - {.message}{"\n"}{end}'
+# 期望：ResourcePoolReady: False (NoAvailableSlots) - "no available slots..."
 ```
 
 **3.3.3 恢复**
@@ -705,8 +715,8 @@ kubectl get vspheremachines -n <namespace> \
   -o json | jq -r '.items[] | select(.status.ready != true) | .metadata.name'
 
 kubectl get vspheremachine <stuck-machine-name> -n <namespace> \
-  -o jsonpath='{range .status.conditions[*]}{.type}: {.reason} - {.message}{"\n"}{end}'
-# 期望：包含 "no available slots"
+  -o jsonpath='{range .status.conditions[*]}{.type}: {.status} ({.reason}) - {.message}{"\n"}{end}'
+# 期望：ResourcePoolReady: False (NoAvailableSlots) - "no available slots..."
 ```
 
 **6.2.3 恢复**

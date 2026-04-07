@@ -607,8 +607,15 @@ func (v *VimMachineService) reconcileResourcePool(ctx context.Context, vimMachin
 	}
 	slot, err := AllocateSlot(ctx, v.Client, vimMachineCtx.VSphereMachine.Spec.ResourcePoolRef, vimMachineCtx.VSphereMachine, consumerRef, desiredDatacenter, allowedFailureDomainDatacenters)
 	if err != nil {
+		reason := infrav1.ResourcePoolNoAvailableSlotsReason
+		if strings.Contains(err.Error(), "is bound to") {
+			reason = infrav1.ResourcePoolBoundToOtherConsumerReason
+		}
+		conditions.MarkFalse(vimMachineCtx.VSphereMachine, infrav1.ResourcePoolReadyCondition,
+			reason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 		return errors.Wrap(err, "failed to allocate slot from pool")
 	}
+	conditions.MarkTrue(vimMachineCtx.VSphereMachine, infrav1.ResourcePoolReadyCondition)
 	vimMachineCtx.ResourceSlot = slot
 	return nil
 }

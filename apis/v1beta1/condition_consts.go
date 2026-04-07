@@ -248,6 +248,26 @@ const (
 	IdentityCredentialsUnavailableReason = "IdentityCredentialsUnavailable"
 )
 
+// Conditions and condition Reasons for VSphereMachine resource pool allocation.
+
+const (
+	// ResourcePoolReadyCondition reports whether the static resource pool slot
+	// has been successfully allocated for this machine. Only set when
+	// spec.resourcePoolRef is configured.
+	ResourcePoolReadyCondition clusterv1.ConditionType = "ResourcePoolReady"
+
+	// ResourcePoolSlotAllocatedReason documents that a slot has been allocated.
+	ResourcePoolSlotAllocatedReason = "SlotAllocated"
+
+	// ResourcePoolBoundToOtherConsumerReason (Severity=Warning) documents that
+	// the pool is bound to a different consumer (KCP or MachineDeployment).
+	ResourcePoolBoundToOtherConsumerReason = "PoolBoundToOtherConsumer"
+
+	// ResourcePoolNoAvailableSlotsReason (Severity=Warning) documents that no
+	// slots matching the required datacenter/failure domain are available.
+	ResourcePoolNoAvailableSlotsReason = "NoAvailableSlots"
+)
+
 const (
 	// GuestSoftPowerOffSucceededCondition documents the status of performing guest initiated
 	// graceful shutdown.

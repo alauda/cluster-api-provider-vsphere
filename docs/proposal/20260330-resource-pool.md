@@ -450,6 +450,12 @@ strategy:
     - The pool will not reconcile until the referenced Cluster and VSphereCluster are available.
     - Two conditions track this readiness: `ClusterRefReady` (Cluster and VSphereCluster exist) and `VCenterAvailable` (credentials resolved successfully).
     - The controller watches `Cluster` and `VSphereCluster` objects to react to changes without polling.
+- **VSphereMachine ResourcePoolReady Condition**:
+    - When `spec.resourcePoolRef` is set, a `ResourcePoolReady` condition is added to the VSphereMachine.
+    - `True` with reason `SlotAllocated` when a slot is successfully allocated.
+    - `False` with reason `PoolBoundToOtherConsumer` when the pool is bound to a different consumer.
+    - `False` with reason `NoAvailableSlots` when no slots match the required datacenter/failure domain.
+    - Not set when `spec.resourcePoolRef` is nil (non-static-pool mode).
 - **Datacenter Resolution**:
     - `VSphereResourcePool.spec.datacenter` is treated as a default value for the pool.
     - `ResourceSlot.datacenter`, when set, takes precedence over the pool-level datacenter.
