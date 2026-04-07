@@ -106,6 +106,13 @@ func (webhook *VSphereMachine) ValidateUpdate(_ context.Context, oldRaw runtime.
 	if !ok {
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereMachine but got a %T", newRaw))
 	}
+
+	// Allow spec changes during deletion so the controller can patch spec
+	// (e.g. datacenter backfill) together with finalizer removal.
+	if newTyped.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
 	if newTyped.Spec.GuestSoftPowerOffTimeout != nil {
 		if newTyped.Spec.PowerOffMode != infrav1.VirtualMachinePowerOpModeTrySoft {
 			allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "guestSoftPowerOffTimeout"), newTyped.Spec.GuestSoftPowerOffTimeout, "should not be set in templates unless the powerOffMode is trySoft"))

@@ -146,6 +146,12 @@ func AddClusterControllerToManager(ctx context.Context, controllerManagerCtx *ca
 			&infrav1.VSphereDeploymentZone{},
 			handler.EnqueueRequestsFromMapFunc(reconciler.deploymentZoneToCluster),
 		).
+		// Watch VSphereResourcePools so that slot availability changes trigger
+		// re-evaluation of which failure domains are reported to CAPI.
+		Watches(
+			&infrav1.VSphereResourcePool{},
+			handler.EnqueueRequestsFromMapFunc(reconciler.resourcePoolToCluster),
+		).
 		// Watch a GenericEvent channel for the controlled resource.
 		//
 		// This is useful when there are events outside of Kubernetes that

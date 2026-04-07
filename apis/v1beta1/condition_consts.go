@@ -34,6 +34,10 @@ const (
 	// Instead of reporting a false ready status, these failure domains are still under the process of reconciling
 	// and hence not yet reporting their status.
 	WaitingForFailureDomainStatusReason = "WaitingForFailureDomainStatus"
+
+	// FailureDomainsExhaustedByResourcePoolReason (Severity=Warning) documents that all failure domains
+	// were excluded because their datacenters have no available resource pool slots.
+	FailureDomainsExhaustedByResourcePoolReason = "FailureDomainsExhaustedByResourcePool"
 )
 
 // Conditions and condition Reasons for the VSphereMachine and the VSphereVM object.

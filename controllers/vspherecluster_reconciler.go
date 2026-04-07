@@ -672,8 +672,13 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 		return false, pkgerrors.Wrap(err, "unable to list VSphereDeploymentZones")
 	}
 
-	readyNotReported, notReady := 0, 0
+	// Check resource pool slot availability per datacenter to filter out
+	// failure domains that have no allocatable slots.
+	availableDatacenters, hasResourcePools := r.computeAvailableDatacenters(ctx, clusterCtx)
+
+	readyNotReported, notReady, excludedByPool := 0, 0, 0
 	failureDomains := clusterv1.FailureDomains{}
+	allReadyDomains := clusterv1.FailureDomains{}
 	for _, zone := range deploymentZoneList.Items {
 		if zone.Spec.Server != clusterCtx.VSphereCluster.Spec.Server {
 			continue
@@ -688,12 +693,31 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 		}
 
 		if *zone.Status.Ready {
-			failureDomains[zone.Name] = clusterv1.FailureDomainSpec{
+			fdSpec := clusterv1.FailureDomainSpec{
 				ControlPlane: ptr.Deref(zone.Spec.ControlPlane, true),
 			}
+			allReadyDomains[zone.Name] = fdSpec
+			if hasResourcePools && !r.zoneHasAvailableSlots(ctx, zone, availableDatacenters) {
+				log.Info("Excluding failure domain: no resource pool slots available for its datacenter",
+					"zone", zone.Name, "failureDomain", zone.Spec.FailureDomain)
+				excludedByPool++
+				continue
+			}
+			failureDomains[zone.Name] = fdSpec
 			continue
 		}
 		notReady++
+	}
+
+	if excludedByPool > 0 {
+		log.Info("Failure domains excluded due to resource pool slot exhaustion", "excludedCount", excludedByPool)
+		// Safety net: never report an empty FailureDomains map when ready zones
+		// exist. An empty map causes CAPI to create Machines without FD assignment,
+		// which could grab any DC's slot when one later becomes available.
+		if len(failureDomains) == 0 && len(allReadyDomains) > 0 {
+			log.Info("All failure domains exhausted, keeping all ready zones to prevent nil FD assignment")
+			failureDomains = allReadyDomains
+		}
 	}
 
 	clusterCtx.VSphereCluster.Status.FailureDomains = failureDomains
@@ -710,13 +734,28 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 	}
 
 	if len(failureDomains) > 0 {
-		if notReady > 0 {
-			conditions.MarkFalse(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition, infrav1.FailureDomainsSkippedReason, clusterv1.ConditionSeverityInfo, "one or more failure domains are not ready")
+		if excludedByPool > 0 && excludedByPool == len(allReadyDomains) {
+			// All ready zones were exhausted; all were kept to prevent nil FD assignment.
+			conditions.MarkFalse(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition,
+				infrav1.FailureDomainsExhaustedByResourcePoolReason, clusterv1.ConditionSeverityWarning,
+				"all failure domains have no available resource pool slots (total %d)", excludedByPool)
 			v1beta2conditions.Set(clusterCtx.VSphereCluster, metav1.Condition{
 				Type:    infrav1.VSphereClusterFailureDomainsReadyV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  infrav1.VSphereClusterFailureDomainsNotReadyV1Beta2Reason,
-				Message: "One or more failure domains are not ready",
+				Message: fmt.Sprintf("All failure domains have no available resource pool slots (total %d)", excludedByPool),
+			})
+		} else if notReady > 0 || excludedByPool > 0 {
+			msg := "one or more failure domains are not ready"
+			if excludedByPool > 0 {
+				msg = fmt.Sprintf("one or more failure domains are not ready or have no available resource pool slots (excluded %d)", excludedByPool)
+			}
+			conditions.MarkFalse(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition, infrav1.FailureDomainsSkippedReason, clusterv1.ConditionSeverityInfo, msg)
+			v1beta2conditions.Set(clusterCtx.VSphereCluster, metav1.Condition{
+				Type:    infrav1.VSphereClusterFailureDomainsReadyV1Beta2Condition,
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.VSphereClusterFailureDomainsNotReadyV1Beta2Reason,
+				Message: msg,
 			})
 		} else {
 			conditions.MarkTrue(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition)
@@ -854,4 +893,88 @@ func (r *clusterReconciler) deploymentZoneToCluster(ctx context.Context, o clien
 		}
 	}
 	return requests
+}
+
+// computeAvailableDatacenters lists all VSphereResourcePools for this cluster
+// and returns the set of datacenters that have at least one allocatable slot.
+// The second return value indicates whether any resource pools exist.
+func (r *clusterReconciler) computeAvailableDatacenters(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (map[string]struct{}, bool) {
+	log := ctrl.LoggerFrom(ctx)
+	var poolList infrav1.VSphereResourcePoolList
+	if err := r.Client.List(ctx, &poolList, client.InNamespace(clusterCtx.Cluster.Namespace)); err != nil {
+		log.Error(err, "Failed to list VSphereResourcePools, skipping slot-based filtering")
+		return nil, false
+	}
+
+	var clusterPools []infrav1.VSphereResourcePool
+	for i := range poolList.Items {
+		if poolList.Items[i].Spec.ClusterRef.Name == clusterCtx.Cluster.Name &&
+			poolList.Items[i].Spec.ClusterRef.Namespace == clusterCtx.Cluster.Namespace {
+			clusterPools = append(clusterPools, poolList.Items[i])
+		}
+	}
+
+	if len(clusterPools) == 0 {
+		return nil, false
+	}
+
+	return services.DatacentersWithAvailableSlots(clusterPools), true
+}
+
+// zoneHasAvailableSlots checks whether the given deployment zone's datacenter
+// has available resource pool slots. Returns true conservatively if the
+// failure domain cannot be resolved.
+func (r *clusterReconciler) zoneHasAvailableSlots(ctx context.Context, zone infrav1.VSphereDeploymentZone, availableDatacenters map[string]struct{}) bool {
+	log := ctrl.LoggerFrom(ctx)
+	if zone.Spec.FailureDomain == "" {
+		return true
+	}
+
+	var fd infrav1.VSphereFailureDomain
+	if err := r.Client.Get(ctx, client.ObjectKey{Name: zone.Spec.FailureDomain}, &fd); err != nil {
+		log.Error(err, "Failed to get VSphereFailureDomain, including zone conservatively", "zone", zone.Name, "failureDomain", zone.Spec.FailureDomain)
+		return true
+	}
+
+	dc := fd.Spec.Topology.Datacenter
+	if dc == "" {
+		return true
+	}
+
+	_, ok := availableDatacenters[dc]
+	return ok
+}
+
+// resourcePoolToCluster maps a VSphereResourcePool to the VSphereCluster
+// that owns the referenced CAPI Cluster.
+func (r *clusterReconciler) resourcePoolToCluster(ctx context.Context, o client.Object) []ctrl.Request {
+	log := ctrl.LoggerFrom(ctx)
+	pool, ok := o.(*infrav1.VSphereResourcePool)
+	if !ok {
+		return nil
+	}
+
+	if pool.Spec.ClusterRef.Name == "" || pool.Spec.ClusterRef.Namespace == "" {
+		return nil
+	}
+
+	cluster := &clusterv1.Cluster{}
+	if err := r.Client.Get(ctx, client.ObjectKey{
+		Namespace: pool.Spec.ClusterRef.Namespace,
+		Name:      pool.Spec.ClusterRef.Name,
+	}, cluster); err != nil {
+		log.V(4).Error(err, "Failed to get Cluster for VSphereResourcePool", "pool", klog.KObj(pool))
+		return nil
+	}
+
+	if cluster.Spec.InfrastructureRef == nil {
+		return nil
+	}
+
+	return []ctrl.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: cluster.Spec.InfrastructureRef.Namespace,
+			Name:      cluster.Spec.InfrastructureRef.Name,
+		},
+	}}
 }

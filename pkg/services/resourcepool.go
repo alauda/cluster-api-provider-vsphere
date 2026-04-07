@@ -213,6 +213,32 @@ func ResolveResourcePoolDatacenterFromRef(ctx context.Context, c client.Client, 
 	return ResolveResourcePoolDatacenter(pool, slot), nil
 }
 
+// DatacentersWithAvailableSlots returns the set of datacenter names that have
+// at least one allocatable slot (Available, Released, or uninitialized) across
+// all provided pools.
+func DatacentersWithAvailableSlots(pools []infrav1.VSphereResourcePool) map[string]struct{} {
+	result := make(map[string]struct{})
+	for i := range pools {
+		pool := &pools[i]
+		statusMap := make(map[string]infrav1.ResourceSlotStatus)
+		for _, s := range pool.Status.ResourceStatuses {
+			statusMap[s.Hostname] = s
+		}
+		for j := range pool.Spec.Resources {
+			slot := &pool.Spec.Resources[j]
+			dc := ResolveResourcePoolDatacenter(pool, slot)
+			if dc == "" {
+				continue
+			}
+			s := statusMap[slot.Hostname]
+			if s.State == "" || s.State == "Available" || s.State == "Released" {
+				result[dc] = struct{}{}
+			}
+		}
+	}
+	return result
+}
+
 // AllocateSlot finds an available or released slot in the pool for the given machine.
 // It retries internally on conflict errors to avoid propagating transient conflicts
 // caused by concurrent updates from the resource pool controller.

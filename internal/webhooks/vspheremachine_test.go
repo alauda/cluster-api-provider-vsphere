@@ -208,6 +208,18 @@ func TestVSphereMachine_ValidateUpdate(t *testing.T) {
 			vsphereMachine:    createVSphereMachine("foo.com", &someProviderID, "", []string{"192.168.0.1/32"}, infrav1.VirtualMachinePowerOpModeSoft, nil, nil),
 			wantErr:           false,
 		},
+		{
+			name:              "spec changes allowed during deletion",
+			oldVSphereMachine: createVSphereMachine("foo.com", nil, "", []string{"192.168.0.1/32"}, infrav1.VirtualMachinePowerOpModeSoft, nil, nil),
+			vsphereMachine: func() *infrav1.VSphereMachine {
+				m := createVSphereMachine("bar.com", nil, "", []string{"192.168.0.1/32"}, infrav1.VirtualMachinePowerOpModeSoft, nil, nil)
+				now := metav1.Now()
+				m.DeletionTimestamp = &now
+				m.Finalizers = []string{"test"}
+				return m
+			}(),
+			wantErr: false,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(*testing.T) {

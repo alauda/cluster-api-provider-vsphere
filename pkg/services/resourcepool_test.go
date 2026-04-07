@@ -397,6 +397,119 @@ func TestResolveResourcePoolDatacenter(t *testing.T) {
 	g.Expect(ResolveResourcePoolDatacenter(nil, slotWithoutDatacenter)).To(BeEmpty())
 }
 
+func TestDatacentersWithAvailableSlots(t *testing.T) {
+	t.Run("empty pool list returns empty result", func(t *testing.T) {
+		g := NewWithT(t)
+		result := DatacentersWithAvailableSlots(nil)
+		g.Expect(result).To(BeEmpty())
+	})
+
+	t.Run("available and released slots are counted", func(t *testing.T) {
+		g := NewWithT(t)
+		pools := []infrav1.VSphereResourcePool{{
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
+				Datacenter: "dc-1",
+				Resources: []infrav1.ResourceSlot{
+					{Hostname: "host-1"},
+					{Hostname: "host-2"},
+					{Hostname: "host-3", Datacenter: "dc-2"},
+				},
+			},
+			Status: infrav1.VSphereResourcePoolStatus{
+				ResourceStatuses: []infrav1.ResourceSlotStatus{
+					{Hostname: "host-1", State: "InUse"},
+					{Hostname: "host-2", State: "Released"},
+					{Hostname: "host-3", State: "Available"},
+				},
+			},
+		}}
+		result := DatacentersWithAvailableSlots(pools)
+		g.Expect(result).To(HaveKey("dc-1"))
+		g.Expect(result).To(HaveKey("dc-2"))
+	})
+
+	t.Run("all slots in use excludes datacenter", func(t *testing.T) {
+		g := NewWithT(t)
+		pools := []infrav1.VSphereResourcePool{{
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
+				Datacenter: "dc-1",
+				Resources: []infrav1.ResourceSlot{
+					{Hostname: "host-1"},
+					{Hostname: "host-2"},
+				},
+			},
+			Status: infrav1.VSphereResourcePoolStatus{
+				ResourceStatuses: []infrav1.ResourceSlotStatus{
+					{Hostname: "host-1", State: "InUse"},
+					{Hostname: "host-2", State: "InUse"},
+				},
+			},
+		}}
+		result := DatacentersWithAvailableSlots(pools)
+		g.Expect(result).NotTo(HaveKey("dc-1"))
+	})
+
+	t.Run("uninitialized slots count as available", func(t *testing.T) {
+		g := NewWithT(t)
+		pools := []infrav1.VSphereResourcePool{{
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
+				Datacenter: "dc-1",
+				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			},
+			// No status entries
+		}}
+		result := DatacentersWithAvailableSlots(pools)
+		g.Expect(result).To(HaveKey("dc-1"))
+	})
+
+	t.Run("slot-level datacenter overrides pool-level", func(t *testing.T) {
+		g := NewWithT(t)
+		pools := []infrav1.VSphereResourcePool{{
+			Spec: infrav1.VSphereResourcePoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
+				Datacenter: "dc-pool",
+				Resources: []infrav1.ResourceSlot{
+					{Hostname: "host-1", Datacenter: "dc-slot"},
+				},
+			},
+		}}
+		result := DatacentersWithAvailableSlots(pools)
+		g.Expect(result).To(HaveKey("dc-slot"))
+		g.Expect(result).NotTo(HaveKey("dc-pool"))
+	})
+
+	t.Run("multiple pools aggregate available datacenters", func(t *testing.T) {
+		g := NewWithT(t)
+		pools := []infrav1.VSphereResourcePool{
+			{
+				Spec: infrav1.VSphereResourcePoolSpec{
+					ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
+					Datacenter: "dc-1",
+					Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				},
+				Status: infrav1.VSphereResourcePoolStatus{
+					ResourceStatuses: []infrav1.ResourceSlotStatus{
+						{Hostname: "host-1", State: "InUse"},
+					},
+				},
+			},
+			{
+				Spec: infrav1.VSphereResourcePoolSpec{
+					ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
+					Datacenter: "dc-1",
+					Resources:  []infrav1.ResourceSlot{{Hostname: "host-2"}},
+				},
+				// host-2 has no status -> available
+			},
+		}
+		result := DatacentersWithAvailableSlots(pools)
+		g.Expect(result).To(HaveKey("dc-1"))
+	})
+}
+
 func TestIsPoolFullyReusable(t *testing.T) {
 	g := NewWithT(t)
 	pool := &infrav1.VSphereResourcePool{

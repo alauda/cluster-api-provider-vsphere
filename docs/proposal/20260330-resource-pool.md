@@ -507,6 +507,65 @@ strategy:
     - The `VSphereVM` controller is responsible for gating backend VM creation on CAPV IPAM fulfillment when slot IPs are not provided.
     - A dedicated controller for `VSphereResourcePool` manages status tracking, delayed reclaim, async reclaim task polling, and safe deletion semantics.
 
+## FailureDomain-Aware Slot Filtering
+
+When `VSphereCluster.spec.failureDomainSelector` is configured, CAPI selects a FailureDomain (and its Datacenter) for each Machine. If the selected Datacenter has no available slots in any `VSphereResourcePool`, the Machine gets stuck with `ResourcePoolNoAvailableSlots`.
+
+### Filtering Logic
+
+CAPV filters `VSphereCluster.Status.FailureDomains` based on resource pool slot availability so CAPI only picks FailureDomains with allocatable slots:
+
+1. In `reconcileDeploymentZones()`, list all `VSphereResourcePool` objects in the cluster namespace whose `ClusterRef` matches the CAPI Cluster.
+2. Compute available datacenters: a datacenter is "available" if **any** pool has at least one allocatable slot (state is `Available`, `Released`, or uninitialized) in that datacenter.
+3. For each ready `VSphereDeploymentZone`, resolve its datacenter from the referenced `VSphereFailureDomain.spec.topology.datacenter`. If that datacenter has no available slots, exclude the zone from `Status.FailureDomains`.
+4. A `Watches` on `VSphereResourcePool` triggers re-reconcile of the `VSphereCluster` when slot states change, ensuring the FailureDomain list stays up to date.
+
+**Backward compatibility**: If no `VSphereResourcePool` references this cluster, all ready zones are reported as before—the filtering is completely transparent.
+
+**Conservative error handling**: If a `VSphereFailureDomain` cannot be resolved for a zone, the zone is included conservatively (not excluded).
+
+### Safety Net: Preventing Empty FailureDomains Map
+
+When **all** ready zones are excluded due to slot exhaustion, CAPV falls back to reporting all ready zones instead of an empty map. This prevents CAPI from creating Machines with `spec.failureDomain = nil`, which would bypass FailureDomain semantics and allow slot allocation from any datacenter when slots later become available.
+
+### Condition Reporting
+
+| Scenario | FailureDomains | Condition |
+|----------|---------------|-----------|
+| Some FDs have slots | Only FDs with available slots | `FailureDomainsSkipped` with excluded count |
+| All FDs exhausted | All ready zones (fallback) | `FailureDomainsExhaustedByResourcePool` (Warning) |
+| No ResourcePools | All ready zones | Original behavior unchanged |
+
+### Known Limitations
+
+**Race condition: Machine.Spec.FailureDomain is immutable**
+
+FailureDomain filtering takes effect at the `VSphereCluster.Status.FailureDomains` level, but there is a propagation delay:
+
+```
+CAPV updates VSphereCluster.Status.FailureDomains
+  → CAPI Cluster controller syncs to Cluster.Status.FailureDomains
+    → KCP controller reads the new list and creates Machine
+```
+
+During this propagation window (typically seconds), CAPI may still use the old FailureDomain list. Since `Machine.Spec.FailureDomain` is immutable once set, these Machines will remain stuck at `ResourcePoolNoAvailableSlots` until a slot becomes available for that datacenter.
+
+**Impact**: The race window is short (watch-driven, seconds). Only a small number of Machines may be affected.
+
+**Possible future mitigations**:
+1. Relax datacenter constraints in `AllocateSlot`: prefer the FailureDomain datacenter, fall back to other DCs when no matching slot exists.
+2. Use `MachineHealthCheck` to detect long-unprovisioned Machines and trigger deletion/recreation (CAPI would reassign FailureDomain).
+
+**Consumer granularity is imprecise**
+
+Different `MachineDeployment`/`KubeadmControlPlane` objects may use different `VSphereResourcePool` instances. The current approach aggregates slot availability across all pools at the cluster level, without distinguishing which consumer uses which pool. For example:
+- Pool-A (bound to KCP) only has DC-1 slots
+- Pool-B (bound to MD-worker) only has DC-2 slots
+- Filtering result: both DC-1 and DC-2 appear available
+- But KCP creating a Machine in DC-2 still fails (Pool-A has no DC-2 slots)
+
+This scenario is not made worse by the filtering (same behavior as without filtering), but cannot be fully prevented.
+
 ## Testing Matrix
 
 The implementation should include at least the following tests.
