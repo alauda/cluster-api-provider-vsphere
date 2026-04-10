@@ -207,17 +207,6 @@ func GetKubeletServingCertCloudConfigFromPEM(kubeletCertPEM, kubeletKeyPEM []byt
 				"encoding":    "b64",
 				"content":     base64.StdEncoding.EncodeToString(kubeletKeyPEM),
 			},
-			map[interface{}]interface{}{
-				"path":        "/etc/kubernetes/patches/kubeletconfiguration1+strategic.json",
-				"permissions": "0644",
-				"owner":       "root:root",
-				"content": "{\n" +
-					"  \"apiVersion\": \"kubelet.config.k8s.io/v1beta1\",\n" +
-					"  \"kind\": \"KubeletConfiguration\",\n" +
-					"  \"tlsCertFile\": \"/etc/kubernetes/pki/kubelet.crt\",\n" +
-					"  \"tlsPrivateKeyFile\": \"/etc/kubernetes/pki/kubelet.key\"\n" +
-					"}\n",
-			},
 		},
 	}
 	return yaml.Marshal(config)
@@ -359,7 +348,7 @@ func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk) ([]b
 		if disk.UnitNumber == nil {
 			continue
 		}
-		if disk.FSFormat == "" {
+		if disk.FSFormat == "" && disk.MountPath != "" {
 			disk.FSFormat = "ext4"
 		}
 		normalizedPersistentDisks = append(normalizedPersistentDisks, disk)
@@ -374,15 +363,20 @@ func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk) ([]b
 		if len(disk.MountOptions) > 0 {
 			options = strings.Join(disk.MountOptions, ",")
 		}
+		wipeFs := "false"
+		if disk.WipeFilesystem != nil && *disk.WipeFilesystem {
+			wipeFs = "true"
+		}
 		fmt.Fprintf(
 			&configFile,
-			"%s\t%d\t%s\t%s\t%s\t%s\n",
+			"%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			disk.Name,
 			*disk.UnitNumber,
 			disk.MountPath,
 			disk.FSFormat,
 			options,
 			disk.DiskUUID,
+			wipeFs,
 		)
 	}
 
@@ -743,7 +737,7 @@ while true; do
     continue
   fi
 
-  while IFS='	' read -r disk_name unit_number mount_path fs_format mount_options disk_uuid; do
+  while IFS='	' read -r disk_name unit_number mount_path fs_format mount_options disk_uuid wipe_fs; do
     [ -n "${disk_name}" ] || continue
 
     link_path="${DEVICE_DIR}/${disk_name}"
@@ -760,19 +754,18 @@ while true; do
 
     ln -sf "${device_path}" "${link_path}"
 
-    if ! blkid "${device_path}" >/dev/null 2>&1; then
-      mkfs_cmd="mkfs.${fs_format}"
-      if ! command -v "${mkfs_cmd}" >/dev/null 2>&1; then
-        echo "missing formatter ${mkfs_cmd} for disk ${disk_name}" >&2
-        continue
-      fi
-      if ! "${mkfs_cmd}" -F "${device_path}"; then
-        echo "failed to format ${device_path} for disk ${disk_name}" >&2
-        continue
-      fi
-    fi
-
     if [ -n "${mount_path}" ]; then
+      if ! blkid "${device_path}" >/dev/null 2>&1; then
+        mkfs_cmd="mkfs.${fs_format}"
+        if ! command -v "${mkfs_cmd}" >/dev/null 2>&1; then
+          echo "missing formatter ${mkfs_cmd} for disk ${disk_name}" >&2
+          continue
+        fi
+        if ! "${mkfs_cmd}" -F "${device_path}"; then
+          echo "failed to format ${device_path} for disk ${disk_name}" >&2
+          continue
+        fi
+      fi
       mkdir -p "${mount_path}"
       if ! mountpoint -q "${mount_path}"; then
         if [ -n "${mount_options}" ] && [ "${mount_options}" != "defaults" ]; then
@@ -780,6 +773,19 @@ while true; do
         else
           mount "${link_path}" "${mount_path}" || true
         fi
+      fi
+      # If wipeFilesystem is true, wipe disk content on first boot of a
+      # new VM.  The marker lives on the system disk (not a persistent disk),
+      # so it is absent after VM recreation but survives normal reboots and
+      # manual service restarts.
+      if [ "${wipe_fs}" = "true" ]; then
+        marker_dir="/var/lib/capv"
+        marker="${marker_dir}/disk-initialized-${disk_name}"
+        if [ ! -f "${marker}" ]; then
+          find "${mount_path}" -mindepth 1 -delete 2>/dev/null || true
+        fi
+        mkdir -p "${marker_dir}"
+        touch "${marker}"
       fi
       # ext4 creates lost+found on mkfs; etcd refuses to start if its
       # data-dir is not empty, so remove it after mounting.

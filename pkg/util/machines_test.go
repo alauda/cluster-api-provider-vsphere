@@ -1045,8 +1045,8 @@ func Test_GetPersistentDiskCloudConfig(t *testing.T) {
 	}
 	actualMap := actualObj.(map[interface{}]interface{})
 	writeFiles, ok := actualMap["write_files"].([]interface{})
-	if !ok || len(writeFiles) != 3 {
-		t.Fatalf("expected 3 write_files entries, got: %#v", actualMap["write_files"])
+	if !ok || len(writeFiles) != 5 {
+		t.Fatalf("expected 5 write_files entries (tsv, script, service, containerd drop-in, kubelet drop-in), got %d: %#v", len(writeFiles), actualMap["write_files"])
 	}
 	configEntry := writeFiles[0].(map[interface{}]interface{})
 	encodedConfig := configEntry["content"].(string)
@@ -1123,8 +1123,8 @@ func Test_GetKubeletServingCertCloudConfig(t *testing.T) {
 	}
 	actualMap := actualObj.(map[interface{}]interface{})
 	writeFiles, ok := actualMap["write_files"].([]interface{})
-	if !ok || len(writeFiles) != 3 {
-		t.Fatalf("expected 3 write_files entries, got: %#v", actualMap["write_files"])
+	if !ok || len(writeFiles) != 2 {
+		t.Fatalf("expected 2 write_files entries, got: %#v", actualMap["write_files"])
 	}
 
 	certEntry := writeFiles[0].(map[interface{}]interface{})
@@ -1171,18 +1171,6 @@ func Test_GetKubeletServingCertCloudConfig(t *testing.T) {
 		t.Fatalf("failed to parse kubelet key: %v", err)
 	}
 
-	patchEntry := writeFiles[2].(map[interface{}]interface{})
-	patchText := patchEntry["content"].(string)
-	for _, expected := range []string{
-		"tlsCertFile",
-		"/etc/kubernetes/pki/kubelet.crt",
-		"tlsPrivateKeyFile",
-		"/etc/kubernetes/pki/kubelet.key",
-	} {
-		if !strings.Contains(patchText, expected) {
-			t.Fatalf("expected kubelet patch to contain %q, got: %s", expected, patchText)
-		}
-	}
 	if _, ok := actualMap["runcmd"]; ok {
 		t.Fatalf("expected kubelet serving cert cloud-config to stop relying on runcmd, got: %#v", actualMap["runcmd"])
 	}
@@ -1326,8 +1314,10 @@ runcmd:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(first), "old-uuid") {
-		t.Fatalf("expected old-uuid in first merge, got: %s", string(first))
+	// TSV content is base64-encoded in the YAML, so check for the encoded form.
+	oldUUIDEncoded := base64.StdEncoding.EncodeToString([]byte("data-1\t1\t/var/lib/data\text4\tdefaults\told-uuid\tfalse\n"))
+	if !strings.Contains(string(first), oldUUIDEncoded) {
+		t.Fatalf("expected base64-encoded old-uuid TSV in first merge, got: %s", string(first))
 	}
 
 	// Second merge: new disk config into result that already has old config.
@@ -1337,11 +1327,12 @@ runcmd:
 	}
 
 	result := string(second)
-	if strings.Contains(result, "old-uuid") {
+	if strings.Contains(result, oldUUIDEncoded) {
 		t.Fatalf("old-uuid should have been replaced, got: %s", result)
 	}
-	if !strings.Contains(result, "new-uuid") {
-		t.Fatalf("expected new-uuid in second merge, got: %s", result)
+	newUUIDEncoded := base64.StdEncoding.EncodeToString([]byte("data-1\t1\t/var/lib/data\text4\tdefaults\tnew-uuid\tfalse\n"))
+	if !strings.Contains(result, newUUIDEncoded) {
+		t.Fatalf("expected base64-encoded new-uuid TSV in second merge, got: %s", result)
 	}
 	// Each file path should appear exactly once.
 	if strings.Count(result, "/etc/capv/persistent-disks.tsv") != 1 {

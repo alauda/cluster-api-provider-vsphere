@@ -124,6 +124,13 @@ type PersistentDisk struct {
 	// +optional
 	FSFormat string `json:"fsFormat,omitempty"`
 
+	// WipeFilesystem controls whether to wipe the filesystem content when the
+	// slot is reused by a new VM. When true, the disk content is cleared on
+	// the first boot of a new VM (reboots and manual service restarts are not
+	// affected). Defaults to false (data is preserved across VM recreations).
+	// +optional
+	WipeFilesystem *bool `json:"wipeFilesystem,omitempty"`
+
 	// VolumePath is backfilled by the controller after the disk is created.
 	// For vSphere, this is usually the datastore path to the .vmdk file.
 	// +optional

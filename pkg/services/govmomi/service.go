@@ -818,8 +818,12 @@ func hasKubeletServingCertUserData(userData string) bool {
 	if userData == "" {
 		return false
 	}
-	return strings.Contains(userData, "/etc/kubernetes/pki/kubelet.crt") &&
-		strings.Contains(userData, "/etc/kubernetes/pki/kubelet.key")
+	// Check for the actual cert file write_files entries (base64-encoded PEM
+	// content), not just path references that may appear in kubelet patches.
+	// The real entries use "path: /etc/kubernetes/pki/kubelet.crt" as a YAML
+	// key inside a write_files list item alongside "encoding: b64".
+	return strings.Contains(userData, "path: /etc/kubernetes/pki/kubelet.crt") &&
+		strings.Contains(userData, "path: /etc/kubernetes/pki/kubelet.key")
 }
 
 func (vms *VMService) getNetworkStatus(ctx context.Context, virtualMachineCtx *virtualMachineContext) ([]infrav1.NetworkStatus, error) {

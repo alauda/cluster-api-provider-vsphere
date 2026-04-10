@@ -107,8 +107,18 @@ type PersistentDisk struct {
     MountOptions []string `json:"mountOptions,omitempty"`
 
     // FSFormat is the filesystem format (default "ext4").
+    // If MountPath is empty, FSFormat is ignored and no formatting is performed.
     // +optional
     FSFormat string `json:"fsFormat,omitempty"`
+
+    // WipeFilesystem controls whether to wipe the filesystem content when the
+    // slot is reused by a new VM. When true, the disk content is cleared on
+    // the first boot of a new VM (reboots and manual service restarts are not
+    // affected). Defaults to false (data is preserved across VM recreations).
+    // This is useful for disks like etcd where stale data from a previous VM
+    // would block kubeadm join.
+    // +optional
+    WipeFilesystem *bool `json:"wipeFilesystem,omitempty"`
     
     // VolumePath is backfilled by the controller after the disk is created.
     // For vSphere, this is usually the datastore path to the .vmdk file.
@@ -310,6 +320,9 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
     - Persistent-disk cloud-config includes `write_files` (e.g., `/etc/capv/persistent-disks.tsv`), helper scripts, systemd services, and related `disk_setup`/`fs_setup`/`mounts` directives.
     - Kubelet serving certificate cloud-config generates `kubelet.crt`/`kubelet.key` using the cluster CA, with SANs derived from the machine's network addresses.
     - This is how disk formatting, mount configuration, and certificate setup are delivered to the guest OS via cloud-init for the current implementation.
+- **Persistent disk mount behavior**:
+    - If `MountPath` is set: the reconcile script formats the disk (if no filesystem detected) and mounts it. If `WipeFilesystem` is true, the script wipes the directory content on the first boot of a new VM (detected via a marker file on the system disk at `/var/lib/capv/disk-initialized-<name>`). The marker survives reboots and manual service restarts but is absent on a freshly cloned VM, ensuring cleanup only happens once per VM lifecycle.
+    - If `MountPath` is empty: the disk is attached and a symlink is created at `/dev/disk/by-capv/<name>`, but no formatting or mounting is performed. This supports raw disk use cases where an external process manages the disk at runtime. On rolling updates, the same VMDK is re-attached and the symlink is recreated.
 - **Persistent disk provisioning**: If `VolumePath` is empty, CAPV creates a new disk and fills `VolumePath`. If not empty, CAPV attaches the existing disk.
 - **Persistent disk discovery and backfill**: After the VM is created, CAPV discovers attached disks using a three-tier matching strategy:
     1. **VolumePath**: Exact VMDK file path match (globally unique, most reliable, matches against any controller type).
@@ -326,6 +339,9 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
 - `MachineDeployment` creates `Machine-v2`.
 - `Machine-v2` requests a slot. The controller prefers `Released` slots before `Available` slots, so in a serial rolling update it will typically reuse the first released slot.
 - `Machine-v2` therefore usually reuses the released slot's IP, Hostname, and existing `PersistentDisk` via `VolumePath`, but the current implementation does not guarantee an identity-based match back to a specific previous machine instance.
+- On first boot, the guest-side reconcile script processes `WipeFilesystem` for each persistent disk:
+    - `false` (default): existing data is preserved. Suitable for disks like `/var/cpaas` and `/var/lib/containerd` where data continuity across rolling updates is desired.
+    - `true`: the script detects first boot via a marker file on the system disk (`/var/lib/capv/disk-initialized-<name>`) and wipes the disk content before use. This prevents stale data from blocking guest-side initialization (e.g., kubeadm requires `/var/lib/etcd` to be empty when joining as a new etcd member).
 - If the owner `VSphereMachine` object is already gone by the time the `VSphereVM` delete path runs, CAPV locates the pool by scanning all `VSphereResourcePool` objects in the namespace and matching the `MachineRef` in slot status entries. This allows CAPV to safely release the slot even without a direct pool reference from the deleted machine.
 - **Orphan detection**: The `VSphereResourcePool` controller periodically checks slots in `InUse` state. If a slot's `MachineRef` points to a `VSphereMachine` that no longer exists, the controller automatically transitions the slot to `Released`.
 - During later `VSphereVM` reconciles, if the slot cannot be resolved from the current status binding, CAPV can fall back to the `resource-slot-hostname` annotation and reload the slot definition from `VSphereResourcePool.spec.resources`.
