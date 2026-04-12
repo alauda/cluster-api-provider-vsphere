@@ -111,7 +111,12 @@ spec:
                       type: string
                     hostname:
                       description: Hostname is the unique identifier for this slot
-                        and will be assigned to the VM.
+                        and will be assigned to the VM. It must also be a valid
+                        Kubernetes node name because CAPV uses it for kubeadm nodeRegistration.name
+                        and the kubelet serving certificate DNS SAN.
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                       type: string
                     network:
                       description: Network configurations.

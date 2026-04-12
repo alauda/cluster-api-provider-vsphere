@@ -50,6 +50,8 @@ type VSphereResourcePoolSpec struct {
 
 type ResourceSlot struct {
     // Hostname is the unique identifier for this slot and will be assigned to the VM.
+    // It must also be a valid Kubernetes node name because CAPV uses it for
+    // kubeadm nodeRegistration.name and the kubelet serving certificate DNS SAN.
     Hostname string `json:"hostname"`
 
     // Datacenter is the vSphere datacenter for this slot.
@@ -57,11 +59,19 @@ type ResourceSlot struct {
     // If unset, the pool-level Datacenter acts as the default.
     Datacenter string `json:"datacenter,omitempty"`
     
-    // Network configurations.
-    Network []NetworkConfig `json:"network,omitempty"`
+    // Network describes the primary and additional network configurations for this slot.
+    Network *ResourceSlotNetwork `json:"network,omitempty"`
     
     // PersistentDisks that survive VM deletion.
     PersistentDisks []PersistentDisk `json:"persistentDisks,omitempty"`
+}
+
+type ResourceSlotNetwork struct {
+    // Primary is the network configuration used for kubelet node IP registration.
+    Primary NetworkConfig `json:"primary"`
+
+    // Additional are the remaining network configurations attached after the primary device.
+    Additional []NetworkConfig `json:"additional,omitempty"`
 }
 
 type NetworkConfig struct {
@@ -302,11 +312,18 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
     - If template / machine datacenter is not set, CAPV resolves `Datacenter` from the selected slot first. If `slot.datacenter` is empty, CAPV falls back to `VSphereResourcePool.spec.datacenter`.
     - When template / machine datacenter is not set, CAPV backfills the final resolved datacenter onto `VSphereMachine.spec.datacenter` after slot allocation so later reconcile steps observe the explicit resolved value.
     - `Hostname` from the slot is used as the guest hostname.
+    - `Hostname` from the slot is used as the kubelet registration name.
+    - `Hostname` must satisfy the Kubernetes DNS-1123 subdomain rules because it is also used as the node name and kubelet serving certificate DNS name.
     - `PersistentDisks` from the slot are merged into `VSphereVM.spec.dataDisks`.
-    - `Network` from the slot is merged into `VSphereVM.spec.network.devices`.
+    - `Network.primary` is merged as the first device in `VSphereVM.spec.network.devices`; `Network.additional` are appended in order after it.
 - **IP precedence**:
     - If the slot provides `IP` or `IPv6`, CAPV writes the slot-provided IP, gateway, and DNS values into the VM spec before create, disables `DHCP4`/`DHCP6` accordingly, and clears `AddressesFromPools` for that NIC. This means slot-defined addressing takes precedence over CAPV IPAM and DHCP.
     - If the slot does not provide an IP, CAPV preserves the original network configuration and continues to use the existing CAPV DHCP / static IP / IPAM logic.
+- **Node registration selection**:
+    - If `slot.network` is configured, CAPV uses `slot.network.primary` as the source of truth for kubelet node IP registration.
+    - CAPV resolves the node IP from the primary device after network status/IPAM resolution and writes it into kubeadm `nodeRegistration.kubeletExtraArgs["node-ip"]`.
+    - If the primary device has not yet resolved to a usable IP (e.g. DHCP pending, guest tools not yet reporting), reconciliation continues without setting `node-ip`; the value is populated on a subsequent reconcile once the network status becomes available.
+    - If `slot.network` is not configured, CAPV falls back to the first resolved device IP.
 - **Creation gate for CAPV IPAM**:
     - If `AddressesFromPools` remains configured after slot merge, CAPV creates and waits for `IPAddressClaim` objects to be fulfilled before creating the backend VM.
     - This guarantees that CAPV-managed IP allocation completes before VM creation, while still allowing slot-defined IPs to bypass IPAM entirely.
@@ -318,7 +335,9 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
 - **User-data augmentation**:
     - CAPV merges persistent-disk cloud-config fragments and kubelet serving certificate configuration into the VM's `guestinfo.userdata` (ExtraConfig) before first power-on.
     - Persistent-disk cloud-config includes `write_files` (e.g., `/etc/capv/persistent-disks.tsv`), helper scripts, systemd services, and related `disk_setup`/`fs_setup`/`mounts` directives.
-    - Kubelet serving certificate cloud-config generates `kubelet.crt`/`kubelet.key` using the cluster CA, with SANs derived from the machine's network addresses.
+    - CAPV updates kubeadm bootstrap `write_files` so `nodeRegistration.name` uses `hostname`.
+    - CAPV updates kubeadm bootstrap `write_files` so `nodeRegistration.kubeletExtraArgs["node-ip"]` uses the resolved primary IP.
+    - Kubelet serving certificate cloud-config generates `kubelet.crt`/`kubelet.key` using the cluster CA, with SANs derived from the machine's network addresses and the DNS name set to the final kubelet node name.
     - This is how disk formatting, mount configuration, and certificate setup are delivered to the guest OS via cloud-init for the current implementation.
 - **Persistent disk mount behavior**:
     - If `MountPath` is set: the reconcile script formats the disk (if no filesystem detected) and mounts it. If `WipeFilesystem` is true, the script wipes the directory content on the first boot of a new VM (detected via a marker file on the system disk at `/var/lib/capv/disk-initialized-<name>`). The marker survives reboots and manual service restarts but is absent on a freshly cloned VM, ensuring cleanup only happens once per VM lifecycle.
@@ -444,7 +463,7 @@ The original fields in `proposal.go` are largely sufficient but require vSphere-
 - `VolumeUrn` -> Replaced with `VolumePath` and `DiskUUID` to align with vSphere's file-based storage and identification.
 - `SequenceNum` -> Renamed to `UnitNumber` to align with vSphere SCSI controller terminology, which is critical for consistent disk ordering.
 - `DVSwitchName/PortGroupName` -> Unified into `NetworkName`, which is the standard CAPV field for both standard and distributed portgroups.
-- `AdditionNic` -> Integrated into `ResourceSlot.Network` as a list of `NetworkConfig`.
+- `AdditionNic` -> Integrated into `ResourceSlot.Network.additional`, with `ResourceSlot.Network.primary` representing the kubelet registration NIC.
 
 ## MachineDeployment Configuration
 To achieve the desired behavior, the `MachineDeployment` must be configured with:
@@ -480,6 +499,14 @@ strategy:
     - A slot is eligible only if its resolved datacenter matches the template / machine datacenter when one is specified, and is also allowed by the resolved failure-domain datacenter set when one is specified.
     - If template and failure domain do not specify a datacenter, the selected slot's resolved datacenter becomes the authoritative datacenter for the machine and VM.
     - When slot selection supplies the datacenter, CAPV backfills that resolved value onto `VSphereMachine.spec.datacenter`.
+- **Slot Network Model**:
+    - `ResourceSlot.network` is a structured object, not a flat NIC array.
+    - `ResourceSlot.network.primary` is the kubelet registration NIC and is merged as the first `VSphereVM.spec.network.devices` entry.
+    - `ResourceSlot.network.additional` are merged after the primary device in declared order.
+    - When `ResourceSlot.network` is present, `primary.networkName` is required.
+- **Hostname**:
+    - `ResourceSlot.hostname` is the guest OS hostname, the stable slot identifier, the kubeadm node registration name, and the kubelet serving certificate DNS name.
+    - `ResourceSlot.hostname` must be a valid Kubernetes DNS-1123 subdomain. Values with uppercase letters, underscores, or other node-name-invalid characters must be rejected by the API before machine creation.
 - **Consumer Binding**:
     - `VSphereResourcePool.spec.consumerRef` is a logical binding, not a Kubernetes owner relationship.
     - CAPV must not add `ownerReferences` from the pool to the referenced `KubeadmControlPlane` or `MachineDeployment`.

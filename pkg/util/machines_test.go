@@ -1176,6 +1176,129 @@ func Test_GetKubeletServingCertCloudConfig(t *testing.T) {
 	}
 }
 
+func Test_GetPrimaryNodeIPAddress_UsesGuestReportedIPs(t *testing.T) {
+	vm := infrav1.VSphereVM{
+		Spec: infrav1.VSphereVMSpec{
+			VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+				Network: infrav1.NetworkSpec{
+					Devices: []infrav1.NetworkDeviceSpec{
+						{NetworkName: "mgmt", DHCP4: true},
+						{NetworkName: "workload", DHCP4: true},
+					},
+				},
+			},
+		},
+	}
+	slot := &infrav1.ResourceSlot{
+		Hostname: "slot-1",
+		Network: &infrav1.ResourceSlotNetwork{
+			Primary: infrav1.NetworkConfig{NetworkName: "mgmt"},
+			Additional: []infrav1.NetworkConfig{
+				{NetworkName: "workload"},
+			},
+		},
+	}
+
+	ip, err := util.GetPrimaryNodeIPAddress(vm, slot, nil,
+		infrav1.NetworkStatus{MACAddr: "00:50:56:aa:bb:01", IPAddrs: []string{"192.168.10.20/24"}},
+		infrav1.NetworkStatus{MACAddr: "00:50:56:aa:bb:02", IPAddrs: []string{"172.16.10.20/24"}},
+	)
+	if err != nil {
+		t.Fatalf("expected guest-reported primary IP to resolve, got error: %v", err)
+	}
+	if ip != "192.168.10.20" {
+		t.Fatalf("expected primary guest-reported IP 192.168.10.20, got %q", ip)
+	}
+}
+
+func Test_GetMachineMetadata_DoesNotRenderGuestReportedIPsAsStaticAddresses(t *testing.T) {
+	vm := infrav1.VSphereVM{
+		Spec: infrav1.VSphereVMSpec{
+			VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+				Network: infrav1.NetworkSpec{
+					Devices: []infrav1.NetworkDeviceSpec{
+						{NetworkName: "mgmt", DHCP4: true},
+					},
+				},
+			},
+		},
+	}
+
+	actual, err := util.GetMachineMetadata("master-01", vm, nil, nil,
+		infrav1.NetworkStatus{MACAddr: "00:50:56:aa:bb:01", IPAddrs: []string{"192.168.10.20/24"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actualStr := string(actual)
+	if strings.Contains(actualStr, "192.168.10.20/24") {
+		t.Fatalf("expected guest-reported DHCP IPs to stay out of metadata addresses, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "dhcp4: true") {
+		t.Fatalf("expected DHCP metadata to be preserved, got: %s", actualStr)
+	}
+}
+
+func Test_GetKubeletServingCertCloudConfig_UsesGuestReportedIPs(t *testing.T) {
+	vm := infrav1.VSphereVM{
+		Spec: infrav1.VSphereVMSpec{
+			VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+				Network: infrav1.NetworkSpec{
+					Devices: []infrav1.NetworkDeviceSpec{
+						{NetworkName: "mgmt", DHCP4: true},
+						{NetworkName: "workload", DHCP4: true},
+					},
+				},
+			},
+		},
+	}
+
+	caCertPEM, caKeyPEM := newTestCA(t)
+	actual, err := util.GetKubeletServingCertCloudConfig("master-01", vm, nil, caCertPEM, caKeyPEM,
+		infrav1.NetworkStatus{MACAddr: "00:50:56:aa:bb:01", IPAddrs: []string{"192.168.10.20/24"}},
+		infrav1.NetworkStatus{MACAddr: "00:50:56:aa:bb:02", IPAddrs: []string{"172.16.10.20/24"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var actualObj interface{}
+	if err := yaml.Unmarshal(actual, &actualObj); err != nil {
+		t.Fatalf("failed to parse actual cloud-config: %v", err)
+	}
+	actualMap := actualObj.(map[interface{}]interface{})
+	writeFiles, ok := actualMap["write_files"].([]interface{})
+	if !ok || len(writeFiles) != 2 {
+		t.Fatalf("expected 2 write_files entries, got: %#v", actualMap["write_files"])
+	}
+
+	certEntry := writeFiles[0].(map[interface{}]interface{})
+	encodedCert := certEntry["content"].(string)
+	decodedCert, err := base64.StdEncoding.DecodeString(encodedCert)
+	if err != nil {
+		t.Fatalf("failed to decode kubelet cert: %v", err)
+	}
+	certBlock, _ := pem.Decode(decodedCert)
+	if certBlock == nil {
+		t.Fatal("expected kubelet cert PEM block")
+	}
+	kubeletCert, err := x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		t.Fatalf("failed to parse kubelet cert: %v", err)
+	}
+
+	actualIPs := []string{}
+	for _, ip := range kubeletCert.IPAddresses {
+		actualIPs = append(actualIPs, ip.String())
+	}
+	for _, expected := range []string{"192.168.10.20", "172.16.10.20"} {
+		if !strings.Contains(strings.Join(actualIPs, ","), expected) {
+			t.Fatalf("expected kubelet cert IP SANs to contain %q, got %#v", expected, actualIPs)
+		}
+	}
+}
+
 func newTestCA(t *testing.T) ([]byte, []byte) {
 	t.Helper()
 
@@ -1375,6 +1498,197 @@ runcmd:
 	}
 	if !strings.Contains(result, "/etc/capv/persistent-disks.tsv") {
 		t.Fatalf("expected disk config file to be present, got: %s", result)
+	}
+}
+
+func TestUpdateKubeadmNodeRegistration(t *testing.T) {
+	userData := []byte(`## template: jinja
+#cloud-config
+
+write_files:
+- path: /run/kubeadm/kubeadm.yaml
+  content: |
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: InitConfiguration
+    nodeRegistration:
+      name: master-01-os
+    ---
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: ClusterConfiguration
+    kubernetesVersion: v1.34.5
+- path: /run/kubeadm/kubeadm-join-config.yaml
+  content: |
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: JoinConfiguration
+    nodeRegistration:
+      name: worker-01-os
+    ---
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: ClusterConfiguration
+    kubernetesVersion: v1.34.5
+`)
+
+	actual, err := util.UpdateKubeadmNodeRegistration(userData, "master-01", "192.168.130.219")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actualStr := string(actual)
+	if !strings.Contains(actualStr, "name: master-01") {
+		t.Fatalf("expected kubeadm nodeRegistration name to be updated, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "name: node-ip") || !strings.Contains(actualStr, "value: 192.168.130.219") {
+		t.Fatalf("expected kubeadm nodeRegistration kubeletExtraArgs.node-ip to be updated, got: %s", actualStr)
+	}
+	if strings.Contains(actualStr, "name: master-01-os") || strings.Contains(actualStr, "name: worker-01-os") {
+		t.Fatalf("expected old node names to be replaced, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "kind: ClusterConfiguration") || !strings.Contains(actualStr, "kubernetesVersion: v1.34.5") {
+		t.Fatalf("expected kubeadm cluster configuration to be preserved, got: %s", actualStr)
+	}
+
+	actual, err = util.UpdateKubeadmNodeRegistration(actual, "master-01", "192.168.130.219")
+	if err != nil {
+		t.Fatalf("expected repeated init update to succeed, got: %v", err)
+	}
+}
+
+func TestUpdateKubeadmNodeRegistrationClusterConfigFirst(t *testing.T) {
+	// Reproduces the real-world scenario where ClusterConfiguration appears
+	// before InitConfiguration in the multi-document kubeadm YAML. The upstream
+	// UniversalDeserializer only decodes a single document, so without splitting
+	// the YAML first this would fail with "unknown kubeadm types".
+	userData := []byte(`## template: jinja
+#cloud-config
+
+write_files:
+- path: /run/kubeadm/kubeadm.yaml
+  content: |
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: ClusterConfiguration
+    kubernetesVersion: v1.34.5
+    ---
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: InitConfiguration
+    nodeRegistration:
+      name: master-01-os
+`)
+
+	actual, err := util.UpdateKubeadmNodeRegistration(userData, "master-01", "10.0.0.1")
+	if err != nil {
+		t.Fatalf("expected multi-doc with ClusterConfiguration first to succeed, got: %v", err)
+	}
+
+	actualStr := string(actual)
+	if !strings.Contains(actualStr, "name: master-01") {
+		t.Fatalf("expected nodeRegistration name to be updated, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "kind: ClusterConfiguration") {
+		t.Fatalf("expected ClusterConfiguration to be preserved, got: %s", actualStr)
+	}
+}
+
+func TestUpdateKubeadmNodeRegistrationJoinWithoutKubernetesVersion(t *testing.T) {
+	userData := []byte(`## template: jinja
+#cloud-config
+
+write_files:
+- path: /run/kubeadm/kubeadm-join-config.yaml
+  content: |
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: JoinConfiguration
+    discovery:
+      bootstrapToken:
+        apiServerEndpoint: 192.168.0.10:6443
+        token: abcdef.0123456789abcdef
+        caCertHashes:
+        - sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    nodeRegistration:
+      name: worker-01-os
+`)
+
+	actual, err := util.UpdateKubeadmNodeRegistration(userData, "worker-01", "192.168.130.220")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actualStr := string(actual)
+	if !strings.Contains(actualStr, "name: worker-01") {
+		t.Fatalf("expected kubeadm join nodeRegistration name to be updated, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "node-ip: 192.168.130.220") {
+		t.Fatalf("expected kubeadm join kubeletExtraArgs.node-ip to be updated, got: %s", actualStr)
+	}
+	if strings.Contains(actualStr, "worker-01-os") {
+		t.Fatalf("expected old join node name to be replaced, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "apiVersion: kubeadm.k8s.io/v1beta4") {
+		t.Fatalf("expected proper kubeadm apiVersion in output, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "kind: JoinConfiguration") {
+		t.Fatalf("expected proper kubeadm kind in output, got: %s", actualStr)
+	}
+}
+
+func TestUpdateKubeadmNodeRegistrationJoinWithV1beta3(t *testing.T) {
+	userData := []byte(`## template: jinja
+#cloud-config
+
+write_files:
+- path: /run/kubeadm/kubeadm-join-config.yaml
+  content: |
+    apiVersion: kubeadm.k8s.io/v1beta3
+    kind: JoinConfiguration
+    discovery:
+      bootstrapToken:
+        apiServerEndpoint: 192.168.0.10:6443
+        token: abcdef.0123456789abcdef
+        caCertHashes:
+        - sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    nodeRegistration:
+      name: worker-01-os
+`)
+
+	actual, err := util.UpdateKubeadmNodeRegistration(userData, "worker-01", "192.168.130.220")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actualStr := string(actual)
+	if !strings.Contains(actualStr, "name: worker-01") {
+		t.Fatalf("expected kubeadm join nodeRegistration name to be updated, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "apiVersion: kubeadm.k8s.io/v1beta3") {
+		t.Fatalf("expected proper kubeadm apiVersion v1beta3 in output, got: %s", actualStr)
+	}
+	if !strings.Contains(actualStr, "kind: JoinConfiguration") {
+		t.Fatalf("expected proper kubeadm kind in output, got: %s", actualStr)
+	}
+}
+
+func TestUpdateKubeadmNodeRegistrationJoinWithoutAPIVersion(t *testing.T) {
+	// Without a valid apiVersion, UnmarshalJoinConfiguration fails to parse the
+	// document, so UpdateKubeadmNodeRegistration should return an error.
+	userData := []byte(`## template: jinja
+#cloud-config
+
+write_files:
+- path: /run/kubeadm/kubeadm-join-config.yaml
+  content: |
+    kind: JoinConfiguration
+    discovery:
+      bootstrapToken:
+        apiServerEndpoint: 192.168.0.10:6443
+        token: abcdef.0123456789abcdef
+        caCertHashes:
+        - sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    nodeRegistration:
+      name: worker-01-os
+`)
+
+	_, err := util.UpdateKubeadmNodeRegistration(userData, "worker-01", "192.168.130.220")
+	if err == nil {
+		t.Fatal("expected error when apiVersion is missing, got nil")
 	}
 }
 

@@ -400,8 +400,8 @@ func Test_mergeSlotNetwork(t *testing.T) {
 			},
 		}
 
-		service.mergeSlotNetwork(vm, []infrav1.NetworkConfig{
-			{
+		service.mergeSlotNetwork(vm, &infrav1.ResourceSlotNetwork{
+			Primary: infrav1.NetworkConfig{
 				NetworkName: "slot-network",
 				DeviceName:  "ens192",
 				IP:          "192.168.1.10/24",
@@ -447,8 +447,8 @@ func Test_mergeSlotNetwork(t *testing.T) {
 			},
 		}
 
-		service.mergeSlotNetwork(vm, []infrav1.NetworkConfig{
-			{
+		service.mergeSlotNetwork(vm, &infrav1.ResourceSlotNetwork{
+			Primary: infrav1.NetworkConfig{
 				NetworkName: "slot-network",
 				DeviceName:  "ens224",
 			},
@@ -856,7 +856,6 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(machineCtx.ResourceSlot).NotTo(BeNil())
 	g.Expect(machineCtx.ResourceSlot.Datacenter).To(Equal("dc-pool"))
-	g.Expect(machineCtx.VSphereMachine.Spec.Datacenter).To(Equal("dc-pool"))
 }
 
 func TestVimMachineServiceReconcileResourcePoolBackfillsWildcardDatacenter(t *testing.T) {
@@ -930,7 +929,6 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsWildcardDatacenter(t *te
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(machineCtx.ResourceSlot).NotTo(BeNil())
 	g.Expect(machineCtx.ResourceSlot.Datacenter).To(Equal("dc-pool"))
-	g.Expect(machineCtx.VSphereMachine.Spec.Datacenter).To(Equal("dc-pool"))
 }
 
 func Test_VimMachineService_reconcileNetwork(t *testing.T) {

@@ -15,12 +15,12 @@ import (
 )
 
 func TestVSphereResourcePoolValidateCreate(t *testing.T) {
-	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
 
 	t.Run("valid pool", func(t *testing.T) {
+		g := NewWithT(t)
 		pool := newPool()
 		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), pool)
@@ -28,21 +28,44 @@ func TestVSphereResourcePoolValidateCreate(t *testing.T) {
 	})
 
 	t.Run("reject missing clusterRef name", func(t *testing.T) {
+		g := NewWithT(t)
 		pool := newPool()
 		pool.Spec.ClusterRef.Name = ""
 		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), pool)
 		g.Expect(err).To(HaveOccurred())
 	})
+
+	t.Run("reject network without primary networkName", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool()
+		pool.Spec.Resources[0].Network = &infrav1.ResourceSlotNetwork{
+			Primary: infrav1.NetworkConfig{},
+		}
+		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		_, err := webhook.ValidateCreate(context.Background(), pool)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("primary"))
+	})
+
+	t.Run("reject invalid hostname for kubernetes node name", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool()
+		pool.Spec.Resources[0].Hostname = "Node_01"
+		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		_, err := webhook.ValidateCreate(context.Background(), pool)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.resources[0].hostname"))
+	})
 }
 
 func TestVSphereResourcePoolValidateUpdate(t *testing.T) {
-	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
 
 	t.Run("rejects changing clusterRef while consumerRef is set", func(t *testing.T) {
+		g := NewWithT(t)
 		oldPool := newPool()
 		oldPool.Status.ConsumerRef = &corev1.ObjectReference{
 			Kind: "KubeadmControlPlane", Name: "cp-1",
@@ -56,6 +79,7 @@ func TestVSphereResourcePoolValidateUpdate(t *testing.T) {
 	})
 
 	t.Run("allows changing clusterRef when consumerRef is nil", func(t *testing.T) {
+		g := NewWithT(t)
 		oldPool := newPool()
 		newPool := oldPool.DeepCopy()
 		newPool.Spec.ClusterRef.Name = "other-cluster"

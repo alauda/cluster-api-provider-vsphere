@@ -64,6 +64,11 @@ const (
 // VMService provdes API to interact with the VMs using govmomi.
 type VMService struct{}
 
+type nodeIdentity struct {
+	Hostname string
+	NodeIP   string
+}
+
 // ReconcileVM makes sure that the VM is in the desired state by:
 //  1. Creating the VM if it does not exist, then...
 //  2. Updating the VM with the bootstrap data, such as the cloud-init meta and user data, before...
@@ -403,12 +408,12 @@ func (vms *VMService) reconcileMetadata(ctx context.Context, virtualMachineCtx *
 		persistentDisks = virtualMachineCtx.ResourceSlot.PersistentDisks
 	}
 
-	hostname := virtualMachineCtx.VSphereVM.Name
-	if virtualMachineCtx.ResourceSlot != nil {
-		hostname = virtualMachineCtx.ResourceSlot.Hostname
+	identity, err := resolveNodeIdentity(virtualMachineCtx)
+	if err != nil {
+		return false, err
 	}
 
-	newMetadata, err := util.GetMachineMetadata(hostname, *virtualMachineCtx.VSphereVM, virtualMachineCtx.IPAMState, persistentDisks, virtualMachineCtx.State.Network...)
+	newMetadata, err := util.GetMachineMetadata(identity.Hostname, *virtualMachineCtx.VSphereVM, virtualMachineCtx.IPAMState, persistentDisks, virtualMachineCtx.State.Network...)
 	if err != nil {
 		return false, err
 	}
@@ -772,6 +777,15 @@ func (vms *VMService) reconcileBootstrapUserData(ctx context.Context, virtualMac
 		mergedUserData = []byte(existingUserData)
 	}
 
+	identity, err := resolveNodeIdentity(virtualMachineCtx)
+	if err != nil {
+		return false, err
+	}
+	mergedUserData, err = util.UpdateKubeadmNodeRegistration(mergedUserData, identity.Hostname, identity.NodeIP)
+	if err != nil {
+		return false, err
+	}
+
 	if virtualMachineCtx.ResourceSlot != nil && len(virtualMachineCtx.ResourceSlot.PersistentDisks) > 0 {
 		diskConfig, err := util.GetPersistentDiskCloudConfig(virtualMachineCtx.ResourceSlot.PersistentDisks)
 		if err != nil {
@@ -916,9 +930,9 @@ func (vms *VMService) buildKubeletServingCertCloudConfig(ctx context.Context, vi
 		return nil, errors.Errorf("cluster CA secret %s/%s is missing tls.key", caSecretKey.Namespace, caSecretKey.Name)
 	}
 
-	hostname := virtualMachineCtx.VSphereVM.Name
-	if virtualMachineCtx.ResourceSlot != nil && virtualMachineCtx.ResourceSlot.Hostname != "" {
-		hostname = virtualMachineCtx.ResourceSlot.Hostname
+	identity, err := resolveNodeIdentity(virtualMachineCtx)
+	if err != nil {
+		return nil, err
 	}
 
 	bootstrapSecret, err := vms.getBootstrapSecret(ctx, &virtualMachineCtx.VMContext)
@@ -934,9 +948,10 @@ func (vms *VMService) buildKubeletServingCertCloudConfig(ctx context.Context, vi
 
 	kubeletCertPEM := bootstrapSecret.Data[bootstrapSecretKubeletServingCertKey]
 	kubeletKeyPEM := bootstrapSecret.Data[bootstrapSecretKubeletServingKeyKey]
-	if len(kubeletCertPEM) == 0 || len(kubeletKeyPEM) == 0 {
+	expectedIPs := util.GetKubeletServingCertIPs(*virtualMachineCtx.VSphereVM, virtualMachineCtx.IPAMState, virtualMachineCtx.State.Network...)
+	if len(kubeletCertPEM) == 0 || len(kubeletKeyPEM) == 0 || !certMatchesNodeIdentity(kubeletCertPEM, identity.Hostname, expectedIPs) {
 		kubeletCertPEM, kubeletKeyPEM, err = util.NewKubeletServingCertData(
-			hostname,
+			identity.Hostname,
 			*virtualMachineCtx.VSphereVM,
 			virtualMachineCtx.IPAMState,
 			caCert,
@@ -957,6 +972,75 @@ func (vms *VMService) buildKubeletServingCertCloudConfig(ctx context.Context, vi
 	}
 
 	return util.GetKubeletServingCertCloudConfigFromPEM(kubeletCertPEM, kubeletKeyPEM)
+}
+
+func resolveNodeIdentity(virtualMachineCtx *virtualMachineContext) (*nodeIdentity, error) {
+	if virtualMachineCtx == nil || virtualMachineCtx.VSphereVM == nil {
+		return &nodeIdentity{}, nil
+	}
+
+	identity := &nodeIdentity{
+		Hostname: virtualMachineCtx.VSphereVM.Name,
+	}
+	if virtualMachineCtx.ResourceSlot != nil {
+		if virtualMachineCtx.ResourceSlot.Hostname != "" {
+			identity.Hostname = virtualMachineCtx.ResourceSlot.Hostname
+		}
+		var networkStatuses []infrav1.NetworkStatus
+		if virtualMachineCtx.State != nil {
+			networkStatuses = virtualMachineCtx.State.Network
+		}
+		nodeIP, err := util.GetPrimaryNodeIPAddress(
+			*virtualMachineCtx.VSphereVM,
+			virtualMachineCtx.ResourceSlot,
+			virtualMachineCtx.IPAMState,
+			networkStatuses...,
+		)
+		if err != nil {
+			switch errors.Cause(err) {
+			case util.ErrNoMachineIPAddr, util.ErrPrimaryMachineIPAddr:
+				return identity, nil
+			default:
+				return nil, err
+			}
+		}
+		identity.NodeIP = nodeIP
+	}
+
+	return identity, nil
+}
+
+func certMatchesNodeIdentity(certPEM []byte, dnsName string, expectedIPs []string) bool {
+	if len(certPEM) == 0 || dnsName == "" {
+		return false
+	}
+	cert, err := util.ParseCertificatePEM(certPEM)
+	if err != nil {
+		return false
+	}
+	hasDNSName := false
+	for _, existingDNSName := range cert.DNSNames {
+		if existingDNSName == dnsName {
+			hasDNSName = true
+			break
+		}
+	}
+	if !hasDNSName {
+		return false
+	}
+	existingIPs := map[string]struct{}{}
+	for _, ip := range cert.IPAddresses {
+		existingIPs[ip.String()] = struct{}{}
+	}
+	if len(expectedIPs) != len(existingIPs) {
+		return false
+	}
+	for _, expectedIP := range expectedIPs {
+		if _, ok := existingIPs[expectedIP]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (vms *VMService) reconcileVMGroupInfo(ctx context.Context, virtualMachineCtx *virtualMachineContext) (bool, error) {

@@ -692,10 +692,13 @@ func (v *VimMachineService) persistResourcePoolChanges(ctx context.Context, vimM
 	return errors.New("transient conflict while persisting resource pool changes, exhausted retries")
 }
 
-func (v *VimMachineService) mergeSlotNetwork(vm *infrav1.VSphereVM, slotNetworks []infrav1.NetworkConfig) {
-	if len(slotNetworks) == 0 {
+func (v *VimMachineService) mergeSlotNetwork(vm *infrav1.VSphereVM, slotNetwork *infrav1.ResourceSlotNetwork) {
+	if slotNetwork == nil {
 		return
 	}
+	slotNetworks := make([]infrav1.NetworkConfig, 0, 1+len(slotNetwork.Additional))
+	slotNetworks = append(slotNetworks, slotNetwork.Primary)
+	slotNetworks = append(slotNetworks, slotNetwork.Additional...)
 	// Use slot networks to override or append to vm devices
 	newDevices := make([]infrav1.NetworkDeviceSpec, 0, max(len(vm.Spec.Network.Devices), len(slotNetworks)))
 	for i := 0; i < len(slotNetworks) || i < len(vm.Spec.Network.Devices); i++ {

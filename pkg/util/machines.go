@@ -17,6 +17,7 @@ limitations under the License.
 package util
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto"
@@ -27,6 +28,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"regexp"
@@ -34,13 +36,17 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	apitypes "k8s.io/apimachinery/pkg/types"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1beta1"
+	kubeadmtypes "sigs.k8s.io/cluster-api/bootstrap/kubeadm/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
@@ -66,6 +72,24 @@ func GetVSphereMachine(
 // ErrNoMachineIPAddr indicates that no valid IP addresses were found in a machine context.
 var ErrNoMachineIPAddr = errors.New("no IP addresses found for machine")
 
+// ErrPrimaryMachineIPAddr indicates that a configured primary slot network did
+// not resolve to a usable IP address.
+var ErrPrimaryMachineIPAddr = errors.New("no IP addresses found for primary slot network")
+
+var (
+	kubernetesVersionRe = regexp.MustCompile(`(?m)^\s*kubernetesVersion:\s*("?[^"\n]+"?)\s*$`)
+	kubeadmAPIVersionRe = regexp.MustCompile(`(?m)^\s*apiVersion:\s*kubeadm\.k8s\.io/(v1beta\d+)\s*$`)
+
+	// kubeadmAPIVersionMinKubeVersion maps kubeadm API version suffixes to the
+	// minimum Kubernetes version that introduced each API version. These are the
+	// boundary values used by kubeadmtypes.KubeVersionToKubeadmAPIGroupVersion
+	// and MUST be kept in sync — see TestKubeadmAPIVersionMinKubeVersionMapping.
+	kubeadmAPIVersionMinKubeVersion = map[string]semver.Version{
+		"v1beta4": semver.MustParse("1.31.0"),
+		"v1beta3": semver.MustParse("1.22.0"),
+	}
+)
+
 // GetMachinePreferredIPAddress returns the preferred IP address for a
 // VSphereMachine resource.
 func GetMachinePreferredIPAddress(machine *infrav1.VSphereMachine) (string, error) {
@@ -86,6 +110,33 @@ func GetMachinePreferredIPAddress(machine *infrav1.VSphereMachine) (string, erro
 		}
 		if cidr.Contains(net.ParseIP(machineAddr.Address)) {
 			return machineAddr.Address, nil
+		}
+	}
+
+	return "", ErrNoMachineIPAddr
+}
+
+// GetPrimaryNodeIPAddress returns the kubelet node IP for the given VM and slot.
+// When a slot network is configured, the primary device must resolve to an IP.
+// Otherwise, the first resolved device IP is used.
+func GetPrimaryNodeIPAddress(vsphereVM infrav1.VSphereVM, slot *infrav1.ResourceSlot, ipamState map[string]infrav1.NetworkDeviceSpec, networkStatuses ...infrav1.NetworkStatus) (string, error) {
+	devices := observedNetworkDevices(vsphereVM, ipamState, networkStatuses...)
+
+	if slot != nil && slot.Network != nil {
+		if len(devices) == 0 {
+			return "", errors.Wrapf(ErrPrimaryMachineIPAddr, "primary slot network %q has no resolved device", slot.Network.Primary.NetworkName)
+		}
+		// devices[0] is the primary network — mergeSlotNetwork always places
+		// slot.Network.Primary at index 0 followed by Additional entries.
+		if ip := firstUsableDeviceIP(devices[0].IPAddrs); ip != "" {
+			return ip, nil
+		}
+		return "", errors.Wrapf(ErrPrimaryMachineIPAddr, "primary slot network %q has no usable IP addresses", slot.Network.Primary.NetworkName)
+	}
+
+	for i := range devices {
+		if ip := firstUsableDeviceIP(devices[i].IPAddrs); ip != "" {
+			return ip, nil
 		}
 	}
 
@@ -172,9 +223,13 @@ func GetKubeletServingCertCloudConfig(hostname string, vsphereVM infrav1.VSphere
 	return GetKubeletServingCertCloudConfigFromPEM(kubeletCertPEM, kubeletKeyPEM)
 }
 
+func GetKubeletServingCertIPs(vsphereVM infrav1.VSphereVM, ipamState map[string]infrav1.NetworkDeviceSpec, networkStatuses ...infrav1.NetworkStatus) []string {
+	devices := observedNetworkDevices(vsphereVM, ipamState, networkStatuses...)
+	return uniqueIPv4SANs(devices)
+}
+
 func NewKubeletServingCertData(hostname string, vsphereVM infrav1.VSphereVM, ipamState map[string]infrav1.NetworkDeviceSpec, caCertPEM, caKeyPEM []byte, networkStatuses ...infrav1.NetworkStatus) ([]byte, []byte, error) {
-	devices := effectiveNetworkDevices(vsphereVM, ipamState, networkStatuses...)
-	sans := uniqueIPv4SANs(devices)
+	sans := GetKubeletServingCertIPs(vsphereVM, ipamState, networkStatuses...)
 	if hostname == "" || len(sans) == 0 {
 		return nil, nil, nil
 	}
@@ -212,8 +267,288 @@ func GetKubeletServingCertCloudConfigFromPEM(kubeletCertPEM, kubeletKeyPEM []byt
 	return yaml.Marshal(config)
 }
 
+// UpdateKubeadmNodeRegistration updates kubeadm init/join configs embedded in
+// cloud-config write_files so kubelet bootstrap identity uses the requested node name
+// and node IP.
+func UpdateKubeadmNodeRegistration(userData []byte, nodeName, nodeIP string) ([]byte, error) {
+	if len(userData) == 0 || nodeName == "" {
+		return userData, nil
+	}
+
+	lines := strings.Split(string(userData), "\n")
+	header := make([]string, 0, 2)
+	bodyStart := 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if len(header) == 0 && trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "## template:") || trimmed == "#cloud-config" {
+			header = append(header, line)
+			bodyStart = i + 1
+			continue
+		}
+		break
+	}
+
+	body := strings.Join(lines[bodyStart:], "\n")
+	config := map[interface{}]interface{}{}
+	if err := yaml.Unmarshal([]byte(body), &config); err != nil {
+		return nil, errors.Wrap(err, "failed to parse bootstrap cloud-config")
+	}
+
+	writeFiles, ok := config["write_files"].([]interface{})
+	if !ok || len(writeFiles) == 0 {
+		return userData, nil
+	}
+
+	updated := false
+	for i := range writeFiles {
+		entry, ok := writeFiles[i].(map[interface{}]interface{})
+		if !ok {
+			continue
+		}
+		path, _ := entry["path"].(string)
+		switch path {
+		case "/run/kubeadm/kubeadm.yaml":
+			content, err := decodeCloudConfigWriteFileContent(entry)
+			if err != nil {
+				return nil, err
+			}
+			newContent, err := updateInitConfigurationNodeRegistration(content, nodeName, nodeIP)
+			if err != nil {
+				return nil, err
+			}
+			encodeCloudConfigWriteFileContent(entry, newContent)
+			updated = true
+		case "/run/kubeadm/kubeadm-join-config.yaml":
+			content, err := decodeCloudConfigWriteFileContent(entry)
+			if err != nil {
+				return nil, err
+			}
+			newContent, err := updateJoinConfigurationNodeRegistration(content, nodeName, nodeIP)
+			if err != nil {
+				return nil, err
+			}
+			encodeCloudConfigWriteFileContent(entry, newContent)
+			updated = true
+		}
+	}
+
+	if !updated {
+		return userData, nil
+	}
+
+	outBody, err := yaml.Marshal(config)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to marshal bootstrap cloud-config")
+	}
+
+	var out strings.Builder
+	if len(header) > 0 {
+		out.WriteString(strings.Join(header, "\n"))
+		out.WriteString("\n\n")
+	}
+	out.Write(outBody)
+	return []byte(out.String()), nil
+}
+
+func decodeCloudConfigWriteFileContent(entry map[interface{}]interface{}) (string, error) {
+	content, _ := entry["content"].(string)
+	encoding, _ := entry["encoding"].(string)
+	if strings.EqualFold(encoding, "b64") || strings.EqualFold(encoding, "base64") {
+		decoded, err := base64.StdEncoding.DecodeString(content)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to decode cloud-config write_files content")
+		}
+		return string(decoded), nil
+	}
+	return content, nil
+}
+
+func encodeCloudConfigWriteFileContent(entry map[interface{}]interface{}, content string) {
+	encoding, _ := entry["encoding"].(string)
+	if strings.EqualFold(encoding, "b64") || strings.EqualFold(encoding, "base64") {
+		entry["content"] = base64.StdEncoding.EncodeToString([]byte(content))
+		return
+	}
+	entry["content"] = content
+}
+
+func updateInitConfigurationNodeRegistration(content, nodeName, nodeIP string) (string, error) {
+	clusterConfiguration := &bootstrapv1.ClusterConfiguration{}
+	// The upstream UnmarshalInitConfiguration uses UniversalDeserializer which
+	// only decodes a single YAML document. Real kubeadm configs are multi-doc
+	// (ClusterConfiguration + InitConfiguration), so we must split and try each
+	// document individually.
+	docs, err := splitYAMLDocuments(content)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to split kubeadm init configuration documents")
+	}
+	var initConfiguration *bootstrapv1.InitConfiguration
+	for _, doc := range docs {
+		init, unmarshalErr := kubeadmtypes.UnmarshalInitConfiguration(doc, clusterConfiguration)
+		if unmarshalErr == nil {
+			initConfiguration = init
+			break
+		}
+	}
+	if initConfiguration == nil {
+		return "", errors.New("failed to parse kubeadm init configuration: InitConfiguration not found")
+	}
+	initConfiguration.NodeRegistration.Name = nodeName
+	if initConfiguration.NodeRegistration.KubeletExtraArgs == nil {
+		initConfiguration.NodeRegistration.KubeletExtraArgs = map[string]string{}
+	}
+	if nodeIP != "" {
+		initConfiguration.NodeRegistration.KubeletExtraArgs["node-ip"] = nodeIP
+	}
+	versionString := clusterConfiguration.KubernetesVersion
+	if versionString == "" {
+		versionString = extractKubernetesVersion(content)
+	}
+	if versionString == "" {
+		versionString = kubeadmAPIVersionToKubernetesVersion(content)
+	}
+	if versionString == "" {
+		return "", errors.New("failed to determine kubernetesVersion from kubeadm init configuration")
+	}
+	version, err := semver.ParseTolerant(versionString)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse kubeadm init kubernetesVersion")
+	}
+	out, err := kubeadmtypes.MarshalInitConfigurationForVersion(clusterConfiguration, initConfiguration, version)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal kubeadm init configuration")
+	}
+
+	updatedContent, err := replaceYAMLDocument(content, "InitConfiguration", out)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to preserve kubeadm cluster configuration")
+	}
+	return updatedContent, nil
+}
+
+func updateJoinConfigurationNodeRegistration(content, nodeName, nodeIP string) (string, error) {
+	clusterConfiguration := &bootstrapv1.ClusterConfiguration{}
+	docs, err := splitYAMLDocuments(content)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to split kubeadm join configuration documents")
+	}
+	var joinConfiguration *bootstrapv1.JoinConfiguration
+	for _, doc := range docs {
+		join, unmarshalErr := kubeadmtypes.UnmarshalJoinConfiguration(doc, clusterConfiguration)
+		if unmarshalErr == nil {
+			joinConfiguration = join
+			break
+		}
+	}
+	if joinConfiguration == nil {
+		return "", errors.New("failed to parse kubeadm join configuration: JoinConfiguration not found")
+	}
+	joinConfiguration.NodeRegistration.Name = nodeName
+	if joinConfiguration.NodeRegistration.KubeletExtraArgs == nil {
+		joinConfiguration.NodeRegistration.KubeletExtraArgs = map[string]string{}
+	}
+	if nodeIP != "" {
+		joinConfiguration.NodeRegistration.KubeletExtraArgs["node-ip"] = nodeIP
+	}
+	versionString := clusterConfiguration.KubernetesVersion
+	if versionString == "" {
+		versionString = extractKubernetesVersion(content)
+	}
+	if versionString == "" {
+		versionString = kubeadmAPIVersionToKubernetesVersion(content)
+	}
+	if versionString == "" {
+		return "", errors.New("failed to determine kubernetesVersion from kubeadm join configuration")
+	}
+	version, err := semver.ParseTolerant(versionString)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse kubeadm join kubernetesVersion")
+	}
+	out, err := kubeadmtypes.MarshalJoinConfigurationForVersion(clusterConfiguration, joinConfiguration, version)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal kubeadm join configuration")
+	}
+	return out, nil
+}
+
+func extractKubernetesVersion(content string) string {
+	matches := kubernetesVersionRe.FindStringSubmatch(content)
+	if len(matches) < 2 {
+		return ""
+	}
+	return strings.Trim(matches[1], `"`)
+}
+
+// kubeadmAPIVersionToKubernetesVersion extracts the kubeadm apiVersion from a
+// YAML document and returns the minimum Kubernetes version that uses that API
+// version. This is used as a fallback when kubernetesVersion is not available
+// (e.g. JoinConfiguration without a ClusterConfiguration). The mapping is
+// defined in kubeadmAPIVersionMinKubeVersion and validated against the upstream
+// kubeadmtypes.KubeVersionToKubeadmAPIGroupVersion in tests.
+func kubeadmAPIVersionToKubernetesVersion(content string) string {
+	matches := kubeadmAPIVersionRe.FindStringSubmatch(content)
+	if len(matches) < 2 {
+		return ""
+	}
+	v, ok := kubeadmAPIVersionMinKubeVersion[matches[1]]
+	if !ok {
+		return ""
+	}
+	return v.String()
+}
+
+func replaceYAMLDocument(content, kind, replacement string) (string, error) {
+	docs, err := splitYAMLDocuments(content)
+	if err != nil {
+		return "", err
+	}
+
+	replaced := false
+	for i := range docs {
+		meta := struct {
+			Kind string `yaml:"kind"`
+		}{}
+		if err := yaml.Unmarshal([]byte(docs[i]), &meta); err != nil {
+			return "", errors.Wrap(err, "failed to inspect yaml document")
+		}
+		if meta.Kind == kind {
+			docs[i] = strings.TrimSpace(replacement)
+			replaced = true
+			break
+		}
+	}
+
+	if !replaced {
+		return strings.TrimSpace(replacement), nil
+	}
+	return strings.Join(docs, "\n---\n"), nil
+}
+
+func splitYAMLDocuments(content string) ([]string, error) {
+	reader := utilyaml.NewYAMLReader(bufio.NewReader(strings.NewReader(content)))
+	docs := []string{}
+	for {
+		doc, err := reader.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, errors.Wrap(err, "failed to read yaml document")
+		}
+		trimmed := strings.TrimSpace(string(doc))
+		if trimmed == "" {
+			continue
+		}
+		docs = append(docs, trimmed)
+	}
+	return docs, nil
+}
+
 func newKubeletServingCert(hostname string, sans []string, caCertPEM, caKeyPEM []byte) ([]byte, []byte, error) {
-	caCert, err := parseCertificatePEM(caCertPEM)
+	caCert, err := ParseCertificatePEM(caCertPEM)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -259,7 +594,8 @@ func newKubeletServingCert(hostname string, sans []string, caCertPEM, caKeyPEM [
 	return kubeletCertPEM, kubeletKeyPEM, nil
 }
 
-func parseCertificatePEM(certPEM []byte) (*x509.Certificate, error) {
+// ParseCertificatePEM decodes the first PEM block from certPEM and parses it as an X.509 certificate.
+func ParseCertificatePEM(certPEM []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
 		return nil, errors.New("failed to decode CA certificate PEM")
@@ -312,6 +648,31 @@ func effectiveNetworkDevices(vsphereVM infrav1.VSphereVM, ipamState map[string]i
 	}
 
 	return devices
+}
+
+func observedNetworkDevices(vsphereVM infrav1.VSphereVM, ipamState map[string]infrav1.NetworkDeviceSpec, networkStatuses ...infrav1.NetworkStatus) []infrav1.NetworkDeviceSpec {
+	devices := effectiveNetworkDevices(vsphereVM, ipamState, networkStatuses...)
+	for i := range networkStatuses {
+		devices[i].IPAddrs = append(devices[i].IPAddrs, networkStatuses[i].IPAddrs...)
+	}
+	return devices
+}
+
+func firstUsableDeviceIP(ipAddrs []string) string {
+	for _, ipAddr := range ipAddrs {
+		host := ipAddr
+		if strings.Contains(ipAddr, "/") {
+			ip, _, err := net.ParseCIDR(ipAddr)
+			if err != nil {
+				continue
+			}
+			host = ip.String()
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			return host
+		}
+	}
+	return ""
 }
 
 func uniqueIPv4SANs(devices []infrav1.NetworkDeviceSpec) []string {

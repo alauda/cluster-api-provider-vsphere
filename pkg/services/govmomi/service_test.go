@@ -247,15 +247,22 @@ func Test_buildKubeletServingCertCloudConfig(t *testing.T) {
 			VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
 				Network: infrav1.NetworkSpec{
 					Devices: []infrav1.NetworkDeviceSpec{
-						{IPAddrs: []string{"192.168.132.20/20"}},
-						{IPAddrs: []string{"192.168.164.245/24"}},
+						{DHCP4: true},
+						{DHCP4: true},
 					},
 				},
 			},
 		},
 	}
-	vmCtx.ResourceSlot = &infrav1.ResourceSlot{Hostname: "worker-01"}
-	vmCtx.State = &infrav1.VirtualMachine{}
+	vmCtx.ResourceSlot = &infrav1.ResourceSlot{
+		Hostname: "worker-01",
+	}
+	vmCtx.State = &infrav1.VirtualMachine{
+		Network: []infrav1.NetworkStatus{
+			{IPAddrs: []string{"192.168.132.20"}, NetworkName: "net-a"},
+			{IPAddrs: []string{"192.168.164.245"}, NetworkName: "net-b"},
+		},
+	}
 	vmCtx.VSphereVM.Spec.BootstrapRef = &corev1.ObjectReference{
 		Kind:      "Secret",
 		Namespace: "cpaas-system",
@@ -274,6 +281,13 @@ func Test_buildKubeletServingCertCloudConfig(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingCertKey]).NotTo(BeEmpty())
 	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingKeyKey]).NotTo(BeEmpty())
+	block, _ := pem.Decode(updatedSecret.Data[bootstrapSecretKubeletServingCertKey])
+	g.Expect(block).NotTo(BeNil())
+	cert, err := x509.ParseCertificate(block.Bytes)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(cert.DNSNames).To(ContainElement("worker-01"))
+	g.Expect(certIPStrings(cert)).To(ContainElement("192.168.132.20"))
+	g.Expect(certIPStrings(cert)).To(ContainElement("192.168.164.245"))
 
 	firstCert := append([]byte(nil), updatedSecret.Data[bootstrapSecretKubeletServingCertKey]...)
 	firstKey := append([]byte(nil), updatedSecret.Data[bootstrapSecretKubeletServingKeyKey]...)
@@ -286,6 +300,93 @@ func Test_buildKubeletServingCertCloudConfig(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingCertKey]).To(Equal(firstCert))
 	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingKeyKey]).To(Equal(firstKey))
+
+	vmCtx.State.Network = []infrav1.NetworkStatus{
+		{IPAddrs: []string{"192.168.132.21"}, NetworkName: "net-a"},
+		{IPAddrs: []string{"192.168.164.245"}, NetworkName: "net-b"},
+	}
+
+	config, err = vms.buildKubeletServingCertCloudConfig(context.Background(), vmCtx)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(config).ToNot(BeEmpty())
+
+	err = vmCtx.Client.Get(context.Background(), client.ObjectKey{Name: "bootstrap-secret", Namespace: "cpaas-system"}, updatedSecret)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingCertKey]).NotTo(Equal(firstCert))
+	g.Expect(updatedSecret.Data[bootstrapSecretKubeletServingKeyKey]).NotTo(Equal(firstKey))
+
+	block, _ = pem.Decode(updatedSecret.Data[bootstrapSecretKubeletServingCertKey])
+	g.Expect(block).NotTo(BeNil())
+	cert, err = x509.ParseCertificate(block.Bytes)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(cert.DNSNames).To(ContainElement("worker-01"))
+	g.Expect(certIPStrings(cert)).To(ContainElement("192.168.132.21"))
+	g.Expect(certIPStrings(cert)).ToNot(ContainElement("192.168.132.20"))
+}
+
+func certIPStrings(cert *x509.Certificate) []string {
+	out := make([]string, 0, len(cert.IPAddresses))
+	for _, ip := range cert.IPAddresses {
+		out = append(out, ip.String())
+	}
+	return out
+}
+
+func TestResolveNodeIdentityAllowsMissingNodeIP(t *testing.T) {
+	t.Run("slot without network resolved yet", func(t *testing.T) {
+		g := NewWithT(t)
+		vmCtx := emptyVirtualMachineContext()
+		vmCtx.VSphereVM = &infrav1.VSphereVM{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "capv-test-md-0-abcde",
+				Namespace: "cpaas-system",
+			},
+		}
+		vmCtx.ResourceSlot = &infrav1.ResourceSlot{
+			Hostname: "worker-01",
+		}
+
+		identity, err := resolveNodeIdentity(vmCtx)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(identity.Hostname).To(Equal("worker-01"))
+		g.Expect(identity.NodeIP).To(BeEmpty())
+	})
+
+	t.Run("primary slot network without usable ip yet", func(t *testing.T) {
+		g := NewWithT(t)
+		vmCtx := emptyVirtualMachineContext()
+		vmCtx.VSphereVM = &infrav1.VSphereVM{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "capv-test-md-0-abcde",
+				Namespace: "cpaas-system",
+			},
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					Network: infrav1.NetworkSpec{
+						Devices: []infrav1.NetworkDeviceSpec{
+							{NetworkName: "net-a"},
+						},
+					},
+				},
+			},
+		}
+		vmCtx.ResourceSlot = &infrav1.ResourceSlot{
+			Hostname: "worker-02",
+			Network: &infrav1.ResourceSlotNetwork{
+				Primary: infrav1.NetworkConfig{NetworkName: "net-a"},
+			},
+		}
+		vmCtx.State = &infrav1.VirtualMachine{
+			Network: []infrav1.NetworkStatus{
+				{NetworkName: "net-a"},
+			},
+		}
+
+		identity, err := resolveNodeIdentity(vmCtx)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(identity.Hostname).To(Equal("worker-02"))
+		g.Expect(identity.NodeIP).To(BeEmpty())
+	})
 }
 
 func getAuthSession(ctx context.Context, server string) (*session.Session, error) {
@@ -470,7 +571,8 @@ func TestFindPersistentDiskDevice(t *testing.T) {
 		used := map[int32]struct{}{1: {}}
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, UnitNumber: int32Ptr(0)}
 		result := findPersistentDiskDevice(pd, disks, used, scsiKeys)
-		g.Expect(result).To(BeNil(), "disk key 1 is used, unit 0 should not match")
+		g.Expect(result).NotTo(BeNil(), "disk key 1 is used, should fall back to the remaining matching disk")
+		g.Expect(result.Key).To(Equal(int32(2)))
 	})
 
 	t.Run("nil pd returns nil", func(t *testing.T) {

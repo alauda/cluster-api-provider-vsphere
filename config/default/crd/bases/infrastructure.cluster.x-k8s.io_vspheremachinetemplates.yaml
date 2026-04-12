@@ -23,7 +23,6 @@ spec:
         description: |-
           VSphereMachineTemplate is the Schema for the vspheremachinetemplates API
 
-
           Deprecated: This type will be removed in one of the next releases.
         properties:
           apiVersion:
@@ -74,16 +73,13 @@ spec:
                           and may be truncated by the length of the suffix required to make the value
                           unique on the server.
 
-
                           If this field is specified and the generated name exists, the server will
                           NOT return a 409 - instead, it will either return 201 Created or 500 with Reason
                           ServerTimeout indicating a unique name could not be found in the time allotted, and the client
                           should retry (optionally after the time indicated in the Retry-After header).
 
-
                           Applied only if Name is not specified.
                           More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#idempotency
-
 
                           Deprecated: This field has no function and is going to be removed in a next release.
                         type: string
@@ -105,7 +101,6 @@ spec:
                           Cannot be updated.
                           More info: http://kubernetes.io/docs/user-guide/identifiers#names
 
-
                           Deprecated: This field has no function and is going to be removed in a next release.
                         type: string
                       namespace:
@@ -115,11 +110,9 @@ spec:
                           Not all objects are required to be scoped to a namespace - the value of this field for
                           those objects will be empty.
 
-
                           Must be a DNS_LABEL.
                           Cannot be updated.
                           More info: http://kubernetes.io/docs/user-guide/namespaces
-
 
                           Deprecated: This field has no function and is going to be removed in a next release.
                         type: string
@@ -129,7 +122,6 @@ spec:
                           been deleted, this object will be garbage collected. If this object is managed by a controller,
                           then an entry in this list will point to this controller, with the controller field set to true.
                           There cannot be more than one managing controller.
-
 
                           Deprecated: This field has no function and is going to be removed in a next release.
                         items:
@@ -241,11 +233,8 @@ spec:
                           machine's VM.
                         properties:
                           devices:
-                            description: |-
+                            description: |
                               Devices is the list of network devices used by the virtual machine.
-
-
-                              TODO(akutz) Make sure at least one network matches the ClusterSpec.CloudProviderConfiguration.Network.Name
                             items:
                               description: |-
                                 NetworkDeviceSpec defines the network configuration for a virtual machine's
@@ -455,7 +444,6 @@ spec:
         description: |-
           VSphereMachineTemplate is the Schema for the vspheremachinetemplates API
 
-
           Deprecated: This type will be removed in one of the next releases.
         properties:
           apiVersion:
@@ -567,11 +555,8 @@ spec:
                           machine's VM.
                         properties:
                           devices:
-                            description: |-
+                            description: |
                               Devices is the list of network devices used by the virtual machine.
-
-
-                              TODO(akutz) Make sure at least one network matches the ClusterSpec.CloudProviderConfiguration.Network.Name
                             items:
                               description: |-
                                 NetworkDeviceSpec defines the network configuration for a virtual machine's
@@ -927,9 +912,7 @@ spec:
                           The VM will be powered off forcibly after the timeout if the VM is still
                           up and running when the PowerOffMode is set to trySoft.
 
-
                           This parameter only applies when the PowerOffMode is set to trySoft.
-
 
                           If omitted, the timeout defaults to 5 minutes.
                         type: string
@@ -974,11 +957,8 @@ spec:
                           machine's VM.
                         properties:
                           devices:
-                            description: |-
+                            description: |
                               Devices is the list of network devices used by the virtual machine.
-
-
-                              TODO(akutz) Make sure at least one network matches the ClusterSpec.CloudProviderConfiguration.Network.Name
                             items:
                               description: |-
                                 NetworkDeviceSpec defines the network configuration for a virtual machine's
@@ -990,7 +970,29 @@ spec:
                                     to IPAddressClaims. The machine's cloud-init metadata will be populated
                                     with IPAddresses fulfilled by an IPAM provider.
                                   items:
-                                    $ref: '#/definitions/k8s.io~1api~1core~1v1~0TypedLocalObjectReference'
+                                    description: |-
+                                      TypedLocalObjectReference contains enough information to let you locate the
+                                      typed referenced object inside the same namespace.
+                                    properties:
+                                      apiGroup:
+                                        description: |-
+                                          APIGroup is the group for the resource being referenced.
+                                          If APIGroup is not specified, the specified Kind must be in the core API group.
+                                          For any other third-party types, APIGroup is required.
+                                        type: string
+                                      kind:
+                                        description: Kind is the type of resource
+                                          being referenced
+                                        type: string
+                                      name:
+                                        description: Name is the name of resource
+                                          being referenced
+                                        type: string
+                                    required:
+                                    - kind
+                                    - name
+                                    type: object
+                                    x-kubernetes-map-type: atomic
                                   type: array
                                 deviceName:
                                   description: |-
@@ -1213,7 +1215,6 @@ spec:
                               PreferredAPIServeCIDR is the preferred CIDR for the Kubernetes API
                               server endpoint on this machine
 
-
                               Deprecated: This field is going to be removed in a future release.
                             type: string
                           routes:
@@ -1310,7 +1311,6 @@ spec:
                         description: |-
                           PowerOffMode describes the desired behavior when powering off a VM.
 
-
                           There are three, supported power off modes: hard, soft, and
                           trySoft. The first mode, hard, is the equivalent of a physical
                           system's power cord being ripped from the wall. The soft mode
@@ -1318,7 +1318,6 @@ spec:
                           gracefully shut down the VM. Its variant, trySoft, first attempts
                           a graceful shutdown, and if that fails or the VM is not in a powered off
                           state after reaching the GuestSoftPowerOffTimeout, the VM is halted.
-
 
                           If omitted, the mode defaults to hard.
                         enum:
@@ -1337,9 +1336,49 @@ spec:
                           object ID in which the virtual machine is created/located.
                         type: string
                       resourcePoolRef:
-                        $ref: '#/definitions/k8s.io~1api~1core~1v1~0ObjectReference'
                         description: ResourcePoolRef is a reference to the VSphereResourcePool
                           to use for this machine.
+                        properties:
+                          apiVersion:
+                            description: API version of the referent.
+                            type: string
+                          fieldPath:
+                            description: |-
+                              If referring to a piece of an object instead of an entire object, this string
+                              should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2].
+                              For example, if the object reference is to a container within a pod, this would take on a value like:
+                              "spec.containers{name}" (where "name" refers to the name of the container that triggered
+                              the event) or if no container name is specified "spec.containers[2]" (container with
+                              index 2 in this pod). This syntax is chosen only to have some well-defined way of
+                              referencing a part of an object.
+                            type: string
+                          kind:
+                            description: |-
+                              Kind of the referent.
+                              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                            type: string
+                          name:
+                            description: |-
+                              Name of the referent.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace of the referent.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+                            type: string
+                          resourceVersion:
+                            description: |-
+                              Specific resourceVersion to which this reference is made, if any.
+                              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency
+                            type: string
+                          uid:
+                            description: |-
+                              UID of the referent.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
                       server:
                         description: |-
                           Server is the IP address or FQDN of the vSphere server on which
