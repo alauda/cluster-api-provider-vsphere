@@ -48,9 +48,9 @@ func (c *BaseMachineContext) GetMachine() *clusterv1.Machine {
 // VIMMachineContext is a Go context used with a VSphereMachine.
 type VIMMachineContext struct {
 	*BaseMachineContext
-	VSphereCluster *infrav1.VSphereCluster
-	VSphereMachine *infrav1.VSphereMachine
-	ResourceSlot   *infrav1.ResourceSlot
+	VSphereCluster    *infrav1.VSphereCluster
+	VSphereMachine    *infrav1.VSphereMachine
+	MachineConfigSlot *infrav1.MachineConfigSlot
 }
 
 // String returns VSphereMachineGroupVersionKind VSphereMachineNamespace/VSphereMachineName.

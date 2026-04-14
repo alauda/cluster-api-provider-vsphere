@@ -24,15 +24,14 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/mo"
-	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/finalizers"
-	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,38 +49,34 @@ import (
 )
 
 const (
-	// ResourcePoolFinalizer allows the reconciler to clean up resources.
-	ResourcePoolFinalizer = "vsphereresourcepool.infrastructure.cluster.x-k8s.io"
+	// MachineConfigPoolFinalizer allows the reconciler to clean up resources.
+	MachineConfigPoolFinalizer = "vspheremachineconfigpool.infrastructure.cluster.x-k8s.io"
 
 	// DefaultReleaseDelayHours is the default time to wait before reclaiming a slot.
 	DefaultReleaseDelayHours = 24
-
-	reclaimTaskStateRunning   = "Running"
-	reclaimTaskStateFailed    = "Failed"
-	reclaimTaskStateCompleted = "Completed"
 )
 
-// AddVSphereResourcePoolControllerToManager adds a VSphereResourcePool controller to the manager.
-func AddVSphereResourcePoolControllerToManager(ctx context.Context, controllerManagerCtx *capvcontext.ControllerManagerContext, mgr manager.Manager, options controller.Options) error {
-	reconciler := resourcePoolReconciler{
+// AddVSphereMachineConfigPoolControllerToManager adds a VSphereMachineConfigPool controller to the manager.
+func AddVSphereMachineConfigPoolControllerToManager(ctx context.Context, controllerManagerCtx *capvcontext.ControllerManagerContext, mgr manager.Manager, options controller.Options) error {
+	reconciler := machineConfigPoolReconciler{
 		Client:                   controllerManagerCtx.Client,
 		ControllerManagerContext: controllerManagerCtx,
-		Recorder:                 mgr.GetEventRecorderFor("vsphereresourcepool-controller"),
+		Recorder:                 mgr.GetEventRecorderFor("vspheremachineconfigpool-controller"),
 	}
-	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "vsphereresourcepool")
+	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "vspheremachineconfigpool")
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&infrav1.VSphereResourcePool{}).
-		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(reconciler.clusterToResourcePools)).
-		Watches(&infrav1.VSphereCluster{}, handler.EnqueueRequestsFromMapFunc(reconciler.vsphereClusterToResourcePools)).
+		For(&infrav1.VSphereMachineConfigPool{}).
+		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(reconciler.clusterToMachineConfigPools)).
+		Watches(&infrav1.VSphereCluster{}, handler.EnqueueRequestsFromMapFunc(reconciler.vsphereClusterToMachineConfigPools)).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
 		Complete(reconciler)
 }
 
-// clusterToResourcePools maps a Cluster to the VSphereResourcePools that reference it.
-func (r resourcePoolReconciler) clusterToResourcePools(ctx context.Context, o client.Object) []reconcile.Request {
-	pools := &infrav1.VSphereResourcePoolList{}
+// clusterToMachineConfigPools maps a Cluster to the VSphereMachineConfigPools that reference it.
+func (r machineConfigPoolReconciler) clusterToMachineConfigPools(ctx context.Context, o client.Object) []reconcile.Request {
+	pools := &infrav1.VSphereMachineConfigPoolList{}
 	if err := r.Client.List(ctx, pools, client.InNamespace(o.GetNamespace())); err != nil {
 		return nil
 	}
@@ -96,9 +91,9 @@ func (r resourcePoolReconciler) clusterToResourcePools(ctx context.Context, o cl
 	return requests
 }
 
-// vsphereClusterToResourcePools maps a VSphereCluster to the VSphereResourcePools
+// vsphereClusterToMachineConfigPools maps a VSphereCluster to the VSphereMachineConfigPools
 // whose ClusterRef points to a Cluster that uses this VSphereCluster as infrastructure.
-func (r resourcePoolReconciler) vsphereClusterToResourcePools(ctx context.Context, o client.Object) []reconcile.Request {
+func (r machineConfigPoolReconciler) vsphereClusterToMachineConfigPools(ctx context.Context, o client.Object) []reconcile.Request {
 	// Find the Cluster that owns this VSphereCluster
 	clusters := &clusterv1.ClusterList{}
 	if err := r.Client.List(ctx, clusters, client.InNamespace(o.GetNamespace())); err != nil {
@@ -114,19 +109,19 @@ func (r resourcePoolReconciler) vsphereClusterToResourcePools(ctx context.Contex
 	if ownerClusterName == "" {
 		return nil
 	}
-	return r.clusterToResourcePools(ctx, &clusterv1.Cluster{
+	return r.clusterToMachineConfigPools(ctx, &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName, Namespace: o.GetNamespace()},
 	})
 }
 
-type resourcePoolReconciler struct {
+type machineConfigPoolReconciler struct {
 	Client                   client.Client
 	ControllerManagerContext *capvcontext.ControllerManagerContext
 	Recorder                 record.EventRecorder
 }
 
-func (r resourcePoolReconciler) Reconcile(ctx context.Context, req reconcile.Request) (_ reconcile.Result, reterr error) {
-	pool := &infrav1.VSphereResourcePool{}
+func (r machineConfigPoolReconciler) Reconcile(ctx context.Context, req reconcile.Request) (_ reconcile.Result, reterr error) {
+	pool := &infrav1.VSphereMachineConfigPool{}
 	if err := r.Client.Get(ctx, req.NamespacedName, pool); err != nil {
 		if apierrors.IsNotFound(err) {
 			return reconcile.Result{}, nil
@@ -134,19 +129,16 @@ func (r resourcePoolReconciler) Reconcile(ctx context.Context, req reconcile.Req
 		return reconcile.Result{}, err
 	}
 
-	if finalizerAdded, err := finalizers.EnsureFinalizer(ctx, r.Client, pool, ResourcePoolFinalizer); err != nil || finalizerAdded {
+	if finalizerAdded, err := finalizers.EnsureFinalizer(ctx, r.Client, pool, MachineConfigPoolFinalizer); err != nil || finalizerAdded {
 		return ctrl.Result{}, err
 	}
 
-	patchHelper, err := patch.NewHelper(pool, r.Client)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
+	before := pool.DeepCopy()
 
 	defer func() {
-		if err := patchHelper.Patch(ctx, pool); err != nil {
+		if err := r.persistPool(ctx, pool, before); err != nil {
 			if reterr == nil {
-				reterr = errors.Wrapf(err, "failed to patch VSphereResourcePool %s/%s", pool.Namespace, pool.Name)
+				reterr = errors.Wrapf(err, "failed to persist VSphereMachineConfigPool %s/%s", pool.Namespace, pool.Name)
 			}
 		}
 	}()
@@ -158,7 +150,35 @@ func (r resourcePoolReconciler) Reconcile(ctx context.Context, req reconcile.Req
 	return r.reconcileNormal(ctx, pool)
 }
 
-// vcenterParams holds the resolved vCenter connection parameters from the ClusterRef chain.
+// persistPool writes any spec/finalizer and status changes accumulated on pool
+// (relative to before) via Update and Status().Update. Conflicts are returned
+// as-is so controller-runtime reschedules reconcile against a fresh object.
+// Both writers on this CRD (this controller and vimmachine.persistMachineConfigPoolChanges)
+// use Update, so the RV optimistic lock prevents silent overwrites.
+func (r machineConfigPoolReconciler) persistPool(ctx context.Context, pool, before *infrav1.VSphereMachineConfigPool) error {
+	specDirty := !reflect.DeepEqual(pool.Spec, before.Spec) ||
+		!reflect.DeepEqual(pool.Finalizers, before.Finalizers)
+	if specDirty {
+		if err := r.Client.Update(ctx, pool); err != nil {
+			return err
+		}
+	}
+
+	// Skip status update if the object is already gone (finalizer removed above,
+	// and GC already deleted it).
+	if pool.UID == "" {
+		return nil
+	}
+
+	if !reflect.DeepEqual(pool.Status, before.Status) {
+		if err := r.Client.Status().Update(ctx, pool); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// vcenterParams holds the resolved vCenter connection parameters from the ClusterRef credential chain.
 type vcenterParams struct {
 	server     string
 	thumbprint string
@@ -169,7 +189,7 @@ type vcenterParams struct {
 // resolveVCenterParams resolves vCenter connection parameters via the ClusterRef credential chain:
 // pool.Spec.ClusterRef → Cluster (same namespace) → VSphereCluster → IdentityRef → credentials.
 // It sets ClusterRefReadyCondition and VCenterAvailableCondition on the pool.
-func (r resourcePoolReconciler) resolveVCenterParams(ctx context.Context, pool *infrav1.VSphereResourcePool) (*vcenterParams, error) {
+func (r machineConfigPoolReconciler) resolveVCenterParams(ctx context.Context, pool *infrav1.VSphereMachineConfigPool) (*vcenterParams, error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	// Step 1: Get Cluster (same namespace as pool)
@@ -182,7 +202,7 @@ func (r resourcePoolReconciler) resolveVCenterParams(ctx context.Context, pool *
 		conditions.MarkFalse(pool, infrav1.ClusterRefReadyCondition,
 			infrav1.ClusterNotFoundReason, clusterv1.ConditionSeverityWarning,
 			"Cluster %s/%s not found: %v", clusterKey.Namespace, clusterKey.Name, err)
-		return nil, errors.Wrapf(err, "failed to get Cluster %s/%s referenced by VSphereResourcePool %s/%s",
+		return nil, errors.Wrapf(err, "failed to get Cluster %s/%s referenced by VSphereMachineConfigPool %s/%s",
 			clusterKey.Namespace, clusterKey.Name, pool.Namespace, pool.Name)
 	}
 
@@ -239,7 +259,7 @@ func (r resourcePoolReconciler) resolveVCenterParams(ctx context.Context, pool *
 	return params, nil
 }
 
-func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infrav1.VSphereResourcePool) (reconcile.Result, error) {
+func (r machineConfigPoolReconciler) reconcileNormal(ctx context.Context, pool *infrav1.VSphereMachineConfigPool) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	// Resolve vCenter params via ClusterRef chain before any vCenter operations
@@ -248,34 +268,33 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	statusMap := make(map[string]infrav1.ResourceSlotStatus)
-	for _, s := range pool.Status.ResourceStatuses {
+	statusMap := make(map[string]infrav1.MachineConfigSlotStatus)
+	for _, s := range pool.Status.ConfigStatuses {
 		statusMap[s.Hostname] = s
 	}
 
-	newStatuses := []infrav1.ResourceSlotStatus{}
+	newStatuses := []infrav1.MachineConfigSlotStatus{}
 	delayHours := DefaultReleaseDelayHours
 	if pool.Spec.ReleaseDelayHours != nil {
 		delayHours = *pool.Spec.ReleaseDelayHours
 	}
 
 	requeueAfter := time.Duration(0)
-	specChanged := false
 
 	r.reconcileConsumerBinding(ctx, pool)
 
-	for i := range pool.Spec.Resources {
-		slot := &pool.Spec.Resources[i]
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
 		status, ok := statusMap[slot.Hostname]
 		if !ok {
-			status = infrav1.ResourceSlotStatus{
+			status = infrav1.MachineConfigSlotStatus{
 				Hostname: slot.Hostname,
-				State:    "Available",
+				State:    infrav1.MachineConfigSlotStateAvailable,
 			}
 		}
 
 		// 1. Reclamation Check (Released -> Available)
-		if status.State == "Released" && status.LastReleasedTime != nil {
+		if status.State == infrav1.MachineConfigSlotStateReleased && status.LastReleasedTime != nil {
 			deadline := status.LastReleasedTime.Add(time.Duration(delayHours) * time.Hour)
 			log.Info("Evaluating released slot for reclamation",
 				"hostname", slot.Hostname,
@@ -286,12 +305,9 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 				"hasReclaimTask", status.ReclaimStatus != nil && status.ReclaimStatus.TaskRef != "",
 			)
 			if status.ReclaimStatus != nil && status.ReclaimStatus.TaskRef != "" {
-				specUpdated, wait, err := r.reconcileReclaimTask(ctx, pool, slot, &status, vcp)
+				_, wait, err := r.reconcileReclaimTask(ctx, pool, slot, &status, vcp)
 				if err != nil {
 					log.Error(err, "failed to reconcile reclaim task for slot", "hostname", slot.Hostname, "task", status.ReclaimStatus.TaskRef)
-				}
-				if specUpdated {
-					specChanged = true
 				}
 				if wait > 0 && (requeueAfter == 0 || wait < requeueAfter) {
 					requeueAfter = wait
@@ -313,10 +329,10 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 					log.Error(err, "failed to reclaim physical resources for slot", "hostname", slot.Hostname)
 				}
 				if reclaimed {
-					status.State = "Available"
+					status.State = infrav1.MachineConfigSlotStateAvailable
 					status.MachineRef = nil
 					status.LastReleasedTime = nil
-					status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{State: reclaimTaskStateCompleted}
+					status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{State: infrav1.MachineConfigSlotReclaimStateCompleted}
 				}
 				if wait > 0 && (requeueAfter == 0 || wait < requeueAfter) {
 					requeueAfter = wait
@@ -334,12 +350,12 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 		}
 
 		// 2. Orphan Check (InUse but Machine is gone)
-		if status.State == "InUse" && status.MachineRef != nil {
+		if status.State == infrav1.MachineConfigSlotStateInUse && status.MachineRef != nil {
 			m := &infrav1.VSphereMachine{}
 			err := r.Client.Get(ctx, client.ObjectKey{Namespace: status.MachineRef.Namespace, Name: status.MachineRef.Name}, m)
 			if err != nil && apierrors.IsNotFound(err) {
 				log.Info("Machine associated with slot no longer exists, moving slot to Released", "hostname", slot.Hostname, "machine", status.MachineRef.Name)
-				status.State = "Released"
+				status.State = infrav1.MachineConfigSlotStateReleased
 				now := metav1.Now()
 				status.LastReleasedTime = &now
 			}
@@ -348,37 +364,39 @@ func (r resourcePoolReconciler) reconcileNormal(ctx context.Context, pool *infra
 		newStatuses = append(newStatuses, status)
 	}
 
-	if specChanged {
-		if err := r.Client.Update(ctx, pool); err != nil {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{Requeue: true}, nil
-	}
-
-	if !reflect.DeepEqual(pool.Status.ResourceStatuses, newStatuses) {
-		pool.Status.ResourceStatuses = newStatuses
+	if !reflect.DeepEqual(pool.Status.ConfigStatuses, newStatuses) {
+		pool.Status.ConfigStatuses = newStatuses
 	}
 
 	return reconcile.Result{RequeueAfter: requeueAfter}, nil
 }
 
-func (r resourcePoolReconciler) reconcileConsumerBinding(_ context.Context, pool *infrav1.VSphereResourcePool) {
+func (r machineConfigPoolReconciler) reconcileConsumerBinding(ctx context.Context, pool *infrav1.VSphereMachineConfigPool) {
 	if pool.Status.ConsumerRef == nil {
 		return
 	}
 	if !services.IsPoolFullyReusable(pool) {
 		return
 	}
+
+	previous := pool.Status.ConsumerRef
+	ctrl.LoggerFrom(ctx).Info("Pool is fully reusable, clearing consumer binding",
+		"previousConsumerKind", previous.Kind,
+		"previousConsumerNamespace", previous.Namespace,
+		"previousConsumerName", previous.Name,
+	)
+	r.Recorder.Eventf(pool, corev1.EventTypeNormal, "ConsumerUnbound",
+		"Pool is fully reusable, cleared consumer binding to %s %s/%s",
+		previous.Kind, previous.Namespace, previous.Name)
 	pool.Status.ConsumerRef = nil
 }
 
-
-func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, status *infrav1.ResourceSlotStatus, vcp *vcenterParams) (bool, time.Duration, error) {
+func (r machineConfigPoolReconciler) reclaimPhysicalResources(ctx context.Context, pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot, status *infrav1.MachineConfigSlotStatus, vcp *vcenterParams) (bool, time.Duration, error) {
 	log := ctrl.LoggerFrom(ctx)
-	slotDatacenter := services.ResolveResourcePoolDatacenter(pool, slot)
+	slotDatacenter := services.ResolveMachineConfigPoolDatacenter(pool, slot)
 
 	if slotDatacenter == "" {
-		return false, 0, errors.Errorf("datacenter must be specified on slot %q or VSphereResourcePool %s/%s for resource reclamation", slot.Hostname, pool.Namespace, pool.Name)
+		return false, 0, errors.Errorf("datacenter must be specified on slot %q or VSphereMachineConfigPool %s/%s for resource reclamation", slot.Hostname, pool.Namespace, pool.Name)
 	}
 
 	params := session.NewParams().
@@ -410,15 +428,23 @@ func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, po
 
 			task, err := m.DeleteDatastoreFile(ctx, pd.VolumePath, dc)
 			if err != nil {
-				log.Error(err, "Failed to start datastore file deletion", "hostname", slot.Hostname, "disk", pd.Name, "path", pd.VolumePath)
-				if !soap.IsSoapFault(err) {
-					return false, 0, err
+				if types.IsFileNotFound(err) {
+					log.Info("Datastore file already gone, treating as reclaimed",
+						"hostname", slot.Hostname,
+						"disk", pd.Name,
+						"path", pd.VolumePath,
+					)
+					pd.VolumePath = ""
+					pd.DiskUUID = ""
+					status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{State: infrav1.MachineConfigSlotReclaimStateCompleted}
+					return false, 1 * time.Second, nil
 				}
+				log.Error(err, "Failed to start datastore file deletion", "hostname", slot.Hostname, "disk", pd.Name, "path", pd.VolumePath)
 				return false, 0, err
 			}
-			status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{
+			status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{
 				TaskRef:    task.Reference().Value,
-				State:      reclaimTaskStateRunning,
+				State:      infrav1.MachineConfigSlotReclaimStateRunning,
 				VolumePath: pd.VolumePath,
 			}
 			log.Info("Started datastore file deletion task",
@@ -438,9 +464,9 @@ func (r resourcePoolReconciler) reclaimPhysicalResources(ctx context.Context, po
 	return true, 0, nil
 }
 
-func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, status *infrav1.ResourceSlotStatus, vcp *vcenterParams) (bool, time.Duration, error) {
+func (r machineConfigPoolReconciler) reconcileReclaimTask(ctx context.Context, pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot, status *infrav1.MachineConfigSlotStatus, vcp *vcenterParams) (bool, time.Duration, error) {
 	log := ctrl.LoggerFrom(ctx)
-	slotDatacenter := services.ResolveResourcePoolDatacenter(pool, slot)
+	slotDatacenter := services.ResolveMachineConfigPoolDatacenter(pool, slot)
 
 	params := session.NewParams().
 		WithUserInfo(vcp.username, vcp.password).
@@ -487,17 +513,33 @@ func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *
 				break
 			}
 		}
-		status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{State: reclaimTaskStateCompleted}
+		status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{State: infrav1.MachineConfigSlotReclaimStateCompleted}
 		return specUpdated, 1 * time.Second, nil
 	case types.TaskInfoStateError:
+		if task.Info.Error != nil {
+			if _, ok := task.Info.Error.Fault.(*types.FileNotFound); ok {
+				log.Info("Reclaim task reported file not found, treating as reclaimed")
+				specUpdated := false
+				for i := range slot.PersistentDisks {
+					if slot.PersistentDisks[i].VolumePath == status.ReclaimStatus.VolumePath {
+						slot.PersistentDisks[i].VolumePath = ""
+						slot.PersistentDisks[i].DiskUUID = ""
+						specUpdated = true
+						break
+					}
+				}
+				status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{State: infrav1.MachineConfigSlotReclaimStateCompleted}
+				return specUpdated, 1 * time.Second, nil
+			}
+		}
 		errMessage := "reclaim task failed"
 		if task.Info.Error != nil {
 			errMessage = task.Info.Error.LocalizedMessage
 		}
 		log.Error(errors.New(errMessage), "Reclaim task failed")
 		retryAfter := metav1.NewTime(time.Now().Add(1 * time.Minute))
-		status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{
-			State:      reclaimTaskStateFailed,
+		status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{
+			State:      infrav1.MachineConfigSlotReclaimStateFailed,
 			RetryAfter: &retryAfter,
 			LastError:  errMessage,
 		}
@@ -507,15 +549,15 @@ func (r resourcePoolReconciler) reconcileReclaimTask(ctx context.Context, pool *
 	}
 }
 
-func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infrav1.VSphereResourcePool) (reconcile.Result, error) {
+func (r machineConfigPoolReconciler) reconcileDelete(ctx context.Context, pool *infrav1.VSphereMachineConfigPool) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	// Check if any vCenter operations are needed (released slots with reclaimable disks)
 	needsVCenter := false
-	for i := range pool.Spec.Resources {
-		slot := &pool.Spec.Resources[i]
-		for _, s := range pool.Status.ResourceStatuses {
-			if s.Hostname == slot.Hostname && s.State == "Released" {
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
+		for _, s := range pool.Status.ConfigStatuses {
+			if s.Hostname == slot.Hostname && s.State == infrav1.MachineConfigSlotStateReleased {
 				if (s.ReclaimStatus != nil && s.ReclaimStatus.TaskRef != "") || hasReclaimablePersistentDisk(slot) {
 					needsVCenter = true
 					break
@@ -537,22 +579,22 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 		}
 	}
 
-	statusMap := make(map[string]infrav1.ResourceSlotStatus, len(pool.Status.ResourceStatuses))
-	for _, status := range pool.Status.ResourceStatuses {
+	statusMap := make(map[string]infrav1.MachineConfigSlotStatus, len(pool.Status.ConfigStatuses))
+	for _, status := range pool.Status.ConfigStatuses {
 		statusMap[status.Hostname] = status
 	}
 
-	newStatuses := make([]infrav1.ResourceSlotStatus, 0, len(pool.Spec.Resources))
+	newStatuses := make([]infrav1.MachineConfigSlotStatus, 0, len(pool.Spec.Configs))
 	var blockingMachines []string
 	requeueAfter := time.Duration(0)
 
-	for i := range pool.Spec.Resources {
-		slot := &pool.Spec.Resources[i]
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
 		status, ok := statusMap[slot.Hostname]
 		if !ok {
-			status = infrav1.ResourceSlotStatus{
+			status = infrav1.MachineConfigSlotStatus{
 				Hostname: slot.Hostname,
-				State:    "Available",
+				State:    infrav1.MachineConfigSlotStateAvailable,
 			}
 		}
 
@@ -565,8 +607,8 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 			case apierrors.IsNotFound(err):
 				log.Info("Deleting pool: machine for slot no longer exists, continuing reclaim", "hostname", slot.Hostname, "machine", status.MachineRef.Name)
 				status.MachineRef = nil
-				if status.State == "InUse" {
-					status.State = "Released"
+				if status.State == infrav1.MachineConfigSlotStateInUse {
+					status.State = infrav1.MachineConfigSlotStateReleased
 					now := metav1.Now()
 					status.LastReleasedTime = &now
 				}
@@ -575,7 +617,7 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 			}
 		}
 
-		if status.State == "Released" {
+		if status.State == infrav1.MachineConfigSlotStateReleased {
 			if status.ReclaimStatus != nil && status.ReclaimStatus.TaskRef != "" {
 				log.Info("Deleting pool: released slot has in-flight reclaim task",
 					"hostname", slot.Hostname,
@@ -601,9 +643,9 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 					log.Info("Deleting pool: slot reclaim completed without pending vSphere tasks",
 						"hostname", slot.Hostname,
 					)
-					status.State = "Available"
+					status.State = infrav1.MachineConfigSlotStateAvailable
 					status.LastReleasedTime = nil
-					status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{State: reclaimTaskStateCompleted}
+					status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{State: infrav1.MachineConfigSlotReclaimStateCompleted}
 				}
 				if wait > 0 && (requeueAfter == 0 || wait < requeueAfter) {
 					requeueAfter = wait
@@ -613,30 +655,30 @@ func (r resourcePoolReconciler) reconcileDelete(ctx context.Context, pool *infra
 					"hostname", slot.Hostname,
 					"persistentDiskCount", len(slot.PersistentDisks),
 				)
-				status.State = "Available"
+				status.State = infrav1.MachineConfigSlotStateAvailable
 				status.LastReleasedTime = nil
-				status.ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{State: reclaimTaskStateCompleted}
+				status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{State: infrav1.MachineConfigSlotReclaimStateCompleted}
 			}
 		}
 
 		newStatuses = append(newStatuses, status)
 	}
 
-	pool.Status.ResourceStatuses = newStatuses
+	pool.Status.ConfigStatuses = newStatuses
 
 	if len(blockingMachines) > 0 {
-		return reconcile.Result{}, errors.Errorf("blocking VSphereResourcePool deletion: currently in use by VSphereMachines %v", blockingMachines)
+		return reconcile.Result{}, errors.Errorf("blocking VSphereMachineConfigPool deletion: currently in use by VSphereMachines %v", blockingMachines)
 	}
 
 	if requeueAfter > 0 {
 		return reconcile.Result{RequeueAfter: requeueAfter}, nil
 	}
 
-	ctrlutil.RemoveFinalizer(pool, ResourcePoolFinalizer)
+	ctrlutil.RemoveFinalizer(pool, MachineConfigPoolFinalizer)
 	return reconcile.Result{}, nil
 }
 
-func hasReclaimablePersistentDisk(slot *infrav1.ResourceSlot) bool {
+func hasReclaimablePersistentDisk(slot *infrav1.MachineConfigSlot) bool {
 	for i := range slot.PersistentDisks {
 		if slot.PersistentDisks[i].VolumePath != "" {
 			return true

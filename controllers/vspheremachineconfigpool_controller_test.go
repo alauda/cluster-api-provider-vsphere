@@ -28,14 +28,14 @@ func TestResolveVCenterParams(t *testing.T) {
 
 	t.Run("cluster not found", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "missing-cluster"},
-				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 		}
-		r := resourcePoolReconciler{
+		r := machineConfigPoolReconciler{
 			Client:                   fake.NewClientBuilder().WithScheme(scheme).Build(),
 			ControllerManagerContext: &capvcontext.ControllerManagerContext{},
 		}
@@ -56,14 +56,14 @@ func TestResolveVCenterParams(t *testing.T) {
 				InfrastructureRef: &corev1.ObjectReference{Name: "my-vsphere-cluster"},
 			},
 		}
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
-				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 		}
-		r := resourcePoolReconciler{
+		r := machineConfigPoolReconciler{
 			Client:                   fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build(),
 			ControllerManagerContext: &capvcontext.ControllerManagerContext{},
 		}
@@ -80,14 +80,14 @@ func TestResolveVCenterParams(t *testing.T) {
 		cluster := &clusterv1.Cluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "default"},
 		}
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
-				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 		}
-		r := resourcePoolReconciler{
+		r := machineConfigPoolReconciler{
 			Client:                   fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build(),
 			ControllerManagerContext: &capvcontext.ControllerManagerContext{},
 		}
@@ -108,14 +108,14 @@ func TestResolveVCenterParams(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "my-vsphere-cluster", Namespace: "default"},
 			Spec:       infrav1.VSphereClusterSpec{Server: "vcenter.example.com", Thumbprint: "AA:BB"},
 		}
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
-				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 		}
-		r := resourcePoolReconciler{
+		r := machineConfigPoolReconciler{
 			Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, vsphereCluster).Build(),
 			ControllerManagerContext: &capvcontext.ControllerManagerContext{
 				Username: "admin",
@@ -144,14 +144,14 @@ func TestResolveVCenterParams(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "my-vsphere-cluster", Namespace: "default"},
 			Spec:       infrav1.VSphereClusterSpec{Server: "vcenter.example.com"},
 		}
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
-				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 		}
-		r := resourcePoolReconciler{
+		r := machineConfigPoolReconciler{
 			Client:                   fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, vsphereCluster).Build(),
 			ControllerManagerContext: &capvcontext.ControllerManagerContext{},
 		}
@@ -189,14 +189,14 @@ func TestResolveVCenterParams(t *testing.T) {
 				"password": []byte("secret-pass"),
 			},
 		}
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "my-cluster"},
-				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 		}
-		r := resourcePoolReconciler{
+		r := machineConfigPoolReconciler{
 			Client:                   fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, vsphereCluster, secret).Build(),
 			ControllerManagerContext: &capvcontext.ControllerManagerContext{Namespace: "default"},
 		}
@@ -211,7 +211,7 @@ func TestResolveVCenterParams(t *testing.T) {
 	})
 }
 
-func TestResourcePoolReconcileDeleteBlocksWhenMachineStillExists(t *testing.T) {
+func TestMachineConfigPoolReconcileDeleteBlocksWhenMachineStillExists(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
@@ -222,20 +222,20 @@ func TestResourcePoolReconcileDeleteBlocksWhenMachineStillExists(t *testing.T) {
 			Namespace: "default",
 		},
 	}
-	pool := &infrav1.VSphereResourcePool{
+	pool := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pool",
 			Namespace:  "default",
-			Finalizers: []string{ResourcePoolFinalizer},
+			Finalizers: []string{MachineConfigPoolFinalizer},
 		},
-		Spec: infrav1.VSphereResourcePoolSpec{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Resources: []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 		},
-		Status: infrav1.VSphereResourcePoolStatus{
-			ResourceStatuses: []infrav1.ResourceSlotStatus{{
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
 				Hostname: "host-1",
-				State:    "InUse",
+				State:    infrav1.MachineConfigSlotStateInUse,
 				MachineRef: &corev1.ObjectReference{
 					Name:      "cp-0",
 					Namespace: "default",
@@ -244,7 +244,7 @@ func TestResourcePoolReconcileDeleteBlocksWhenMachineStillExists(t *testing.T) {
 		},
 	}
 
-	r := resourcePoolReconciler{
+	r := machineConfigPoolReconciler{
 		Client: fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(pool, machine).
@@ -253,30 +253,30 @@ func TestResourcePoolReconcileDeleteBlocksWhenMachineStillExists(t *testing.T) {
 
 	_, err := r.reconcileDelete(context.Background(), pool)
 	g.Expect(err).To(HaveOccurred())
-	g.Expect(err.Error()).To(ContainSubstring("blocking VSphereResourcePool deletion"))
-	g.Expect(pool.Finalizers).To(ContainElement(ResourcePoolFinalizer))
+	g.Expect(err.Error()).To(ContainSubstring("blocking VSphereMachineConfigPool deletion"))
+	g.Expect(pool.Finalizers).To(ContainElement(MachineConfigPoolFinalizer))
 }
 
-func TestResourcePoolReconcileDeleteRemovesFinalizerAfterSafeReclaim(t *testing.T) {
+func TestMachineConfigPoolReconcileDeleteRemovesFinalizerAfterSafeReclaim(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 
 	now := metav1.Now()
-	pool := &infrav1.VSphereResourcePool{
+	pool := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pool",
 			Namespace:  "default",
-			Finalizers: []string{ResourcePoolFinalizer},
+			Finalizers: []string{MachineConfigPoolFinalizer},
 		},
-		Spec: infrav1.VSphereResourcePoolSpec{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Resources: []infrav1.ResourceSlot{{Hostname: "host-1"}},
+			Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 		},
-		Status: infrav1.VSphereResourcePoolStatus{
-			ResourceStatuses: []infrav1.ResourceSlotStatus{{
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
 				Hostname: "host-1",
-				State:    "InUse",
+				State:    infrav1.MachineConfigSlotStateInUse,
 				MachineRef: &corev1.ObjectReference{
 					Name:      "cp-0",
 					Namespace: "default",
@@ -286,7 +286,7 @@ func TestResourcePoolReconcileDeleteRemovesFinalizerAfterSafeReclaim(t *testing.
 		},
 	}
 
-	r := resourcePoolReconciler{
+	r := machineConfigPoolReconciler{
 		Client: fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(pool).
@@ -296,26 +296,26 @@ func TestResourcePoolReconcileDeleteRemovesFinalizerAfterSafeReclaim(t *testing.
 	result, err := r.reconcileDelete(context.Background(), pool)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(result.IsZero()).To(BeTrue())
-	g.Expect(pool.Finalizers).NotTo(ContainElement(ResourcePoolFinalizer))
-	g.Expect(pool.Status.ResourceStatuses[0].MachineRef).To(BeNil())
-	g.Expect(pool.Status.ResourceStatuses[0].State).To(Equal("Available"))
+	g.Expect(pool.Finalizers).NotTo(ContainElement(MachineConfigPoolFinalizer))
+	g.Expect(pool.Status.ConfigStatuses[0].MachineRef).To(BeNil())
+	g.Expect(pool.Status.ConfigStatuses[0].State).To(Equal(infrav1.MachineConfigSlotStateAvailable))
 }
 
-func TestResourcePoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvailable(t *testing.T) {
+func TestMachineConfigPoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvailable(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 
 	releasedAt := metav1.NewTime(time.Now().Add(-25 * time.Hour))
-	pool := &infrav1.VSphereResourcePool{
+	pool := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pool",
 			Namespace:  "default",
-			Finalizers: []string{ResourcePoolFinalizer},
+			Finalizers: []string{MachineConfigPoolFinalizer},
 		},
-		Spec: infrav1.VSphereResourcePoolSpec{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Resources: []infrav1.ResourceSlot{{
+			Configs: []infrav1.MachineConfigSlot{{
 				Hostname: "host-1",
 				PersistentDisks: []infrav1.PersistentDisk{{
 					Name:       "data-0",
@@ -326,17 +326,17 @@ func TestResourcePoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvailable
 				}},
 			}},
 		},
-		Status: infrav1.VSphereResourcePoolStatus{
-			ResourceStatuses: []infrav1.ResourceSlotStatus{{
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
 				Hostname:         "host-1",
-				State:            "Released",
+				State:            infrav1.MachineConfigSlotStateReleased,
 				LastReleasedTime: &releasedAt,
 				MachineRef: &corev1.ObjectReference{
 					Name:      "worker-1",
 					Namespace: "default",
 				},
-				ReclaimStatus: &infrav1.ResourceSlotReclaimStatus{
-					State: reclaimTaskStateCompleted,
+				ReclaimStatus: &infrav1.MachineConfigSlotReclaimStatus{
+					State: infrav1.MachineConfigSlotReclaimStateCompleted,
 				},
 			}},
 		},
@@ -348,7 +348,7 @@ func TestResourcePoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvailable
 		WithObjects(pool).
 		Build()
 
-	r := resourcePoolReconciler{
+	r := machineConfigPoolReconciler{
 		Client: fakeClient,
 	}
 
@@ -357,42 +357,42 @@ func TestResourcePoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvailable
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 
-	updated := &infrav1.VSphereResourcePool{}
+	updated := &infrav1.VSphereMachineConfigPool{}
 	err = fakeClient.Get(context.Background(), client.ObjectKeyFromObject(pool), updated)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(updated.Status.ResourceStatuses).To(HaveLen(1))
-	g.Expect(updated.Status.ResourceStatuses[0].State).To(Equal("Available"))
-	g.Expect(updated.Status.ResourceStatuses[0].MachineRef).To(BeNil())
-	g.Expect(updated.Status.ResourceStatuses[0].LastReleasedTime).To(BeNil())
-	g.Expect(updated.Status.ResourceStatuses[0].ReclaimStatus).NotTo(BeNil())
-	g.Expect(updated.Status.ResourceStatuses[0].ReclaimStatus.TaskRef).To(BeEmpty())
-	g.Expect(updated.Status.ResourceStatuses[0].ReclaimStatus.VolumePath).To(BeEmpty())
-	g.Expect(updated.Status.ResourceStatuses[0].ReclaimStatus.RetryAfter).To(BeNil())
+	g.Expect(updated.Status.ConfigStatuses).To(HaveLen(1))
+	g.Expect(updated.Status.ConfigStatuses[0].State).To(Equal(infrav1.MachineConfigSlotStateAvailable))
+	g.Expect(updated.Status.ConfigStatuses[0].MachineRef).To(BeNil())
+	g.Expect(updated.Status.ConfigStatuses[0].LastReleasedTime).To(BeNil())
+	g.Expect(updated.Status.ConfigStatuses[0].ReclaimStatus).NotTo(BeNil())
+	g.Expect(updated.Status.ConfigStatuses[0].ReclaimStatus.TaskRef).To(BeEmpty())
+	g.Expect(updated.Status.ConfigStatuses[0].ReclaimStatus.VolumePath).To(BeEmpty())
+	g.Expect(updated.Status.ConfigStatuses[0].ReclaimStatus.RetryAfter).To(BeNil())
 }
 
 func TestResolveSlotDatacenter(t *testing.T) {
 	g := NewWithT(t)
 
-	pool := &infrav1.VSphereResourcePool{
-		Spec: infrav1.VSphereResourcePoolSpec{
+	pool := &infrav1.VSphereMachineConfigPool{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Datacenter: "Datacenter1",
 		},
 	}
 
-	slotWithOwnDatacenter := &infrav1.ResourceSlot{
+	slotWithOwnDatacenter := &infrav1.MachineConfigSlot{
 		Hostname:   "host-1",
 		Datacenter: "Datacenter2",
 	}
 
-	slotWithoutDatacenter := &infrav1.ResourceSlot{
+	slotWithoutDatacenter := &infrav1.MachineConfigSlot{
 		Hostname: "host-2",
 	}
 
-	g.Expect(services.ResolveResourcePoolDatacenter(pool, slotWithOwnDatacenter)).To(Equal("Datacenter2"))
-	g.Expect(services.ResolveResourcePoolDatacenter(pool, slotWithoutDatacenter)).To(Equal("Datacenter1"))
-	g.Expect(services.ResolveResourcePoolDatacenter(&infrav1.VSphereResourcePool{}, slotWithoutDatacenter)).To(BeEmpty())
-	g.Expect(services.ResolveResourcePoolDatacenter(nil, slotWithoutDatacenter)).To(BeEmpty())
+	g.Expect(services.ResolveMachineConfigPoolDatacenter(pool, slotWithOwnDatacenter)).To(Equal("Datacenter2"))
+	g.Expect(services.ResolveMachineConfigPoolDatacenter(pool, slotWithoutDatacenter)).To(Equal("Datacenter1"))
+	g.Expect(services.ResolveMachineConfigPoolDatacenter(&infrav1.VSphereMachineConfigPool{}, slotWithoutDatacenter)).To(BeEmpty())
+	g.Expect(services.ResolveMachineConfigPoolDatacenter(nil, slotWithoutDatacenter)).To(BeEmpty())
 }
 
 func ptrTo[T any](v T) *T {

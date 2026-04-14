@@ -354,33 +354,33 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		PatchHelper:              patchHelper,
 	}
 
-	if vsphereMachine.Spec.ResourcePoolRef != nil {
-		slot, err := services.GetSlotForMachine(ctx, r.Client, vsphereMachine.Spec.ResourcePoolRef, &corev1.ObjectReference{
+	if vsphereMachine.Spec.MachineConfigPoolRef != nil {
+		slot, err := services.GetSlotForMachine(ctx, r.Client, vsphereMachine.Spec.MachineConfigPoolRef, &corev1.ObjectReference{
 			Namespace: vsphereMachine.Namespace,
 			Name:      vsphereMachine.Name,
 			UID:       vsphereMachine.UID,
 		})
 		if err != nil {
-			return reconcile.Result{}, errors.Wrapf(err, "failed to get resource slot for VSphereMachine %s", vsphereMachine.Name)
+			return reconcile.Result{}, errors.Wrapf(err, "failed to get machine config slot for VSphereMachine %s", vsphereMachine.Name)
 		}
 		if slot == nil {
-			if hostname := vsphereVM.Annotations["infrastructure.cluster.x-k8s.io/resource-slot-hostname"]; hostname != "" {
-				pool := &infrav1.VSphereResourcePool{}
+			if hostname := vsphereVM.Annotations["infrastructure.cluster.x-k8s.io/machine-config-slot-hostname"]; hostname != "" {
+				pool := &infrav1.VSphereMachineConfigPool{}
 				if err := r.Client.Get(ctx, apitypes.NamespacedName{
-					Namespace: vsphereMachine.Spec.ResourcePoolRef.Namespace,
-					Name:      vsphereMachine.Spec.ResourcePoolRef.Name,
+					Namespace: vsphereMachine.Spec.MachineConfigPoolRef.Namespace,
+					Name:      vsphereMachine.Spec.MachineConfigPoolRef.Name,
 				}, pool); err != nil {
-					return reconcile.Result{}, errors.Wrapf(err, "failed to get resource pool %s for VSphereMachine %s", vsphereMachine.Spec.ResourcePoolRef.Name, vsphereMachine.Name)
+					return reconcile.Result{}, errors.Wrapf(err, "failed to get machine config pool %s for VSphereMachine %s", vsphereMachine.Spec.MachineConfigPoolRef.Name, vsphereMachine.Name)
 				}
-				for i := range pool.Spec.Resources {
-					if pool.Spec.Resources[i].Hostname == hostname {
-						slot = &pool.Spec.Resources[i]
+				for i := range pool.Spec.Configs {
+					if pool.Spec.Configs[i].Hostname == hostname {
+						slot = &pool.Spec.Configs[i]
 						break
 					}
 				}
 			}
 		}
-		vmContext.ResourceSlot = slot
+		vmContext.MachineConfigSlot = slot
 	}
 
 	// Print the task-ref upon entry and upon exit.
@@ -453,7 +453,7 @@ func (r vmReconciler) reconcileDelete(ctx context.Context, vmCtx *capvcontext.VM
 		return reconcile.Result{}, nil
 	}
 
-	// AFTER PHYSICAL DELETION IS CONFIRMED: Release the resource pool slot.
+	// AFTER PHYSICAL DELETION IS CONFIRMED: Release the machine config pool slot.
 	// The owner VSphereMachine may already be gone, so fall back to the owner ref and
 	// locate the pool by status assignment when necessary.
 	machineRef, err := util.GetOwnerVSphereMachineRef(vmCtx.VSphereVM.ObjectMeta)
@@ -468,12 +468,12 @@ func (r vmReconciler) reconcileDelete(ctx context.Context, vmCtx *capvcontext.VM
 			return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine for VSphereVM")
 		}
 		if machine != nil {
-			poolRef = machine.Spec.ResourcePoolRef
+			poolRef = machine.Spec.MachineConfigPoolRef
 		}
 		if poolRef == nil {
-			poolRef, err = services.FindResourcePoolForMachine(ctx, r.Client, vmCtx.VSphereVM.Namespace, machineRef)
+			poolRef, err = services.FindMachineConfigPoolForMachine(ctx, r.Client, vmCtx.VSphereVM.Namespace, machineRef)
 			if err != nil {
-				return reconcile.Result{}, errors.Wrapf(err, "failed to find resource pool for VSphereVM")
+				return reconcile.Result{}, errors.Wrapf(err, "failed to find machine config pool for VSphereVM")
 			}
 		}
 		if err := services.ReleaseSlot(ctx, r.Client, poolRef, machineRef); err != nil {
@@ -618,10 +618,10 @@ func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VM
 	})
 
 	// Persist discovered paths back to the pool
-	if vmCtx.ResourceSlot != nil {
+	if vmCtx.MachineConfigSlot != nil {
 		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
-		if err == nil && machine != nil && machine.Spec.ResourcePoolRef != nil {
-			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.ResourcePoolRef, vmCtx.ResourceSlot); err != nil {
+		if err == nil && machine != nil && machine.Spec.MachineConfigPoolRef != nil {
+			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.MachineConfigPoolRef, vmCtx.MachineConfigSlot); err != nil {
 				return reconcile.Result{}, errors.Wrapf(err, "failed to persist slot changes for vm %s", vmCtx.VSphereVM.Name)
 			}
 		}

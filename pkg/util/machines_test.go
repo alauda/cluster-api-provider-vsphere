@@ -1189,9 +1189,9 @@ func Test_GetPrimaryNodeIPAddress_UsesGuestReportedIPs(t *testing.T) {
 			},
 		},
 	}
-	slot := &infrav1.ResourceSlot{
+	slot := &infrav1.MachineConfigSlot{
 		Hostname: "slot-1",
-		Network: &infrav1.ResourceSlotNetwork{
+		Network: &infrav1.MachineConfigSlotNetwork{
 			Primary: infrav1.NetworkConfig{NetworkName: "mgmt"},
 			Additional: []infrav1.NetworkConfig{
 				{NetworkName: "workload"},

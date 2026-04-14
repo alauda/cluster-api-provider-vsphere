@@ -103,30 +103,30 @@ func ResolveMachineConsumerRef(ctx context.Context, c client.Client, machine *cl
 	return nil, errors.Errorf("failed to resolve consumer for Machine %s/%s", machine.Namespace, machine.Name)
 }
 
-func ValidatePoolConsumer(pool *infrav1.VSphereResourcePool, consumerRef *corev1.ObjectReference) error {
+func ValidatePoolConsumer(pool *infrav1.VSphereMachineConfigPool, consumerRef *corev1.ObjectReference) error {
 	if pool == nil || pool.Status.ConsumerRef == nil || consumerRef == nil {
 		return nil
 	}
 	if ConsumerRefsEqual(pool.Status.ConsumerRef, consumerRef) {
 		return nil
 	}
-	return errors.Errorf("resource pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Status.ConsumerRef.Kind, pool.Status.ConsumerRef.Namespace, pool.Status.ConsumerRef.Name)
+	return errors.Errorf("machine config pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Status.ConsumerRef.Kind, pool.Status.ConsumerRef.Namespace, pool.Status.ConsumerRef.Name)
 }
 
-func IsPoolFullyReusable(pool *infrav1.VSphereResourcePool) bool {
+func IsPoolFullyReusable(pool *infrav1.VSphereMachineConfigPool) bool {
 	if pool == nil {
 		return true
 	}
-	statusMap := make(map[string]infrav1.ResourceSlotStatus, len(pool.Status.ResourceStatuses))
-	for _, status := range pool.Status.ResourceStatuses {
+	statusMap := make(map[string]infrav1.MachineConfigSlotStatus, len(pool.Status.ConfigStatuses))
+	for _, status := range pool.Status.ConfigStatuses {
 		statusMap[status.Hostname] = status
 	}
 
-	for i := range pool.Spec.Resources {
-		slot := &pool.Spec.Resources[i]
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
 		status, ok := statusMap[slot.Hostname]
 		if ok {
-			if status.State == "InUse" || status.State == "Released" {
+			if status.State == infrav1.MachineConfigSlotStateInUse || status.State == infrav1.MachineConfigSlotStateReleased {
 				return false
 			}
 			if status.ReclaimStatus != nil {
@@ -142,7 +142,7 @@ func IsPoolFullyReusable(pool *infrav1.VSphereResourcePool) bool {
 	return true
 }
 
-func hasReclaimablePersistentDiskBacking(slot *infrav1.ResourceSlot) bool {
+func hasReclaimablePersistentDiskBacking(slot *infrav1.MachineConfigSlot) bool {
 	for i := range slot.PersistentDisks {
 		if slot.PersistentDisks[i].VolumePath != "" {
 			return true
@@ -158,9 +158,9 @@ func normalizeDesiredDatacenter(datacenter string) string {
 	return datacenter
 }
 
-func slotMatchesDatacenterConstraints(pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot, desiredDatacenter string, allowedDatacenters map[string]struct{}) bool {
+func slotMatchesDatacenterConstraints(pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot, desiredDatacenter string, allowedDatacenters map[string]struct{}) bool {
 	desiredDatacenter = normalizeDesiredDatacenter(desiredDatacenter)
-	resolvedDatacenter := ResolveResourcePoolDatacenter(pool, slot)
+	resolvedDatacenter := ResolveMachineConfigPoolDatacenter(pool, slot)
 	if desiredDatacenter != "" {
 		if resolvedDatacenter != desiredDatacenter {
 			return false
@@ -175,18 +175,18 @@ func slotMatchesDatacenterConstraints(pool *infrav1.VSphereResourcePool, slot *i
 	return true
 }
 
-func findSlotByHostname(pool *infrav1.VSphereResourcePool, hostname string) *infrav1.ResourceSlot {
-	for i := range pool.Spec.Resources {
-		if pool.Spec.Resources[i].Hostname == hostname {
-			return &pool.Spec.Resources[i]
+func findSlotByHostname(pool *infrav1.VSphereMachineConfigPool, hostname string) *infrav1.MachineConfigSlot {
+	for i := range pool.Spec.Configs {
+		if pool.Spec.Configs[i].Hostname == hostname {
+			return &pool.Spec.Configs[i]
 		}
 	}
 	return nil
 }
 
-// ResolveResourcePoolDatacenter returns the effective datacenter for a slot.
+// ResolveMachineConfigPoolDatacenter returns the effective datacenter for a slot.
 // Slot-level Datacenter takes precedence over the pool-level default.
-func ResolveResourcePoolDatacenter(pool *infrav1.VSphereResourcePool, slot *infrav1.ResourceSlot) string {
+func ResolveMachineConfigPoolDatacenter(pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot) string {
 	if slot != nil && slot.Datacenter != "" {
 		return slot.Datacenter
 	}
@@ -196,9 +196,9 @@ func ResolveResourcePoolDatacenter(pool *infrav1.VSphereResourcePool, slot *infr
 	return ""
 }
 
-// ResolveResourcePoolDatacenterFromRef returns the effective datacenter for a slot
-// by loading the referenced VSphereResourcePool when needed.
-func ResolveResourcePoolDatacenterFromRef(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, slot *infrav1.ResourceSlot) (string, error) {
+// ResolveMachineConfigPoolDatacenterFromRef returns the effective datacenter for a slot
+// by loading the referenced VSphereMachineConfigPool when needed.
+func ResolveMachineConfigPoolDatacenterFromRef(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, slot *infrav1.MachineConfigSlot) (string, error) {
 	if slot != nil && slot.Datacenter != "" {
 		return slot.Datacenter, nil
 	}
@@ -206,32 +206,32 @@ func ResolveResourcePoolDatacenterFromRef(ctx context.Context, c client.Client, 
 		return "", nil
 	}
 
-	pool := &infrav1.VSphereResourcePool{}
+	pool := &infrav1.VSphereMachineConfigPool{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
 		return "", err
 	}
-	return ResolveResourcePoolDatacenter(pool, slot), nil
+	return ResolveMachineConfigPoolDatacenter(pool, slot), nil
 }
 
 // DatacentersWithAvailableSlots returns the set of datacenter names that have
 // at least one allocatable slot (Available, Released, or uninitialized) across
 // all provided pools.
-func DatacentersWithAvailableSlots(pools []infrav1.VSphereResourcePool) map[string]struct{} {
+func DatacentersWithAvailableSlots(pools []infrav1.VSphereMachineConfigPool) map[string]struct{} {
 	result := make(map[string]struct{})
 	for i := range pools {
 		pool := &pools[i]
-		statusMap := make(map[string]infrav1.ResourceSlotStatus)
-		for _, s := range pool.Status.ResourceStatuses {
+		statusMap := make(map[string]infrav1.MachineConfigSlotStatus)
+		for _, s := range pool.Status.ConfigStatuses {
 			statusMap[s.Hostname] = s
 		}
-		for j := range pool.Spec.Resources {
-			slot := &pool.Spec.Resources[j]
-			dc := ResolveResourcePoolDatacenter(pool, slot)
+		for j := range pool.Spec.Configs {
+			slot := &pool.Spec.Configs[j]
+			dc := ResolveMachineConfigPoolDatacenter(pool, slot)
 			if dc == "" {
 				continue
 			}
 			s := statusMap[slot.Hostname]
-			if s.State == "" || s.State == "Available" || s.State == "Released" {
+			if s.State == "" || s.State == infrav1.MachineConfigSlotStateAvailable || s.State == infrav1.MachineConfigSlotStateReleased {
 				result[dc] = struct{}{}
 			}
 		}
@@ -241,10 +241,10 @@ func DatacentersWithAvailableSlots(pools []infrav1.VSphereResourcePool) map[stri
 
 // AllocateSlot finds an available or released slot in the pool for the given machine.
 // It retries internally on conflict errors to avoid propagating transient conflicts
-// caused by concurrent updates from the resource pool controller.
+// caused by concurrent updates from the machine config pool controller.
 // consumerRef is checked against the pool's current consumer binding to prevent
 // machines from different consumers allocating slots from the same pool.
-func AllocateSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machine *infrav1.VSphereMachine, consumerRef *corev1.ObjectReference, desiredDatacenter string, allowedDatacenters []string) (*infrav1.ResourceSlot, error) {
+func AllocateSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machine *infrav1.VSphereMachine, consumerRef *corev1.ObjectReference, desiredDatacenter string, allowedDatacenters []string) (*infrav1.MachineConfigSlot, error) {
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		slot, err := allocateSlotOnce(ctx, c, poolRef, machine, consumerRef, desiredDatacenter, allowedDatacenters)
@@ -259,8 +259,8 @@ func AllocateSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectRe
 	return nil, errors.Wrapf(lastErr, "transient conflict while allocating slot from pool %s/%s, will retry", poolRef.Namespace, poolRef.Name)
 }
 
-func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machine *infrav1.VSphereMachine, consumerRef *corev1.ObjectReference, desiredDatacenter string, allowedDatacenters []string) (*infrav1.ResourceSlot, error) {
-	pool := &infrav1.VSphereResourcePool{}
+func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machine *infrav1.VSphereMachine, consumerRef *corev1.ObjectReference, desiredDatacenter string, allowedDatacenters []string) (*infrav1.MachineConfigSlot, error) {
+	pool := &infrav1.VSphereMachineConfigPool{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
 		return nil, err
 	}
@@ -277,13 +277,13 @@ func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.Obje
 		allowedDatacenterSet[datacenter] = struct{}{}
 	}
 
-	statusMap := make(map[string]infrav1.ResourceSlotStatus)
-	for _, s := range pool.Status.ResourceStatuses {
+	statusMap := make(map[string]infrav1.MachineConfigSlotStatus)
+	for _, s := range pool.Status.ConfigStatuses {
 		statusMap[s.Hostname] = s
 	}
 
 	// 1. Try to find a slot already assigned to this specific machine instance (by UID or Name)
-	for i, slot := range pool.Spec.Resources {
+	for i, slot := range pool.Spec.Configs {
 		if !slotMatchesDatacenterConstraints(pool, &slot, desiredDatacenter, allowedDatacenterSet) {
 			continue
 		}
@@ -291,12 +291,12 @@ func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.Obje
 			if s.MachineRef != nil {
 				// Exact match by UID is safest
 				if s.MachineRef.UID == machine.UID {
-					return &pool.Spec.Resources[i], nil
+					return &pool.Spec.Configs[i], nil
 				}
 				// Match by Name/Namespace handles idempotency within the same reconcile loop
 				// before UID is settled or if machine is recreated.
 				if s.MachineRef.Name == machine.Name && s.MachineRef.Namespace == machine.Namespace {
-					return &pool.Spec.Resources[i], nil
+					return &pool.Spec.Configs[i], nil
 				}
 			}
 		}
@@ -304,12 +304,12 @@ func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.Obje
 
 	// 2. Priority Reuse: Find a Released slot
 	var selectedIdx = -1
-	for i, slot := range pool.Spec.Resources {
+	for i, slot := range pool.Spec.Configs {
 		if !slotMatchesDatacenterConstraints(pool, &slot, desiredDatacenter, allowedDatacenterSet) {
 			continue
 		}
 		if s, ok := statusMap[slot.Hostname]; ok {
-			if s.State == "Released" {
+			if s.State == infrav1.MachineConfigSlotStateReleased {
 				selectedIdx = i
 				break
 			}
@@ -318,12 +318,12 @@ func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.Obje
 
 	// 3. Fallback: Find an Available slot OR an uninitialized slot
 	if selectedIdx == -1 {
-		for i, slot := range pool.Spec.Resources {
+		for i, slot := range pool.Spec.Configs {
 			if !slotMatchesDatacenterConstraints(pool, &slot, desiredDatacenter, allowedDatacenterSet) {
 				continue
 			}
 			s, ok := statusMap[slot.Hostname]
-			if !ok || s.State == "Available" {
+			if !ok || s.State == infrav1.MachineConfigSlotStateAvailable {
 				selectedIdx = i
 				break
 			}
@@ -340,32 +340,32 @@ func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.Obje
 		if len(allowedDatacenterSet) > 0 {
 			return nil, errors.Errorf("no available slots in pool %s/%s matching failure domain datacenters", pool.Namespace, pool.Name)
 		}
-		return nil, errors.Errorf("no available slots in pool %s/%s (total slots: %d, status entries: %d)", pool.Namespace, pool.Name, len(pool.Spec.Resources), len(pool.Status.ResourceStatuses))
+		return nil, errors.Errorf("no available slots in pool %s/%s (total slots: %d, status entries: %d)", pool.Namespace, pool.Name, len(pool.Spec.Configs), len(pool.Status.ConfigStatuses))
 	}
 
-	targetHostname := pool.Spec.Resources[selectedIdx].Hostname
+	targetHostname := pool.Spec.Configs[selectedIdx].Hostname
 
 	// Update or Create status entry
 	found := false
-	for i := range pool.Status.ResourceStatuses {
-		if pool.Status.ResourceStatuses[i].Hostname == targetHostname {
-			pool.Status.ResourceStatuses[i].State = "InUse"
-			pool.Status.ResourceStatuses[i].MachineRef = &corev1.ObjectReference{
+	for i := range pool.Status.ConfigStatuses {
+		if pool.Status.ConfigStatuses[i].Hostname == targetHostname {
+			pool.Status.ConfigStatuses[i].State = infrav1.MachineConfigSlotStateInUse
+			pool.Status.ConfigStatuses[i].MachineRef = &corev1.ObjectReference{
 				Kind:      machine.Kind,
 				Namespace: machine.Namespace,
 				Name:      machine.Name,
 				UID:       machine.UID,
 			}
-			pool.Status.ResourceStatuses[i].LastReleasedTime = nil
+			pool.Status.ConfigStatuses[i].LastReleasedTime = nil
 			found = true
 			break
 		}
 	}
 
 	if !found {
-		pool.Status.ResourceStatuses = append(pool.Status.ResourceStatuses, infrav1.ResourceSlotStatus{
+		pool.Status.ConfigStatuses = append(pool.Status.ConfigStatuses, infrav1.MachineConfigSlotStatus{
 			Hostname: targetHostname,
-			State:    "InUse",
+			State:    infrav1.MachineConfigSlotStateInUse,
 			MachineRef: &corev1.ObjectReference{
 				Kind:      machine.Kind,
 				Namespace: machine.Namespace,
@@ -398,7 +398,7 @@ func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.Obje
 
 	slotCopy := *selectedSlot
 	if slotCopy.Datacenter == "" {
-		slotCopy.Datacenter = ResolveResourcePoolDatacenter(pool, selectedSlot)
+		slotCopy.Datacenter = ResolveMachineConfigPoolDatacenter(pool, selectedSlot)
 	}
 
 	return &slotCopy, nil
@@ -410,7 +410,7 @@ func ReleaseSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectRef
 		return nil
 	}
 
-	pool := &infrav1.VSphereResourcePool{}
+	pool := &infrav1.VSphereMachineConfigPool{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -419,15 +419,15 @@ func ReleaseSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectRef
 	}
 
 	found := false
-	for i, s := range pool.Status.ResourceStatuses {
+	for i, s := range pool.Status.ConfigStatuses {
 		if s.MachineRef != nil && s.MachineRef.Name == machineRef.Name && s.MachineRef.Namespace == machineRef.Namespace {
 			if machineRef.UID != "" && s.MachineRef.UID != "" && s.MachineRef.UID != machineRef.UID {
 				continue
 			}
-			if pool.Status.ResourceStatuses[i].State != "Released" {
-				pool.Status.ResourceStatuses[i].State = "Released"
+			if pool.Status.ConfigStatuses[i].State != infrav1.MachineConfigSlotStateReleased {
+				pool.Status.ConfigStatuses[i].State = infrav1.MachineConfigSlotStateReleased
 				now := metav1.Now()
-				pool.Status.ResourceStatuses[i].LastReleasedTime = &now
+				pool.Status.ConfigStatuses[i].LastReleasedTime = &now
 				found = true
 			}
 			break
@@ -446,17 +446,17 @@ func ReleaseSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectRef
 }
 
 // GetSlotForMachine returns the slot currently assigned to the machine.
-func GetSlotForMachine(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machineRef *corev1.ObjectReference) (*infrav1.ResourceSlot, error) {
+func GetSlotForMachine(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, machineRef *corev1.ObjectReference) (*infrav1.MachineConfigSlot, error) {
 	if poolRef == nil || machineRef == nil {
 		return nil, nil
 	}
 
-	pool := &infrav1.VSphereResourcePool{}
+	pool := &infrav1.VSphereMachineConfigPool{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
 		return nil, err
 	}
 
-	for _, status := range pool.Status.ResourceStatuses {
+	for _, status := range pool.Status.ConfigStatuses {
 		if status.MachineRef == nil {
 			continue
 		}
@@ -472,20 +472,20 @@ func GetSlotForMachine(ctx context.Context, c client.Client, poolRef *corev1.Obj
 	return nil, nil
 }
 
-// FindResourcePoolForMachine returns the pool currently holding the machine's slot assignment.
-func FindResourcePoolForMachine(ctx context.Context, c client.Client, namespace string, machineRef *corev1.ObjectReference) (*corev1.ObjectReference, error) {
+// FindMachineConfigPoolForMachine returns the pool currently holding the machine's slot assignment.
+func FindMachineConfigPoolForMachine(ctx context.Context, c client.Client, namespace string, machineRef *corev1.ObjectReference) (*corev1.ObjectReference, error) {
 	if machineRef == nil {
 		return nil, nil
 	}
 
-	pools := &infrav1.VSphereResourcePoolList{}
+	pools := &infrav1.VSphereMachineConfigPoolList{}
 	if err := c.List(ctx, pools, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 
 	for i := range pools.Items {
 		pool := &pools.Items[i]
-		for _, status := range pool.Status.ResourceStatuses {
+		for _, status := range pool.Status.ConfigStatuses {
 			if status.MachineRef == nil {
 				continue
 			}
@@ -508,17 +508,17 @@ func FindResourcePoolForMachine(ctx context.Context, c client.Client, namespace 
 // ApplyDiskBackfill updates persistent disk metadata (UnitNumber, VolumePath,
 // DiskUUID) in pool.Spec for the slot matching updatedSlot.Hostname.  Returns
 // true if any field was changed.
-func ApplyDiskBackfill(pool *infrav1.VSphereResourcePool, updatedSlot *infrav1.ResourceSlot) bool {
+func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infrav1.MachineConfigSlot) bool {
 	if pool == nil || updatedSlot == nil {
 		return false
 	}
 	updated := false
-	for i := range pool.Spec.Resources {
-		if pool.Spec.Resources[i].Hostname != updatedSlot.Hostname {
+	for i := range pool.Spec.Configs {
+		if pool.Spec.Configs[i].Hostname != updatedSlot.Hostname {
 			continue
 		}
-		for j := range pool.Spec.Resources[i].PersistentDisks {
-			pdInSpec := &pool.Spec.Resources[i].PersistentDisks[j]
+		for j := range pool.Spec.Configs[i].PersistentDisks {
+			pdInSpec := &pool.Spec.Configs[i].PersistentDisks[j]
 			for _, updatedDisk := range updatedSlot.PersistentDisks {
 				if pdInSpec.Name != updatedDisk.Name {
 					continue
@@ -552,13 +552,13 @@ func ApplyDiskBackfill(pool *infrav1.VSphereResourcePool, updatedSlot *infrav1.R
 	return updated
 }
 
-// PersistSlotChanges updates the VSphereResourcePool Spec with the backfilled slot information.
-func PersistSlotChanges(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, updatedSlot *infrav1.ResourceSlot) error {
+// PersistSlotChanges updates the VSphereMachineConfigPool Spec with the backfilled slot information.
+func PersistSlotChanges(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, updatedSlot *infrav1.MachineConfigSlot) error {
 	if poolRef == nil || updatedSlot == nil {
 		return nil
 	}
 
-	pool := &infrav1.VSphereResourcePool{}
+	pool := &infrav1.VSphereMachineConfigPool{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
 		return err
 	}
@@ -574,4 +574,3 @@ func PersistSlotChanges(ctx context.Context, c client.Client, poolRef *corev1.Ob
 	}
 	return nil
 }
-

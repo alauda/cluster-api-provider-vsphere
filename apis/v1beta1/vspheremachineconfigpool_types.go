@@ -1,0 +1,283 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1beta1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+)
+
+// VSphereMachineConfigPoolSpec defines the desired state of VSphereMachineConfigPool.
+type VSphereMachineConfigPoolSpec struct {
+	// ClusterRef references the CAPI Cluster (in the same namespace) whose
+	// VSphereCluster provides vCenter server, thumbprint, and credential
+	// chain (IdentityRef) for this pool's vCenter operations (e.g. disk
+	// reclaim). Required. Can only be changed when consumerRef is nil.
+	// The pool will not reconcile until the referenced Cluster and its
+	// VSphereCluster infrastructure are available.
+	ClusterRef corev1.ObjectReference `json:"clusterRef"`
+
+	// Datacenter is the default vSphere datacenter for slots in this pool.
+	// It is used when a slot does not define its own Datacenter.
+	// +optional
+	Datacenter string `json:"datacenter,omitempty"`
+
+	// Configs is the list of pre-defined machine configuration slots.
+	Configs []MachineConfigSlot `json:"configs"`
+
+	// ReleaseDelayHours is the time to wait before marking a released slot as "Available" for any machine.
+	// During this period, the slot can only be reused if specifically requested or via priority reuse.
+	// Default is 24.
+	// +optional
+	ReleaseDelayHours *int `json:"releaseDelayHours,omitempty"`
+}
+
+// MachineConfigSlot defines a single machine configuration slot in the pool.
+type MachineConfigSlot struct {
+	// Hostname is the unique identifier for this slot and will be assigned to the VM.
+	// It must also be a valid Kubernetes node name because CAPV uses it for
+	// kubeadm nodeRegistration.name and the kubelet serving certificate DNS SAN.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Hostname string `json:"hostname"`
+
+	// Datacenter is the vSphere datacenter for this slot.
+	// If set, it takes precedence over VSphereMachineConfigPool.spec.datacenter.
+	// If unset, the pool-level Datacenter acts as the default.
+	// +optional
+	Datacenter string `json:"datacenter,omitempty"`
+
+	// Network describes the primary and additional network configurations for this slot.
+	// +optional
+	Network *MachineConfigSlotNetwork `json:"network,omitempty"`
+
+	// PersistentDisks that survive VM deletion.
+	// +optional
+	PersistentDisks []PersistentDisk `json:"persistentDisks,omitempty"`
+}
+
+// MachineConfigSlotNetwork defines the primary and additional network configurations for a slot.
+type MachineConfigSlotNetwork struct {
+	// Primary is the network configuration used for kubelet node IP registration.
+	Primary NetworkConfig `json:"primary"`
+
+	// Additional are the remaining network configurations attached after the primary device.
+	// +optional
+	Additional []NetworkConfig `json:"additional,omitempty"`
+}
+
+// NetworkConfig defines the network configuration for a slot device.
+type NetworkConfig struct {
+	// NetworkName is the name of the vSphere network (PortGroup or DVPortGroup).
+	NetworkName string `json:"networkName"`
+
+	// DeviceName explicitly assigns a guest OS interface name to the network device.
+	// +optional
+	DeviceName string `json:"deviceName,omitempty"`
+
+	// IPv4 configuration
+	// +optional
+	IP string `json:"ip,omitempty"`
+	// +optional
+	Gateway string `json:"gateway,omitempty"`
+
+	// IPv6 configuration
+	// +optional
+	IPv6 string `json:"ipv6,omitempty"`
+	// +optional
+	IPv6Gateway string `json:"ipv6Gateway,omitempty"`
+
+	// DNS nameservers
+	// +optional
+	DNS []string `json:"dns,omitempty"`
+}
+
+// PersistentDisk defines a disk that survives VM deletion.
+type PersistentDisk struct {
+	// Name is the disk name.
+	Name string `json:"name"`
+	// SizeGiB is the disk size.
+	SizeGiB int32 `json:"sizeGiB"`
+	// Datastore is the vSphere datastore name.
+	// +optional
+	Datastore string `json:"datastore,omitempty"`
+	// StoragePolicy is the vSphere storage policy name.
+	// +optional
+	StoragePolicy string `json:"storagePolicy,omitempty"`
+
+	// UnitNumber is the SCSI unit number for the disk (0-15, excluding 7).
+	// This ensures consistent disk ordering across VM recreations.
+	// +optional
+	UnitNumber *int32 `json:"unitNumber,omitempty"`
+
+	// MountPath is the mount path inside the VM guest OS (e.g., "/var/lib/etcd").
+	// +optional
+	MountPath string `json:"mountPath,omitempty"`
+
+	// MountOptions for the filesystem mount.
+	// +optional
+	MountOptions []string `json:"mountOptions,omitempty"`
+
+	// FSFormat is the filesystem format (default "ext4").
+	// +optional
+	FSFormat string `json:"fsFormat,omitempty"`
+
+	// WipeFilesystem controls whether to wipe the filesystem content when the
+	// slot is reused by a new VM. When true, the disk content is cleared on
+	// the first boot of a new VM (reboots and manual service restarts are not
+	// affected). Defaults to false (data is preserved across VM recreations).
+	// +optional
+	WipeFilesystem *bool `json:"wipeFilesystem,omitempty"`
+
+	// VolumePath is backfilled by the controller after the disk is created.
+	// For vSphere, this is usually the datastore path to the .vmdk file.
+	// +optional
+	VolumePath string `json:"volumePath,omitempty"`
+
+	// DiskUUID is backfilled by the controller.
+	// +optional
+	DiskUUID string `json:"diskUUID,omitempty"`
+}
+
+// VSphereMachineConfigPoolStatus defines the observed state of VSphereMachineConfigPool.
+type VSphereMachineConfigPoolStatus struct {
+	// ConfigStatuses tracks the state of each slot.
+	// +optional
+	ConfigStatuses []MachineConfigSlotStatus `json:"configStatuses,omitempty"`
+
+	// ConsumerRef is the workload controller (KubeadmControlPlane or MachineDeployment)
+	// currently bound to this pool. Set automatically by the controller when a machine
+	// allocates a slot. Cleared when the pool becomes fully reusable.
+	// +optional
+	ConsumerRef *corev1.ObjectReference `json:"consumerRef,omitempty"`
+
+	// Conditions defines current state of the machine config pool.
+	// +optional
+	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+}
+
+// MachineConfigSlotState describes the allocation state of a slot.
+type MachineConfigSlotState string
+
+const (
+	// MachineConfigSlotStateAvailable means the slot is free for allocation.
+	MachineConfigSlotStateAvailable MachineConfigSlotState = "Available"
+	// MachineConfigSlotStateInUse means the slot is currently bound to a VSphereMachine.
+	MachineConfigSlotStateInUse MachineConfigSlotState = "InUse"
+	// MachineConfigSlotStateReleased means the slot's machine is gone and the
+	// slot is waiting out the release delay before its persistent resources
+	// are reclaimed and it transitions back to Available.
+	MachineConfigSlotStateReleased MachineConfigSlotState = "Released"
+)
+
+// MachineConfigSlotReclaimState describes the lifecycle of an in-flight reclaim task.
+type MachineConfigSlotReclaimState string
+
+const (
+	// MachineConfigSlotReclaimStateRunning means a vCenter reclaim task is currently in flight.
+	MachineConfigSlotReclaimStateRunning MachineConfigSlotReclaimState = "Running"
+	// MachineConfigSlotReclaimStateFailed means the last reclaim task failed and
+	// the controller is waiting out RetryAfter before the next attempt.
+	MachineConfigSlotReclaimStateFailed MachineConfigSlotReclaimState = "Failed"
+	// MachineConfigSlotReclaimStateCompleted means the slot's persistent resources
+	// have been reclaimed successfully.
+	MachineConfigSlotReclaimStateCompleted MachineConfigSlotReclaimState = "Completed"
+)
+
+// MachineConfigSlotStatus tracks the state of a single slot.
+type MachineConfigSlotStatus struct {
+	// Hostname matches the Hostname in the Spec.
+	Hostname string `json:"hostname"`
+
+	// State is the allocation state of the slot.
+	// +kubebuilder:validation:Enum=Available;InUse;Released
+	State MachineConfigSlotState `json:"state"`
+
+	// MachineRef is the reference to the Machine currently using this slot.
+	// +optional
+	MachineRef *corev1.ObjectReference `json:"machineRef,omitempty"`
+
+	// LastReleasedTime is the timestamp when the slot transitioned to Released.
+	// +optional
+	LastReleasedTime *metav1.Time `json:"lastReleasedTime,omitempty"`
+
+	// ReclaimStatus tracks asynchronous reclaim progress for this slot.
+	// +optional
+	ReclaimStatus *MachineConfigSlotReclaimStatus `json:"reclaimStatus,omitempty"`
+}
+
+// MachineConfigSlotReclaimStatus tracks async reclaim state for a slot.
+type MachineConfigSlotReclaimStatus struct {
+	// TaskRef tracks the in-flight vCenter reclaim task for this slot.
+	// +optional
+	TaskRef string `json:"taskRef,omitempty"`
+
+	// State tracks the lifecycle of the reclaim task.
+	// +kubebuilder:validation:Enum=Running;Failed;Completed
+	// +optional
+	State MachineConfigSlotReclaimState `json:"state,omitempty"`
+
+	// VolumePath tracks the persistent disk currently being reclaimed.
+	// +optional
+	VolumePath string `json:"volumePath,omitempty"`
+
+	// RetryAfter prevents tight retry loops after reclaim task failures.
+	// +optional
+	RetryAfter *metav1.Time `json:"retryAfter,omitempty"`
+
+	// LastError stores the latest reclaim task failure.
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:path=vspheremachineconfigpools,scope=Namespaced,categories=cluster-api
+
+// VSphereMachineConfigPool is the Schema for the vspheremachineconfigpools API.
+type VSphereMachineConfigPool struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   VSphereMachineConfigPoolSpec   `json:"spec,omitempty"`
+	Status VSphereMachineConfigPoolStatus `json:"status,omitempty"`
+}
+
+// GetConditions returns the conditions for a VSphereMachineConfigPool.
+func (r *VSphereMachineConfigPool) GetConditions() clusterv1.Conditions {
+	return r.Status.Conditions
+}
+
+// SetConditions sets the conditions on a VSphereMachineConfigPool.
+func (r *VSphereMachineConfigPool) SetConditions(conditions clusterv1.Conditions) {
+	r.Status.Conditions = conditions
+}
+
+// +kubebuilder:object:root=true
+
+// VSphereMachineConfigPoolList contains a list of VSphereMachineConfigPool.
+type VSphereMachineConfigPoolList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []VSphereMachineConfigPool `json:"items"`
+}
+
+func init() {
+	objectTypes = append(objectTypes, &VSphereMachineConfigPool{}, &VSphereMachineConfigPoolList{})
+}

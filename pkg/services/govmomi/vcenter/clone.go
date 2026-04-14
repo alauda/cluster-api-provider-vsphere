@@ -63,10 +63,10 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 		VSphereVM:                vmCtx.VSphereVM,
 		Session:                  vmCtx.Session,
 		PatchHelper:              vmCtx.PatchHelper,
-		ResourceSlot:             vmCtx.ResourceSlot,
+		MachineConfigSlot:        vmCtx.MachineConfigSlot,
 	}
 	log.Info("Starting clone process")
-	log.Info("Clone received bootstrap payload", "format", string(format), "bootstrapBytes", len(bootstrapData), "hasResourceSlot", vmCtx.ResourceSlot != nil)
+	log.Info("Clone received bootstrap payload", "format", string(format), "bootstrapBytes", len(bootstrapData), "hasMachineConfigSlot", vmCtx.MachineConfigSlot != nil)
 
 	var extraConfig extra.Config
 	if len(bootstrapData) > 0 {
@@ -80,8 +80,8 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 	}
 	if format == bootstrapv1.CloudConfig {
 		hostname := vmCtx.VSphereVM.Name
-		if vmCtx.ResourceSlot != nil {
-			hostname = vmCtx.ResourceSlot.Hostname
+		if vmCtx.MachineConfigSlot != nil {
+			hostname = vmCtx.MachineConfigSlot.Hostname
 		}
 		metadata, err := util.GetMachineMetadata(hostname, *vmCtx.VSphereVM, nil, nil)
 		if err != nil {
@@ -466,12 +466,12 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 	for i, dataDisk := range vmCtx.VSphereVM.Spec.DataDisks {
 		log.V(2).Info("Adding disk", "name", dataDisk.Name, "spec", dataDisk)
 
-		// ADDITION: Check for persistent disk in ResourceSlot
+		// ADDITION: Check for persistent disk in MachineConfigSlot
 		var pd *infrav1.PersistentDisk
-		if vmCtx.ResourceSlot != nil {
-			for j := range vmCtx.ResourceSlot.PersistentDisks {
-				if vmCtx.ResourceSlot.PersistentDisks[j].Name == dataDisk.Name {
-					pd = &vmCtx.ResourceSlot.PersistentDisks[j]
+		if vmCtx.MachineConfigSlot != nil {
+			for j := range vmCtx.MachineConfigSlot.PersistentDisks {
+				if vmCtx.MachineConfigSlot.PersistentDisks[j].Name == dataDisk.Name {
+					pd = &vmCtx.MachineConfigSlot.PersistentDisks[j]
 					break
 				}
 			}

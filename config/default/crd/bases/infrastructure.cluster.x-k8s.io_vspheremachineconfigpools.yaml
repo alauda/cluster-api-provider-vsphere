@@ -4,22 +4,22 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.0
-  name: vsphereresourcepools.infrastructure.cluster.x-k8s.io
+  name: vspheremachineconfigpools.infrastructure.cluster.x-k8s.io
 spec:
   group: infrastructure.cluster.x-k8s.io
   names:
     categories:
     - cluster-api
-    kind: VSphereResourcePool
-    listKind: VSphereResourcePoolList
-    plural: vsphereresourcepools
-    singular: vsphereresourcepool
+    kind: VSphereMachineConfigPool
+    listKind: VSphereMachineConfigPoolList
+    plural: vspheremachineconfigpools
+    singular: vspheremachineconfigpool
   scope: Namespaced
   versions:
   - name: v1beta1
     schema:
       openAPIV3Schema:
-        description: VSphereResourcePool is the Schema for the vsphereresourcepools
+        description: VSphereMachineConfigPool is the Schema for the vspheremachineconfigpools
           API.
         properties:
           apiVersion:
@@ -40,7 +40,8 @@ spec:
           metadata:
             type: object
           spec:
-            description: VSphereResourcePoolSpec defines the desired state of VSphereResourcePool.
+            description: VSphereMachineConfigPoolSpec defines the desired state of
+              VSphereMachineConfigPool.
             properties:
               clusterRef:
                 description: |-
@@ -91,37 +92,27 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
-              datacenter:
-                description: |-
-                  Datacenter is the default vSphere datacenter for slots in this pool.
-                  It is used when a slot does not define its own Datacenter.
-                type: string
-              releaseDelayHours:
-                description: |-
-                  ReleaseDelayHours is the time to wait before marking a released slot as "Available" for any machine.
-                  During this period, the slot can only be reused if specifically requested or via priority reuse.
-                  Default is 24.
-                type: integer
-              resources:
-                description: Resources is the list of pre-defined resource slots.
+              configs:
+                description: Configs is the list of pre-defined machine configuration
+                  slots.
                 items:
-                  description: ResourceSlot defines a single resource slot in the
-                    pool.
+                  description: MachineConfigSlot defines a single machine configuration
+                    slot in the pool.
                   properties:
                     datacenter:
                       description: |-
                         Datacenter is the vSphere datacenter for this slot.
-                        If set, it takes precedence over VSphereResourcePool.spec.datacenter.
+                        If set, it takes precedence over VSphereMachineConfigPool.spec.datacenter.
                         If unset, the pool-level Datacenter acts as the default.
                       type: string
                     hostname:
-                      description: Hostname is the unique identifier for this slot
-                        and will be assigned to the VM. It must also be a valid
-                        Kubernetes node name because CAPV uses it for kubeadm nodeRegistration.name
-                        and the kubelet serving certificate DNS SAN.
+                      description: |-
+                        Hostname is the unique identifier for this slot and will be assigned to the VM.
+                        It must also be a valid Kubernetes node name because CAPV uses it for
+                        kubeadm nodeRegistration.name and the kubelet serving certificate DNS SAN.
                       maxLength: 253
                       minLength: 1
-                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                       type: string
                     network:
                       description: Network describes the primary and additional network
@@ -257,15 +248,28 @@ spec:
                   - hostname
                   type: object
                 type: array
+              datacenter:
+                description: |-
+                  Datacenter is the default vSphere datacenter for slots in this pool.
+                  It is used when a slot does not define its own Datacenter.
+                type: string
+              releaseDelayHours:
+                description: |-
+                  ReleaseDelayHours is the time to wait before marking a released slot as "Available" for any machine.
+                  During this period, the slot can only be reused if specifically requested or via priority reuse.
+                  Default is 24.
+                type: integer
             required:
             - clusterRef
-            - resources
+            - configs
             type: object
           status:
-            description: VSphereResourcePoolStatus defines the observed state of VSphereResourcePool.
+            description: VSphereMachineConfigPoolStatus defines the observed state
+              of VSphereMachineConfigPool.
             properties:
               conditions:
-                description: Conditions defines current state of the resource pool.
+                description: Conditions defines current state of the machine config
+                  pool.
                 items:
                   description: Condition defines an observation of a Cluster API resource
                     operational state.
@@ -316,56 +320,11 @@ spec:
                   - type
                   type: object
                 type: array
-              consumerRef:
-                description: |-
-                  ConsumerRef is the workload controller (KubeadmControlPlane or MachineDeployment)
-                  currently bound to this pool. Set automatically by the controller when a machine
-                  allocates a slot. Cleared when the pool becomes fully reusable.
-                properties:
-                  apiVersion:
-                    description: API version of the referent.
-                    type: string
-                  fieldPath:
-                    description: |-
-                      If referring to a piece of an object instead of an entire object, this string
-                      should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2].
-                      For example, if the object reference is to a container within a pod, this would take on a value like:
-                      "spec.containers{name}" (where "name" refers to the name of the container that triggered
-                      the event) or if no container name is specified "spec.containers[2]" (container with
-                      index 2 in this pod). This syntax is chosen only to have some well-defined way of
-                      referencing a part of an object.
-                    type: string
-                  kind:
-                    description: |-
-                      Kind of the referent.
-                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-                    type: string
-                  name:
-                    description: |-
-                      Name of the referent.
-                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                    type: string
-                  namespace:
-                    description: |-
-                      Namespace of the referent.
-                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
-                    type: string
-                  resourceVersion:
-                    description: |-
-                      Specific resourceVersion to which this reference is made, if any.
-                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency
-                    type: string
-                  uid:
-                    description: |-
-                      UID of the referent.
-                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
-                    type: string
-                type: object
-                x-kubernetes-map-type: atomic
-              resourceStatuses:
-                description: ResourceStatuses tracks the state of each slot.
+              configStatuses:
+                description: ConfigStatuses tracks the state of each slot.
                 items:
-                  description: ResourceSlotStatus tracks the state of a single slot.
+                  description: MachineConfigSlotStatus tracks the state of a single
+                    slot.
                   properties:
                     hostname:
                       description: Hostname matches the Hostname in the Spec.
@@ -433,6 +392,10 @@ spec:
                           type: string
                         state:
                           description: State tracks the lifecycle of the reclaim task.
+                          enum:
+                          - Running
+                          - Failed
+                          - Completed
                           type: string
                         taskRef:
                           description: TaskRef tracks the in-flight vCenter reclaim
@@ -444,13 +407,63 @@ spec:
                           type: string
                       type: object
                     state:
-                      description: 'State can be: Available, InUse, Released'
+                      description: State is the allocation state of the slot.
+                      enum:
+                      - Available
+                      - InUse
+                      - Released
                       type: string
                   required:
                   - hostname
                   - state
                   type: object
                 type: array
+              consumerRef:
+                description: |-
+                  ConsumerRef is the workload controller (KubeadmControlPlane or MachineDeployment)
+                  currently bound to this pool. Set automatically by the controller when a machine
+                  allocates a slot. Cleared when the pool becomes fully reusable.
+                properties:
+                  apiVersion:
+                    description: API version of the referent.
+                    type: string
+                  fieldPath:
+                    description: |-
+                      If referring to a piece of an object instead of an entire object, this string
+                      should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2].
+                      For example, if the object reference is to a container within a pod, this would take on a value like:
+                      "spec.containers{name}" (where "name" refers to the name of the container that triggered
+                      the event) or if no container name is specified "spec.containers[2]" (container with
+                      index 2 in this pod). This syntax is chosen only to have some well-defined way of
+                      referencing a part of an object.
+                    type: string
+                  kind:
+                    description: |-
+                      Kind of the referent.
+                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                    type: string
+                  name:
+                    description: |-
+                      Name of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+                    type: string
+                  resourceVersion:
+                    description: |-
+                      Specific resourceVersion to which this reference is made, if any.
+                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency
+                    type: string
+                  uid:
+                    description: |-
+                      UID of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
             type: object
         type: object
     served: true

@@ -1,4 +1,4 @@
-# Proposal: Resource Pool for CAPV
+# Proposal: Machine Config Pool for CAPV
 
 ## Goals
 1. Provide a mechanism to assign fixed IP addresses, hostnames, and persistent disks to VMs in CAPV.
@@ -8,19 +8,19 @@
 
 ## CRD Definitions
 
-### VSphereResourcePool
-The `VSphereResourcePool` defines a pool of "slots", where each slot contains a fixed IP, hostname, and a set of persistent disks.
+### VSphereMachineConfigPool
+The `VSphereMachineConfigPool` defines a pool of "slots", where each slot contains a fixed IP, hostname, and a set of persistent disks.
 
 ```go
-type VSphereResourcePool struct {
+type VSphereMachineConfigPool struct {
     metav1.TypeMeta   `json:",inline"`
     metav1.ObjectMeta `json:"metadata,omitempty"`
 
-    Spec   VSphereResourcePoolSpec   `json:"spec,omitempty"`
-    Status VSphereResourcePoolStatus `json:"status,omitempty"`
+    Spec   VSphereMachineConfigPoolSpec   `json:"spec,omitempty"`
+    Status VSphereMachineConfigPoolStatus `json:"status,omitempty"`
 }
 
-type VSphereResourcePoolSpec struct {
+type VSphereMachineConfigPoolSpec struct {
     // ClusterRef references the CAPI Cluster (in the same namespace) whose
     // VSphereCluster provides vCenter server, thumbprint, and credential
     // chain (IdentityRef) for this pool's vCenter operations (e.g. disk
@@ -33,40 +33,34 @@ type VSphereResourcePoolSpec struct {
     // It is used when a slot does not define its own Datacenter.
     Datacenter string `json:"datacenter,omitempty"`
 
-    // Resources is the list of pre-defined resource slots.
-    Resources []ResourceSlot `json:"resources"`
+    // Configs is the list of pre-defined machine config slots.
+    Configs []MachineConfigSlot `json:"configs"`
     
     // ReleaseDelayHours is the time to wait before marking a released slot as "Available" for any machine.
     // During this period, the slot can only be reused if specifically requested or via priority reuse.
     // Default is 24.
     ReleaseDelayHours *int `json:"releaseDelayHours,omitempty"`
-
-    // ConsumerRef is the single workload controller currently allowed to consume this pool.
-    // Supported kinds are KubeadmControlPlane and MachineDeployment.
-    // This is a logical binding only. It must not be translated into ownerReferences
-    // and must not imply cascading delete semantics.
-    ConsumerRef *corev1.ObjectReference `json:"consumerRef,omitempty"`
 }
 
-type ResourceSlot struct {
+type MachineConfigSlot struct {
     // Hostname is the unique identifier for this slot and will be assigned to the VM.
     // It must also be a valid Kubernetes node name because CAPV uses it for
     // kubeadm nodeRegistration.name and the kubelet serving certificate DNS SAN.
     Hostname string `json:"hostname"`
 
     // Datacenter is the vSphere datacenter for this slot.
-    // If set, it takes precedence over VSphereResourcePool.spec.datacenter.
+    // If set, it takes precedence over VSphereMachineConfigPool.spec.datacenter.
     // If unset, the pool-level Datacenter acts as the default.
     Datacenter string `json:"datacenter,omitempty"`
     
     // Network describes the primary and additional network configurations for this slot.
-    Network *ResourceSlotNetwork `json:"network,omitempty"`
+    Network *MachineConfigSlotNetwork `json:"network,omitempty"`
     
     // PersistentDisks that survive VM deletion.
     PersistentDisks []PersistentDisk `json:"persistentDisks,omitempty"`
 }
 
-type ResourceSlotNetwork struct {
+type MachineConfigSlotNetwork struct {
     // Primary is the network configuration used for kubelet node IP registration.
     Primary NetworkConfig `json:"primary"`
 
@@ -138,18 +132,25 @@ type PersistentDisk struct {
     DiskUUID string `json:"diskUUID,omitempty"`
 }
 
-type VSphereResourcePoolStatus struct {
-    // ResourceStatuses tracks the state of each slot.
-    ResourceStatuses []ResourceSlotStatus `json:"resourceStatuses,omitempty"`
+type VSphereMachineConfigPoolStatus struct {
+    // ConfigStatuses tracks the state of each slot.
+    ConfigStatuses []MachineConfigSlotStatus `json:"configStatuses,omitempty"`
 
-    // Conditions defines current state of the resource pool.
+    // ConsumerRef is the single workload controller currently bound to this pool.
+    // Supported kinds are KubeadmControlPlane and MachineDeployment. It is set by the
+    // controller when a machine first allocates a slot, and cleared when the pool
+    // becomes fully reusable. This is a logical binding only. It must not be
+    // translated into ownerReferences and must not imply cascading delete semantics.
+    ConsumerRef *corev1.ObjectReference `json:"consumerRef,omitempty"`
+
+    // Conditions defines current state of the machine config pool.
     // Supported condition types:
     //   - ClusterRefReady: the referenced Cluster and VSphereCluster are found and available.
     //   - VCenterAvailable: vCenter credentials can be resolved and a session can be established.
     Conditions clusterv1.Conditions `json:"conditions,omitempty"`
 }
 
-type ResourceSlotStatus struct {
+type MachineConfigSlotStatus struct {
     // Hostname matches the Hostname in the Spec.
     Hostname string `json:"hostname"`
     
@@ -163,10 +164,10 @@ type ResourceSlotStatus struct {
     LastReleasedTime *metav1.Time `json:"lastReleasedTime,omitempty"`
 
     // ReclaimStatus tracks asynchronous reclaim progress for this slot.
-    ReclaimStatus *ResourceSlotReclaimStatus `json:"reclaimStatus,omitempty"`
+    ReclaimStatus *MachineConfigSlotReclaimStatus `json:"reclaimStatus,omitempty"`
 }
 
-type ResourceSlotReclaimStatus struct {
+type MachineConfigSlotReclaimStatus struct {
     // TaskRef tracks the in-flight vCenter reclaim task for this slot.
     TaskRef string `json:"taskRef,omitempty"`
 
@@ -185,26 +186,26 @@ type ResourceSlotReclaimStatus struct {
 ```
 
 ### VSphereMachine
-The `VSphereMachineSpec` will be extended to support referencing a resource pool.
+The `VSphereMachineSpec` will be extended to support referencing a machine config pool.
 
 ```go
 type VSphereMachineSpec struct {
     // ... existing fields ...
 
-    // ResourcePoolRef is a reference to a VSphereResourcePool to use for this machine.
+    // MachineConfigPoolRef is a reference to a VSphereMachineConfigPool to use for this machine.
     // +optional
-    ResourcePoolRef *corev1.ObjectReference `json:"resourcePoolRef,omitempty"`
+    MachineConfigPoolRef *corev1.ObjectReference `json:"machineConfigPoolRef,omitempty"`
 }
 ```
 
 ## Consumer Binding Model
 
-`VSphereResourcePool` is intended to be consumed by exactly one workload controller at a time:
+`VSphereMachineConfigPool` is intended to be consumed by exactly one workload controller at a time:
 
 - one `KubeadmControlPlane`, or
 - one `MachineDeployment`
 
-This relationship is modeled by `VSphereResourcePool.spec.consumerRef`.
+This relationship is modeled by `VSphereMachineConfigPool.status.consumerRef`.
 
 Important semantics:
 
@@ -216,7 +217,7 @@ Important semantics:
 
 ### Allowed Reference Shape
 
-`spec.consumerRef` reuses `corev1.ObjectReference` and is constrained as follows:
+`status.consumerRef` reuses `corev1.ObjectReference` and is constrained as follows:
 
 - `APIVersion` must be one of:
   - `controlplane.cluster.x-k8s.io/v1beta1`
@@ -224,7 +225,7 @@ Important semantics:
 - `Kind` must be one of:
   - `KubeadmControlPlane`
   - `MachineDeployment`
-- `Namespace` may be omitted (defaults to the `VSphereResourcePool` namespace). If explicitly set, it must equal the pool namespace. Cross-namespace consumer references are not supported.
+- `Namespace` may be omitted (defaults to the `VSphereMachineConfigPool` namespace). If explicitly set, it must equal the pool namespace. Cross-namespace consumer references are not supported.
 - `Name` must be non-empty.
 - CAPV may read `UID` when present, but the primary identity for admission and lookup remains `APIVersion/Kind/Namespace/Name`.
 
@@ -234,14 +235,14 @@ Important semantics:
 - If `consumerRef` is set, only `VSphereMachine` objects belonging to that consumer may allocate slots from the pool.
 - If the referenced consumer still exists, the binding remains active.
 - If the referenced consumer has been deleted, CAPV must keep the binding until all slots in the pool are fully reusable.
-- "Fully reusable" means CAPV can infer from `status.resourceStatuses` and `spec.resources` that:
+- "Fully reusable" means CAPV can infer from `status.configStatuses` and `spec.configs` that:
   - every slot status is either absent or `Available`
   - no slot is `InUse`
   - no slot is `Released`
   - no slot has an in-flight reclaim task in `reclaimStatus.taskRef`
   - no slot has a failed reclaim retry window in `reclaimStatus.retryAfter`
-  - no slot still has reclaimable persistent-disk backing in `spec.resources[].persistentDisks[].volumePath`
-- Only after all slots are fully reusable may CAPV clear `spec.consumerRef`.
+  - no slot still has reclaimable persistent-disk backing in `spec.configs[].persistentDisks[].volumePath`
+- Only after all slots are fully reusable may CAPV clear `status.consumerRef`.
 - This prevents a newly bound consumer from racing with release/reclaim work still belonging to the previous consumer.
 
 ### Rebinding
@@ -256,34 +257,34 @@ Important semantics:
 - Admission validates whether that declaration is compatible with the current pool state.
 - The actual binding is established by CAPV controller logic, not by webhook mutation and not by slot allocation.
 - CAPV establishes the binding when the first `VSphereMachine` for that consumer reconciles and attempts to use the pool.
-- Binding must use optimistic concurrency on `VSphereResourcePool.metadata.resourceVersion`.
+- Binding must use optimistic concurrency on `VSphereMachineConfigPool.metadata.resourceVersion`.
   If two consumers race for the same unbound pool:
   - both may pass webhook validation when `consumerRef` is still empty
-  - only one controller update may successfully write `spec.consumerRef`
+  - only one controller update may successfully write `status.consumerRef`
   - the loser must re-read the pool, detect that it is now bound to another consumer, and fail
-- Therefore, configuration reference is not equivalent to a successful binding. The source of truth for the active binding is `VSphereResourcePool.spec.consumerRef`.
+- Therefore, configuration reference is not equivalent to a successful binding. The source of truth for the active binding is `VSphereMachineConfigPool.status.consumerRef`.
 
 ### Mutability Rules
 
-- `spec.consumerRef` may be added to an unbound pool.
-- `spec.consumerRef` may be cleared (by CAPV controller or manually) only after the previous consumer no longer exists and the pool is fully reusable.
-- Clearing `spec.consumerRef` is rejected while the referenced consumer still exists or while the pool is not fully reusable.
+- `status.consumerRef` may be added to an unbound pool.
+- `status.consumerRef` may be cleared (by CAPV controller or manually) only after the previous consumer no longer exists and the pool is fully reusable.
+- Clearing `status.consumerRef` is rejected while the referenced consumer still exists or while the pool is not fully reusable.
 - User-initiated rebinding from one consumer to another should be rejected unless the pool is already unbound.
-- `spec.resources[*].hostname` should remain immutable after creation.
-- `spec.resources[*].network` and `spec.resources[*].persistentDisks` remain declarative inputs, except for controller-managed backfill fields such as `volumePath`, `diskUUID`, and `unitNumber`.
+- `spec.configs[*].hostname` should remain immutable after creation.
+- `spec.configs[*].network` and `spec.configs[*].persistentDisks` remain declarative inputs, except for controller-managed backfill fields such as `volumePath`, `diskUUID`, and `unitNumber`.
 
 ## Workflow
 
 ### 1. Machine Provisioning
-When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
-- The CAPV controller (or a dedicated pool controller) looks for a `ResourceSlot` in the pool.
+When a `VSphereMachine` is created and it references a `VSphereMachineConfigPool`:
+- The CAPV controller (or a dedicated pool controller) looks for a `MachineConfigSlot` in the pool.
 - Before slot selection, CAPV validates that the machine is allowed to consume the referenced pool:
-    - If `VSphereResourcePool.spec.consumerRef` is set, the machine's effective consumer must match it.
+    - If `VSphereMachineConfigPool.status.consumerRef` is set, the machine's effective consumer must match it.
     - Effective consumer is derived from the machine owner chain:
       - control-plane machines resolve to their `KubeadmControlPlane`
       - worker machines resolve to their `MachineDeployment`
     - If the effective consumer does not match the pool `consumerRef`, reconciliation fails.
-- If `VSphereResourcePool.spec.consumerRef` is empty, CAPV attempts to bind the pool to the machine's effective consumer using optimistic concurrency on the pool `resourceVersion`.
+- If `VSphereMachineConfigPool.status.consumerRef` is empty, CAPV attempts to bind the pool to the machine's effective consumer using optimistic concurrency on the pool `resourceVersion`.
   - If the update succeeds, the machine may continue allocation.
   - If the update conflicts, CAPV re-reads the pool.
   - If the pool is now bound to another consumer, reconciliation fails.
@@ -295,21 +296,21 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
     - If template / machine datacenter is empty and a `FailureDomain` is set, slot selection is filtered by the datacenter(s) allowed by the resolved failure domain.
     - If neither template / machine datacenter nor `FailureDomain` provides a datacenter, CAPV uses the selected slot's resolved datacenter.
 - CAPV resolves a slot datacenter as follows:
-    - `ResourceSlot.datacenter` is matched first.
-    - If `slot.datacenter` is empty, CAPV falls back to `VSphereResourcePool.spec.datacenter`.
+    - `MachineConfigSlot.datacenter` is matched first.
+    - If `slot.datacenter` is empty, CAPV falls back to `VSphereMachineConfigPool.spec.datacenter`.
 - A slot is eligible only if its resolved datacenter satisfies all active constraints:
     - The template / machine datacenter, when specified.
     - The resolved `FailureDomain` datacenter set, when specified.
     - If no slot in the pool satisfies the active constraints, reconciliation fails instead of silently choosing a slot from a different datacenter.
 - Priority:
     1. A slot already assigned to the same `VSphereMachine` instance (matched by `UID`, or by `Name/Namespace` as an idempotency fallback before `UID` is settled), subject to the active datacenter constraints above.
-    2. The first `Released` slot in `spec.resources` order that satisfies the active datacenter constraints, if any.
-    3. The first `Available` (or uninitialized) slot in `spec.resources` order that satisfies the active datacenter constraints, if any.
-- The controller marks the slot as `InUse` and updates `VSphereResourcePool.Status.ResourceStatuses` with the `MachineRef` pointing to the `VSphereMachine`.
+    2. The first `Released` slot in `spec.configs` order that satisfies the active datacenter constraints, if any.
+    3. The first `Available` (or uninitialized) slot in `spec.configs` order that satisfies the active datacenter constraints, if any.
+- The controller marks the slot as `InUse` and updates `VSphereMachineConfigPool.Status.ConfigStatuses` with the `MachineRef` pointing to the `VSphereMachine`.
 - The `VSphereVM` is created using the standard generated name (e.g., with random suffixes).
 - Slot data is merged into the `VSphereVM` before backend VM creation:
     - If template / machine datacenter is set, CAPV preserves it on the resulting `VSphereVM`, but the selected slot must also satisfy any configured `FailureDomain`.
-    - If template / machine datacenter is not set, CAPV resolves `Datacenter` from the selected slot first. If `slot.datacenter` is empty, CAPV falls back to `VSphereResourcePool.spec.datacenter`.
+    - If template / machine datacenter is not set, CAPV resolves `Datacenter` from the selected slot first. If `slot.datacenter` is empty, CAPV falls back to `VSphereMachineConfigPool.spec.datacenter`.
     - When template / machine datacenter is not set, CAPV backfills the final resolved datacenter onto `VSphereMachine.spec.datacenter` after slot allocation so later reconcile steps observe the explicit resolved value.
     - `Hostname` from the slot is used as the guest hostname.
     - `Hostname` from the slot is used as the kubelet registration name.
@@ -330,7 +331,7 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
 - **Metadata Injection**: 
     - **Hostname Overriding**: Instead of using the `VSphereVM` name, the controller explicitly passes the **slot's Hostname** to the metadata generator. This ensures `local-hostname` and `instance-id` in `guestinfo.metadata` match the slot definition, which `cloud-init` then uses to set the OS hostname.
 - **Slot hostname annotation**:
-    - The controller also writes `infrastructure.cluster.x-k8s.io/resource-slot-hostname=<slot.Hostname>` onto the `VSphereVM`.
+    - The controller also writes `infrastructure.cluster.x-k8s.io/machine-config-slot-hostname=<slot.Hostname>` onto the `VSphereVM`.
     - This provides a durable hint that allows the `VSphereVM` reconcile path to recover the slot definition from the pool spec even if the slot-to-machine status binding is temporarily unavailable.
 - **User-data augmentation**:
     - CAPV merges persistent-disk cloud-config fragments and kubelet serving certificate configuration into the VM's `guestinfo.userdata` (ExtraConfig) before first power-on.
@@ -348,25 +349,25 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
     2. **UnitNumber**: SCSI unit number match (stable across VM recreations, restricted to SCSI controllers).
     3. **Capacity**: Disk size match on SCSI controllers (last resort, returns no match if ambiguous).
     - Tiers 2 and 3 are restricted to SCSI controllers to prevent false matches against OS disks on IDE or SATA controllers.
-    - Discovered `UnitNumber`, `VolumePath`, and `DiskUUID` are backfilled into the resource pool spec for persistence across VM recreations.
+    - Discovered `UnitNumber`, `VolumePath`, and `DiskUUID` are backfilled into the machine config pool spec for persistence across VM recreations.
 
 ### 2. Rolling Update (maxSurge=0)
 - `MachineDeployment` deletes `Machine-v1`.
 - `VSphereMachine-v1` is deleted, and its `VSphereVM` is destroyed.
 - **Crucially**: The `PersistentDisk` is **detached** but **NOT deleted** from the datastore.
-- The `ResourceSlot` status is updated to `State: Released`, `LastReleasedTime: now`. The `MachineRef` is intentionally preserved for orphan detection, release verification, and audit purposes; it is only overwritten when the slot is re-allocated to a new machine.
+- The `MachineConfigSlot` status is updated to `State: Released`, `LastReleasedTime: now`. The `MachineRef` is intentionally preserved for orphan detection, release verification, and audit purposes; it is only overwritten when the slot is re-allocated to a new machine.
 - `MachineDeployment` creates `Machine-v2`.
 - `Machine-v2` requests a slot. The controller prefers `Released` slots before `Available` slots, so in a serial rolling update it will typically reuse the first released slot.
 - `Machine-v2` therefore usually reuses the released slot's IP, Hostname, and existing `PersistentDisk` via `VolumePath`, but the current implementation does not guarantee an identity-based match back to a specific previous machine instance.
 - On first boot, the guest-side reconcile script processes `WipeFilesystem` for each persistent disk:
     - `false` (default): existing data is preserved. Suitable for disks like `/var/cpaas` and `/var/lib/containerd` where data continuity across rolling updates is desired.
     - `true`: the script detects first boot via a marker file on the system disk (`/var/lib/capv/disk-initialized-<name>`) and wipes the disk content before use. This prevents stale data from blocking guest-side initialization (e.g., kubeadm requires `/var/lib/etcd` to be empty when joining as a new etcd member).
-- If the owner `VSphereMachine` object is already gone by the time the `VSphereVM` delete path runs, CAPV locates the pool by scanning all `VSphereResourcePool` objects in the namespace and matching the `MachineRef` in slot status entries. This allows CAPV to safely release the slot even without a direct pool reference from the deleted machine.
-- **Orphan detection**: The `VSphereResourcePool` controller periodically checks slots in `InUse` state. If a slot's `MachineRef` points to a `VSphereMachine` that no longer exists, the controller automatically transitions the slot to `Released`.
-- During later `VSphereVM` reconciles, if the slot cannot be resolved from the current status binding, CAPV can fall back to the `resource-slot-hostname` annotation and reload the slot definition from `VSphereResourcePool.spec.resources`.
+- If the owner `VSphereMachine` object is already gone by the time the `VSphereVM` delete path runs, CAPV locates the pool by scanning all `VSphereMachineConfigPool` objects in the namespace and matching the `MachineRef` in slot status entries. This allows CAPV to safely release the slot even without a direct pool reference from the deleted machine.
+- **Orphan detection**: The `VSphereMachineConfigPool` controller periodically checks slots in `InUse` state. If a slot's `MachineRef` points to a `VSphereMachine` that no longer exists, the controller automatically transitions the slot to `Released`.
+- During later `VSphereVM` reconciles, if the slot cannot be resolved from the current status binding, CAPV can fall back to the `machine-config-slot-hostname` annotation and reload the slot definition from `VSphereMachineConfigPool.spec.configs`.
 
 ### 3. Resource Cleanup (Automatic Reclaim)
-- A dedicated `VSphereResourcePool` controller checks slots in the `Released` state.
+- A dedicated `VSphereMachineConfigPool` controller checks slots in the `Released` state.
 - **Retention Period**: By default, a released slot is "reserved" for its previous owner (or for manual recovery) for a period defined by `ReleaseDelayHours` (e.g., 24-48 hours).
 - **Reclamation**: If `now - LastReleasedTime > ReleaseDelayHours`:
     - **Disk Cleanup**: The controller automatically deletes the associated `PersistentDisk` from the vSphere datastore to reclaim space.
@@ -381,37 +382,37 @@ When a `VSphereMachine` is created and it references a `VSphereResourcePool`:
     - If a reclaim task fails, the controller records `reclaimStatus.lastError` and uses `reclaimStatus.retryAfter` to avoid tight retry loops.
     - Reclaim completion is therefore not modeled as a single atomic transition; a slot may temporarily remain `Released` with reclaim metadata already cleaned from `spec` while it waits for the follow-up reconcile that marks it `Available`.
 
-### 4. Resource Pool Deletion
-- Deleting a `VSphereResourcePool` is blocked by a finalizer until all slots are safely released.
+### 4. Machine Config Pool Deletion
+- Deleting a `VSphereMachineConfigPool` is blocked by a finalizer until all slots are safely released.
 - "Safe" means:
     - Any slot still bound to an existing `VSphereMachine` blocks deletion and surfaces an error.
     - If the referenced `VSphereMachine` no longer exists, the slot may transition to `Released` and continue reclaim.
     - Any released slot with reclaimable persistent disks must finish reclaim before the pool finalizer is removed.
 - The finalizer is removed only after no live machine is using a slot and all reclaim work is complete.
 
-## Validation of `resourcePoolRef`
+## Validation of `machineConfigPoolRef`
 
-To ensure `VSphereResourcePool` and workload controllers are effectively used in a one-to-one manner, CAPV should validate pool references from both sides.
+To ensure `VSphereMachineConfigPool` and workload controllers are effectively used in a one-to-one manner, CAPV should validate pool references from both sides.
 
 ### Pool-side validation
 
-When creating or updating a `VSphereResourcePool`:
+When creating or updating a `VSphereMachineConfigPool`:
 
 - `spec.clusterRef.name` must be set.
 - `spec.clusterRef.apiVersion`, if set, must be `cluster.x-k8s.io/v1beta1`.
 - `spec.clusterRef.kind`, if set, must be `Cluster`.
 - `spec.clusterRef.namespace`, if set, must match the pool namespace.
-- `spec.clusterRef` can only be changed when `spec.consumerRef` is nil.
-- If `spec.consumerRef` is set, `kind` must be either `KubeadmControlPlane` or `MachineDeployment`.
+- `spec.clusterRef` can only be changed when `status.consumerRef` is nil.
+- If `status.consumerRef` is set, `kind` must be either `KubeadmControlPlane` or `MachineDeployment`.
 - `apiVersion` must match the supported group for that kind.
 - The referenced consumer object must exist.
-- If another `VSphereResourcePool` in the same namespace already points at the same consumer, validation fails.
+- If another `VSphereMachineConfigPool` in the same namespace already points at the same consumer, validation fails.
   This prevents multiple pools from being bound to the same `KubeadmControlPlane` or `MachineDeployment`.
-- If `spec.consumerRef` is changed while the pool is not yet fully reusable, validation fails.
+- If `status.consumerRef` is changed while the pool is not yet fully reusable, validation fails.
 
 Recommended implementation:
 
-- use a validating webhook on `VSphereResourcePool`
+- use a validating webhook on `VSphereMachineConfigPool`
 - on create/update, list pools in the same namespace and reject duplicates by `(apiVersion, kind, namespace, name)`
 - on update, compare old/new `consumerRef`
   - if unchanged, allow
@@ -422,7 +423,7 @@ Recommended implementation:
 
 When reconciling a `VSphereMachine`, CAPV should validate the referenced pool before allocation:
 
-- `VSphereMachine.spec.resourcePoolRef` must point to an existing `VSphereResourcePool`.
+- `VSphereMachine.spec.machineConfigPoolRef` must point to an existing `VSphereMachineConfigPool`.
 - If the pool `consumerRef` is set, it must match the effective consumer of the machine.
 - If the pool is already bound to a different consumer, reconciliation fails immediately instead of attempting slot allocation.
 
@@ -438,7 +439,7 @@ This ensures duplicate references are caught before machines are created, rather
 
 Recommended admission split:
 
-- `VSphereResourcePool` webhook validates the pool-side binding uniqueness.
+- `VSphereMachineConfigPool` webhook validates the pool-side binding uniqueness.
 - `KubeadmControlPlane` / `MachineDeployment` webhook validates that the referenced `VSphereMachineTemplate`
   ultimately points to an existing pool and that the pool `consumerRef` is either:
   - empty and compatible with the object being admitted, or
@@ -449,8 +450,8 @@ Recommended admission split:
 
 To prevent repeated use of the same pool, CAPV should treat the following as invalid:
 
-- two `VSphereResourcePool` objects that both bind to the same `KubeadmControlPlane`
-- two `VSphereResourcePool` objects that both bind to the same `MachineDeployment`
+- two `VSphereMachineConfigPool` objects that both bind to the same `KubeadmControlPlane`
+- two `VSphereMachineConfigPool` objects that both bind to the same `MachineDeployment`
 - one `KubeadmControlPlane` and one `MachineDeployment` that both resolve to the same pool through their machine templates
 - one consumer whose template points to pool `A` while pool `A.consumerRef` points to a different consumer
 
@@ -463,7 +464,7 @@ The original fields in `proposal.go` are largely sufficient but require vSphere-
 - `VolumeUrn` -> Replaced with `VolumePath` and `DiskUUID` to align with vSphere's file-based storage and identification.
 - `SequenceNum` -> Renamed to `UnitNumber` to align with vSphere SCSI controller terminology, which is critical for consistent disk ordering.
 - `DVSwitchName/PortGroupName` -> Unified into `NetworkName`, which is the standard CAPV field for both standard and distributed portgroups.
-- `AdditionNic` -> Integrated into `ResourceSlot.Network.additional`, with `ResourceSlot.Network.primary` representing the kubelet registration NIC.
+- `AdditionNic` -> Integrated into `MachineConfigSlot.Network.additional`, with `MachineConfigSlot.Network.primary` representing the kubelet registration NIC.
 
 ## MachineDeployment Configuration
 To achieve the desired behavior, the `MachineDeployment` must be configured with:
@@ -477,7 +478,7 @@ strategy:
 
 ## Implementation Notes
 - **Credential Resolution via ClusterRef**:
-    - `VSphereResourcePool.spec.clusterRef` is required. It references the CAPI `Cluster` object in the same namespace.
+    - `VSphereMachineConfigPool.spec.clusterRef` is required. It references the CAPI `Cluster` object in the same namespace.
     - `clusterRef` can only be changed when `consumerRef` is nil (i.e. the pool is not bound to any consumer).
     - vCenter server address and thumbprint are derived from the `VSphereCluster` referenced by `Cluster.spec.infrastructureRef`.
     - vCenter credentials are resolved via the chain: `ClusterRef` → `Cluster` → `VSphereCluster` → `IdentityRef` → `Secret`.
@@ -485,40 +486,40 @@ strategy:
     - The pool will not reconcile until the referenced Cluster and VSphereCluster are available.
     - Two conditions track this readiness: `ClusterRefReady` (Cluster and VSphereCluster exist) and `VCenterAvailable` (credentials resolved successfully).
     - The controller watches `Cluster` and `VSphereCluster` objects to react to changes without polling.
-- **VSphereMachine ResourcePoolReady Condition**:
-    - When `spec.resourcePoolRef` is set, a `ResourcePoolReady` condition is added to the VSphereMachine.
+- **VSphereMachine MachineConfigPoolReady Condition**:
+    - When `spec.machineConfigPoolRef` is set, a `MachineConfigPoolReady` condition is added to the VSphereMachine.
     - `True` with reason `SlotAllocated` when a slot is successfully allocated.
     - `False` with reason `PoolBoundToOtherConsumer` when the pool is bound to a different consumer.
     - `False` with reason `NoAvailableSlots` when no slots match the required datacenter/failure domain.
-    - Not set when `spec.resourcePoolRef` is nil (non-static-pool mode).
+    - Not set when `spec.machineConfigPoolRef` is nil (non-static-pool mode).
 - **Datacenter Resolution**:
-    - `VSphereResourcePool.spec.datacenter` is treated as a default value for the pool.
-    - `ResourceSlot.datacenter`, when set, takes precedence over the pool-level datacenter.
-    - At least one of `VSphereResourcePool.spec.datacenter` and `ResourceSlot.datacenter` must be set for every slot.
+    - `VSphereMachineConfigPool.spec.datacenter` is treated as a default value for the pool.
+    - `MachineConfigSlot.datacenter`, when set, takes precedence over the pool-level datacenter.
+    - At least one of `VSphereMachineConfigPool.spec.datacenter` and `MachineConfigSlot.datacenter` must be set for every slot.
     - During provisioning, template / machine datacenter and failure-domain datacenter are combined as constraints; failure-domain resolution does not override a template datacenter.
     - A slot is eligible only if its resolved datacenter matches the template / machine datacenter when one is specified, and is also allowed by the resolved failure-domain datacenter set when one is specified.
     - If template and failure domain do not specify a datacenter, the selected slot's resolved datacenter becomes the authoritative datacenter for the machine and VM.
     - When slot selection supplies the datacenter, CAPV backfills that resolved value onto `VSphereMachine.spec.datacenter`.
 - **Slot Network Model**:
-    - `ResourceSlot.network` is a structured object, not a flat NIC array.
-    - `ResourceSlot.network.primary` is the kubelet registration NIC and is merged as the first `VSphereVM.spec.network.devices` entry.
-    - `ResourceSlot.network.additional` are merged after the primary device in declared order.
-    - When `ResourceSlot.network` is present, `primary.networkName` is required.
+    - `MachineConfigSlot.network` is a structured object, not a flat NIC array.
+    - `MachineConfigSlot.network.primary` is the kubelet registration NIC and is merged as the first `VSphereVM.spec.network.devices` entry.
+    - `MachineConfigSlot.network.additional` are merged after the primary device in declared order.
+    - When `MachineConfigSlot.network` is present, `primary.networkName` is required.
 - **Hostname**:
-    - `ResourceSlot.hostname` is the guest OS hostname, the stable slot identifier, the kubeadm node registration name, and the kubelet serving certificate DNS name.
-    - `ResourceSlot.hostname` must be a valid Kubernetes DNS-1123 subdomain. Values with uppercase letters, underscores, or other node-name-invalid characters must be rejected by the API before machine creation.
+    - `MachineConfigSlot.hostname` is the guest OS hostname, the stable slot identifier, the kubeadm node registration name, and the kubelet serving certificate DNS name.
+    - `MachineConfigSlot.hostname` must be a valid Kubernetes DNS-1123 subdomain. Values with uppercase letters, underscores, or other node-name-invalid characters must be rejected by the API before machine creation.
 - **Consumer Binding**:
-    - `VSphereResourcePool.spec.consumerRef` is a logical binding, not a Kubernetes owner relationship.
+    - `VSphereMachineConfigPool.status.consumerRef` is a logical binding, not a Kubernetes owner relationship.
     - CAPV must not add `ownerReferences` from the pool to the referenced `KubeadmControlPlane` or `MachineDeployment`.
     - Consumer deletion does not delete the pool.
     - Consumer deletion only makes the pool eligible for unbinding after all slot lifecycle and reclaim work has completed.
     - `KubeadmControlPlane` / `MachineDeployment` webhook validation is only a pre-check. It does not establish the binding.
-    - The actual binding is created during `VSphereMachine` reconcile using optimistic concurrency on `VSphereResourcePool.resourceVersion`.
+    - The actual binding is created during `VSphereMachine` reconcile using optimistic concurrency on `VSphereMachineConfigPool.resourceVersion`.
     - Slot allocation reuses the same reconcile path after binding succeeds; no separate binding controller is required.
 - **Reclaim Tracking**:
-    - Reclaim-related task metadata should be grouped under `status.resourceStatuses[].reclaimStatus`.
+    - Reclaim-related task metadata should be grouped under `status.configStatuses[].reclaimStatus`.
     - Suggested task state enum is `Running`, `Failed`, `Completed`.
-    - This keeps asynchronous reclaim state localized and avoids scattering task-related fields across `ResourceSlotStatus`.
+    - This keeps asynchronous reclaim state localized and avoids scattering task-related fields across `MachineConfigSlotStatus`.
 - **SCSI Controller Selection**:
     - Data disks are attached to the VM's primary disk controller when that controller is SCSI.
     - If the primary disk controller is not SCSI, CAPV falls back to the first SCSI controller found on the template VM.
@@ -538,32 +539,32 @@ strategy:
 | 7 | Reserved | vSphere SCSI controller unit |
 
 - **Resource Selection Logic**:
-    - The controller manages the binding between `VSphereMachine` and `ResourceSlot` within the `VSphereResourcePool` status.
+    - The controller manages the binding between `VSphereMachine` and `MachineConfigSlot` within the `VSphereMachineConfigPool` status.
     - The controller first computes the machine's desired datacenter from template / machine settings and `FailureDomain`.
     - It then filters candidate slots to those whose resolved datacenter matches that desired datacenter, if one is present.
     - The controller first checks whether the current `VSphereMachine` already owns a matching slot (by `UID`, or by `Name/Namespace` as an idempotency fallback).
     - If no existing matching binding is found, it prefers the first `Released` matching slot over the first `Available` matching slot.
-    - On initial provisioning, if allocation is serial, slot selection follows the order of `spec.resources` after datacenter filtering.
+    - On initial provisioning, if allocation is serial, slot selection follows the order of `spec.configs` after datacenter filtering.
     - If no slot matches the desired datacenter, reconciliation fails instead of selecting a slot from another datacenter.
 - **Controller Responsibilities**:
     - The `VSphereVM` controller needs to be aware of `PersistentDisks` that should not be deleted upon VM destruction.
     - The `VSphereVM` controller is responsible for gating backend VM creation on CAPV IPAM fulfillment when slot IPs are not provided.
-    - A dedicated controller for `VSphereResourcePool` manages status tracking, delayed reclaim, async reclaim task polling, and safe deletion semantics.
+    - A dedicated controller for `VSphereMachineConfigPool` manages status tracking, delayed reclaim, async reclaim task polling, and safe deletion semantics.
 
 ## FailureDomain-Aware Slot Filtering
 
-When `VSphereCluster.spec.failureDomainSelector` is configured, CAPI selects a FailureDomain (and its Datacenter) for each Machine. If the selected Datacenter has no available slots in any `VSphereResourcePool`, the Machine gets stuck with `ResourcePoolNoAvailableSlots`.
+When `VSphereCluster.spec.failureDomainSelector` is configured, CAPI selects a FailureDomain (and its Datacenter) for each Machine. If the selected Datacenter has no available slots in any `VSphereMachineConfigPool`, the Machine gets stuck with `MachineConfigPoolReady=False (NoAvailableSlots)`.
 
 ### Filtering Logic
 
-CAPV filters `VSphereCluster.Status.FailureDomains` based on resource pool slot availability so CAPI only picks FailureDomains with allocatable slots:
+CAPV filters `VSphereCluster.Status.FailureDomains` based on machine config pool slot availability so CAPI only picks FailureDomains with allocatable slots:
 
-1. In `reconcileDeploymentZones()`, list all `VSphereResourcePool` objects in the cluster namespace whose `ClusterRef` matches the CAPI Cluster.
+1. In `reconcileDeploymentZones()`, list all `VSphereMachineConfigPool` objects in the cluster namespace whose `ClusterRef` matches the CAPI Cluster.
 2. Compute available datacenters: a datacenter is "available" if **any** pool has at least one allocatable slot (state is `Available`, `Released`, or uninitialized) in that datacenter.
 3. For each ready `VSphereDeploymentZone`, resolve its datacenter from the referenced `VSphereFailureDomain.spec.topology.datacenter`. If that datacenter has no available slots, exclude the zone from `Status.FailureDomains`.
-4. A `Watches` on `VSphereResourcePool` triggers re-reconcile of the `VSphereCluster` when slot states change, ensuring the FailureDomain list stays up to date.
+4. A `Watches` on `VSphereMachineConfigPool` triggers re-reconcile of the `VSphereCluster` when slot states change, ensuring the FailureDomain list stays up to date.
 
-**Backward compatibility**: If no `VSphereResourcePool` references this cluster, all ready zones are reported as before—the filtering is completely transparent.
+**Backward compatibility**: If no `VSphereMachineConfigPool` references this cluster, all ready zones are reported as before—the filtering is completely transparent.
 
 **Conservative error handling**: If a `VSphereFailureDomain` cannot be resolved for a zone, the zone is included conservatively (not excluded).
 
@@ -576,8 +577,8 @@ When **all** ready zones are excluded due to slot exhaustion, CAPV falls back to
 | Scenario | FailureDomains | Condition |
 |----------|---------------|-----------|
 | Some FDs have slots | Only FDs with available slots | `FailureDomainsSkipped` with excluded count |
-| All FDs exhausted | All ready zones (fallback) | `FailureDomainsExhaustedByResourcePool` (Warning) |
-| No ResourcePools | All ready zones | Original behavior unchanged |
+| All FDs exhausted | All ready zones (fallback) | `FailureDomainsExhaustedByMachineConfigPool` (Warning) |
+| No MachineConfigPools | All ready zones | Original behavior unchanged |
 
 ### Known Limitations
 
@@ -591,7 +592,7 @@ CAPV updates VSphereCluster.Status.FailureDomains
     → KCP controller reads the new list and creates Machine
 ```
 
-During this propagation window (typically seconds), CAPI may still use the old FailureDomain list. Since `Machine.Spec.FailureDomain` is immutable once set, these Machines will remain stuck at `ResourcePoolNoAvailableSlots` until a slot becomes available for that datacenter.
+During this propagation window (typically seconds), CAPI may still use the old FailureDomain list. Since `Machine.Spec.FailureDomain` is immutable once set, these Machines will remain stuck at `MachineConfigPoolReady=False (NoAvailableSlots)` until a slot becomes available for that datacenter.
 
 **Impact**: The race window is short (watch-driven, seconds). Only a small number of Machines may be affected.
 
@@ -601,7 +602,7 @@ During this propagation window (typically seconds), CAPI may still use the old F
 
 **Consumer granularity is imprecise**
 
-Different `MachineDeployment`/`KubeadmControlPlane` objects may use different `VSphereResourcePool` instances. The current approach aggregates slot availability across all pools at the cluster level, without distinguishing which consumer uses which pool. For example:
+Different `MachineDeployment`/`KubeadmControlPlane` objects may use different `VSphereMachineConfigPool` instances. The current approach aggregates slot availability across all pools at the cluster level, without distinguishing which consumer uses which pool. For example:
 - Pool-A (bound to KCP) only has DC-1 slots
 - Pool-B (bound to MD-worker) only has DC-2 slots
 - Filtering result: both DC-1 and DC-2 appear available
@@ -649,5 +650,5 @@ The implementation should include at least the following tests.
 
 ## Open Questions
 
-- Should CAPV reject a `VSphereMachineTemplate` with `resourcePoolRef` pointing to an unbound pool when another object already references that same pool in persisted configuration, even before runtime binding has happened?
+- Should CAPV reject a `VSphereMachineTemplate` with `machineConfigPoolRef` pointing to an unbound pool when another object already references that same pool in persisted configuration, even before runtime binding has happened?
 - Should rebinding require all slots to be `Available`, or is a weaker condition acceptable if future requirements allow cross-consumer reuse of released slots without reclaim?

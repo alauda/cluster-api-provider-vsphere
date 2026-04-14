@@ -110,19 +110,19 @@
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 2.4.1 | CP pool consumerRef | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.kind}/{.status.consumerRef.name}'` | `consumerRef=KubeadmControlPlane/<kcp-name>` |
-| 2.4.2 | CP pool slot 状态 | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | 3 个 InUse（machineRef 指向对应 VSphereMachine），2 个 Available |
-| 2.4.3 | CP pool conditions | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'` | `ClusterRefReady=True`，`VCenterAvailable=True` |
-| 2.4.4 | Worker pool consumerRef | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.kind}/{.status.consumerRef.name}'` | `consumerRef=MachineDeployment/<md-name>`（先抢到的 MD） |
-| 2.4.5 | Worker pool slot 状态 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | `<bound-md>` failureDomain 对应 DC 的 2 个 slot InUse，其余 Available |
+| 2.4.1 | CP pool consumerRef | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.kind}/{.status.consumerRef.name}'` | `consumerRef=KubeadmControlPlane/<kcp-name>` |
+| 2.4.2 | CP pool slot 状态 | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | 3 个 InUse（machineRef 指向对应 VSphereMachine），2 个 Available |
+| 2.4.3 | CP pool conditions | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'` | `ClusterRefReady=True`，`VCenterAvailable=True` |
+| 2.4.4 | Worker pool consumerRef | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.kind}/{.status.consumerRef.name}'` | `consumerRef=MachineDeployment/<md-name>`（先抢到的 MD） |
+| 2.4.5 | Worker pool slot 状态 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | `<bound-md>` failureDomain 对应 DC 的 2 个 slot InUse，其余 Available |
 
-### 2.5 VSphereMachine ResourcePoolReady Condition
+### 2.5 VSphereMachine MachineConfigPoolReady Condition
 
 **验证：**
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 2.5.1 | ResourcePoolReady condition | `kubectl get vspheremachines -n <namespace>`<br>`-l cluster.x-k8s.io/cluster-name=<cluster-name>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: {range .status.conditions[?(@.type=="ResourcePoolReady")]}{.status} ({.reason}){end}{"\n"}{end}'` | 已分配 slot 的 VSphereMachine 显示 `True (SlotAllocated)`；`<bound-md>` 中无可用 slot 的 VSphereMachine 显示 `False (NoAvailableSlots)`；`<other-md>` 的 VSphereMachine 显示 `False (PoolBoundToOtherConsumer)` |
+| 2.5.1 | MachineConfigPoolReady condition | `kubectl get vspheremachines -n <namespace>`<br>`-l cluster.x-k8s.io/cluster-name=<cluster-name>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: {range .status.conditions[?(@.type=="MachineConfigPoolReady")]}{.status} ({.reason}){end}{"\n"}{end}'` | 已分配 slot 的 VSphereMachine 显示 `True (SlotAllocated)`；`<bound-md>` 中无可用 slot 的 VSphereMachine 显示 `False (NoAvailableSlots)`；`<other-md>` 的 VSphereMachine 显示 `False (PoolBoundToOtherConsumer)` |
 
 ### 2.6 Slot-Machine 匹配
 
@@ -130,8 +130,8 @@
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 2.6.1 | 获取 slot→machine 映射 | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.resourceStatuses[] \| select(.state=="InUse") \| "\(.hostname) -> \(.machineRef.name)"'` | 输出 InUse slot 对应的 machine 名称 |
-| 2.6.2 | annotation 与 slot hostname 一致 | `kubectl get vspheremachine <machineRef-name> -n <namespace>`<br>`-o jsonpath='{.metadata.annotations.infrastructure\.cluster\.x-k8s\.io/resource-slot-hostname}'` | 与 slot hostname 一致 |
+| 2.6.1 | 获取 slot→machine 映射 | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.configStatuses[] \| select(.state=="InUse") \| "\(.hostname) -> \(.machineRef.name)"'` | 输出 InUse slot 对应的 machine 名称 |
+| 2.6.2 | annotation 与 slot hostname 一致 | `kubectl get vspheremachine <machineRef-name> -n <namespace>`<br>`-o jsonpath='{.metadata.annotations.infrastructure\.cluster\.x-k8s\.io/machine-config-slot-hostname}'` | 与 slot hostname 一致 |
 
 ### 2.7 持久盘挂载
 
@@ -193,10 +193,10 @@
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 3.1.1 | Slot datacenter 分布 | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] \| "\(.hostname): datacenter=\(.datacenter // "<pool-default>")"'` | 3 个 DC1，2 个 DC2 |
+| 3.1.1 | Slot datacenter 分布 | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] \| "\(.hostname): datacenter=\(.datacenter // "<pool-default>")"'` | 3 个 DC1，2 个 DC2 |
 | 3.1.2 | VSphereVM 实际 datacenter | `kubectl get vspherevms -n <namespace>`<br>`-l cluster.x-k8s.io/control-plane-name=<kcp-name>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: datacenter={.spec.datacenter}{"\n"}{end}'` | 与对应 slot datacenter 一致 |
 | 3.1.3 | Machine failureDomain | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/control-plane-name=<kcp-name>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: failureDomain={.spec.failureDomain}{"\n"}{end}'` | DC1 的 Machine → `<dz-dc1-name>`，DC2 的 Machine → `<dz-dc2-name>` |
-| 3.1.4 | Slot-Machine datacenter 交叉验证 | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] as $slot \| .status.resourceStatuses[] \| select(.state=="InUse" and .hostname==$slot.hostname) \| "\(.hostname): slot-dc=\($slot.datacenter // "<pool-default>"), machine=\(.machineRef.name)"'`<br><br>对每行验证：<br>`kubectl get vspherevm <machineRef-name> -n <namespace> -o jsonpath='{.spec.datacenter}'` | VSphereVM datacenter 与 slot-dc 一致 |
+| 3.1.4 | Slot-Machine datacenter 交叉验证 | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] as $slot \| .status.configStatuses[] \| select(.state=="InUse" and .hostname==$slot.hostname) \| "\(.hostname): slot-dc=\($slot.datacenter // "<pool-default>"), machine=\(.machineRef.name)"'`<br><br>对每行验证：<br>`kubectl get vspherevm <machineRef-name> -n <namespace> -o jsonpath='{.spec.datacenter}'` | VSphereVM datacenter 与 slot-dc 一致 |
 
 ### 3.2 Worker 故障域约束
 
@@ -206,8 +206,8 @@
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 3.2.1 | InUse slot datacenter | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] as $slot \| .status.resourceStatuses[] \| select(.state=="InUse" and .hostname==$slot.hostname) \| "\(.hostname): datacenter=\($slot.datacenter // "<pool-default>")"'` | 所有 InUse slot 的 datacenter 均为 `<bound-dc>` |
-| 3.2.2 | 另一个 DC 的 slot 未被分配 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] as $slot \| .status.resourceStatuses[] \| select(.hostname==$slot.hostname) \| "\(.hostname): datacenter=\($slot.datacenter // "<pool-default>"), state=\(.state)"'` | 非 `<bound-dc>` 的 slot 状态为 Available |
+| 3.2.1 | InUse slot datacenter | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] as $slot \| .status.configStatuses[] \| select(.state=="InUse" and .hostname==$slot.hostname) \| "\(.hostname): datacenter=\($slot.datacenter // "<pool-default>")"'` | 所有 InUse slot 的 datacenter 均为 `<bound-dc>` |
+| 3.2.2 | 另一个 DC 的 slot 未被分配 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] as $slot \| .status.configStatuses[] \| select(.hostname==$slot.hostname) \| "\(.hostname): datacenter=\($slot.datacenter // "<pool-default>"), state=\(.state)"'` | 非 `<bound-dc>` 的 slot 状态为 Available |
 | 3.2.3 | VSphereVM datacenter | `kubectl get vspherevms -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: datacenter={.spec.datacenter}{"\n"}{end}'` | 全部为 `<bound-dc>` |
 
 ### 3.3 故障域不匹配 — slot 不足阻塞
@@ -219,9 +219,9 @@
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
 | 3.3.1 | 第 3 个 Machine 卡住 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: phase={.status.phase}{"\n"}{end}'` | 2 个 Running + 1 个 Provisioning |
-| 3.3.2 | 另一个 DC 的 slot 不被分配 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}{"\n"}{end}'` | `<bound-dc>` 的 2 个 InUse，另一个 DC 的 2 个 Available |
+| 3.3.2 | 另一个 DC 的 slot 不被分配 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}{"\n"}{end}'` | `<bound-dc>` 的 2 个 InUse，另一个 DC 的 2 个 Available |
 | 3.3.3 | 找到 stuck machine | `kubectl get vspheremachines -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o json \| jq -r '.items[] \| select(.status.ready != true) \| .metadata.name' \| head -1` | 输出 stuck machine 名称 |
-| 3.3.4 | condition 详情 | `kubectl get vspheremachine <stuck-machine-name> -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}: {.status} ({.reason}) - {.message}{"\n"}{end}'` | `ResourcePoolReady: False (NoAvailableSlots) - "no available slots..."` |
+| 3.3.4 | condition 详情 | `kubectl get vspheremachine <stuck-machine-name> -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}: {.status} ({.reason}) - {.message}{"\n"}{end}'` | `MachineConfigPoolReady: False (NoAvailableSlots) - "no available slots..."` |
 
 **操作（恢复）：**
 
@@ -252,7 +252,7 @@
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
 | 4.1.2 | Machine 状态 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/control-plane-name=<kcp-name>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: phase={.status.phase}, node={.status.nodeRef.name}{"\n"}{end}'` | 5 个 Machine，全部 Running |
-| 4.1.3 | CP Pool slot | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | 5 个 InUse，0 个 Available |
+| 4.1.3 | CP Pool slot | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | 5 个 InUse，0 个 Available |
 | 4.1.4 | hostname 验证 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/control-plane-name=<kcp-name>`<br>`-o jsonpath='{range .items[*]}{.status.nodeRef.name}{"\n"}{end}' \| sort` | CP pool 中 5 个 slot 的 hostname |
 | 4.1.5 | 网络验证 | `kubectl get vspherevms -n <namespace>`<br>`-l cluster.x-k8s.io/control-plane-name=<kcp-name>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: {.status.addresses}{"\n"}{end}'` | 每个 VM 2 个 IP，与 slot NIC1/NIC2 一致 |
 | 4.1.6 | 新 CP 持久盘 — 格式化盘 | `ssh <new-cp-node-ip> "lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT \| grep -E 'var/cpaas\|var/lib/containerd\|var/lib/etcd'"` | 3 块格式化挂载盘，路径和大小与 slot 定义一致 |
@@ -277,8 +277,8 @@
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
 | 4.2.2 | Machine 状态 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: phase={.status.phase}, node={.status.nodeRef.name}{"\n"}{end}'` | 4 个 Running |
-| 4.2.3 | Slot 分配 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | 4 个 slot 全部 InUse，0 个 Available |
-| 4.2.4 | consumerRef 不变 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.kind}/{.status.consumerRef.name}'` | 不变 |
+| 4.2.3 | Slot 分配 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | 4 个 slot 全部 InUse，0 个 Available |
+| 4.2.4 | consumerRef 不变 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.kind}/{.status.consumerRef.name}'` | 不变 |
 | 4.2.5 | hostname 与网络 | `kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig get nodes`<br>`-l nodepool=<bound-md-nodepool-label> -o wide` | 4 个 Worker Ready，NAME 为 slot hostname |
 | 4.2.6 | 新 Worker 双网卡 | `ssh <new-worker-ip> "ip -4 addr show \| grep 'inet ' \| grep -v '127.0.0.1'"` | 2 个 IP，与 slot NIC1/NIC2 一致 |
 | 4.2.7 | 新 Worker 持久盘 — 格式化盘 | `ssh <new-worker-ip> "lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT \| grep -E 'var/cpaas\|var/lib/containerd'"` | 2 块格式化挂载盘，路径和大小与 slot 定义一致 |
@@ -304,8 +304,8 @@
 
 | 步骤 | 操作 | 命令 |
 |------|------|------|
-| 5.1.1a | 记录 slot → machine 映射 | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.resourceStatuses[] \| "\(.hostname): machine=\(.machineRef.name)"'` |
-| 5.1.1b | 记录持久盘 VolumePath | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] \| "\(.hostname): \([.persistentDisks[] \| "\(.name)=\(.volumePath)"] \| join(", "))"'` |
+| 5.1.1a | 记录 slot → machine 映射 | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.configStatuses[] \| "\(.hostname): machine=\(.machineRef.name)"'` |
+| 5.1.1b | 记录持久盘 VolumePath | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] \| "\(.hostname): \([.persistentDisks[] \| "\(.name)=\(.volumePath)"] \| join(", "))"'` |
 | 5.1.1c | 记录节点 IP | `kubectl get vspherevms -n <namespace>`<br>`-l cluster.x-k8s.io/control-plane-name=<kcp-name>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: {.status.addresses}{"\n"}{end}'` |
 | 5.1.1d | 写入 etcd 测试数据 | `ssh <cp-node-ip> "ETCDCTL_API=3 etcdctl`<br>`--cacert=/etc/kubernetes/pki/etcd/ca.crt`<br>`--cert=/etc/kubernetes/pki/etcd/peer.crt`<br>`--key=/etc/kubernetes/pki/etcd/peer.key`<br>`put /capv-test/rolling-update-marker 'before-update'"` |
 
@@ -339,9 +339,9 @@ spec:
         devices:
         - networkName: "<nic1-network>"
         - networkName: "<nic2-network>"
-      resourcePoolRef:
+      machineConfigPoolRef:
         apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: VSphereResourcePool
+        kind: VSphereMachineConfigPool
         name: <cp-pool-name>
         namespace: <namespace>
 ```
@@ -365,11 +365,11 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/control-plane-name=<kcp-
 |------|--------|------|----------|
 | 5.1.3a | hostname 不变 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/control-plane-name=<kcp-name>`<br>`-o jsonpath='{range .items[*]}{.status.nodeRef.name}{"\n"}{end}' \| sort` | 与更新前相同的 5 个 hostname |
 | 5.1.3b | IP 复用 | `kubectl get vspherevms -n <namespace>`<br>`-l cluster.x-k8s.io/control-plane-name=<kcp-name>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: {.status.addresses}{"\n"}{end}'` | 与更新前一致 |
-| 5.1.3c | 持久盘复用 — VolumePath | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] \| "\(.hostname): \([.persistentDisks[] \| "\(.name)=\(.volumePath)"] \| join(", "))"'` | 与 5.1.1b 记录完全一致 |
+| 5.1.3c | 持久盘复用 — VolumePath | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] \| "\(.hostname): \([.persistentDisks[] \| "\(.name)=\(.volumePath)"] \| join(", "))"'` | 与 5.1.1b 记录完全一致 |
 | 5.1.3d | 持久盘复用 — 格式化盘 | `ssh <cp-node-ip> "lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT \| grep -E 'var/cpaas\|var/lib/containerd\|var/lib/etcd'"` | 3 块格式化挂载盘，与更新前一致 |
 | 5.1.3e | 持久盘复用 — 空盘 | `ssh <cp-node-ip> "ls -l /dev/disk/by-capv/data-disk-1 /dev/disk/by-capv/data-disk-2"` | 2 块空盘 symlink 存在，仍未格式化 |
 | 5.1.3f | etcd 数据保留 | `ssh <cp-node-ip> "ETCDCTL_API=3 etcdctl`<br>`--cacert=/etc/kubernetes/pki/etcd/ca.crt`<br>`--cert=/etc/kubernetes/pki/etcd/peer.crt`<br>`--key=/etc/kubernetes/pki/etcd/peer.key`<br>`get /capv-test/rolling-update-marker"` | `before-update` |
-| 5.1.3g | Pool slot 更新 | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | 5 个 InUse，machineRef 指向新 Machine（名称与更新前不同） |
+| 5.1.3g | Pool slot 更新 | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | 5 个 InUse，machineRef 指向新 Machine（名称与更新前不同） |
 | 5.1.3h | 工作负载集群 | `kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig get nodes -o wide` | 5 个 CP Ready，IP 和 hostname 不变 |
 
 ### 5.2 Worker 滚动更新
@@ -382,8 +382,8 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/control-plane-name=<kcp-
 
 | 步骤 | 操作 | 命令 |
 |------|------|------|
-| 5.2.1a | 记录 slot → machine 映射 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.resourceStatuses[] \| select(.state=="InUse") \| "\(.hostname): machine=\(.machineRef.name)"'` |
-| 5.2.1b | 记录持久盘 VolumePath | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] \| "\(.hostname): \([.persistentDisks[] \| "\(.name)=\(.volumePath)"] \| join(", "))"'` |
+| 5.2.1a | 记录 slot → machine 映射 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.configStatuses[] \| select(.state=="InUse") \| "\(.hostname): machine=\(.machineRef.name)"'` |
+| 5.2.1b | 记录持久盘 VolumePath | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] \| "\(.hostname): \([.persistentDisks[] \| "\(.name)=\(.volumePath)"] \| join(", "))"'` |
 | 5.2.1c | 记录节点 IP | `kubectl get vspherevms -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: {.status.addresses}{"\n"}{end}'` |
 
 > 保存上述输出，用于更新后对比。
@@ -416,9 +416,9 @@ spec:
         devices:
         - networkName: "<nic1-network>"
         - networkName: "<nic2-network>"
-      resourcePoolRef:
+      machineConfigPoolRef:
         apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: VSphereResourcePool
+        kind: VSphereMachineConfigPool
         name: <worker-pool-name>
         namespace: <namespace>
 ```
@@ -442,11 +442,11 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 |------|--------|------|----------|
 | 5.2.3a | hostname 复用 | `kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig get nodes`<br>`-l nodepool=<bound-md-nodepool-label> -o wide` | NAME 与更新前相同 |
 | 5.2.3b | IP 复用 | `kubectl get vspherevms -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: {.status.addresses}{"\n"}{end}'` | IP 与更新前一致 |
-| 5.2.3c | 持久盘 — VolumePath | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] \| "\(.hostname): \([.persistentDisks[] \| "\(.name)=\(.volumePath)"] \| join(", "))"'` | VolumePath 与更新前一致 |
+| 5.2.3c | 持久盘 — VolumePath | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] \| "\(.hostname): \([.persistentDisks[] \| "\(.name)=\(.volumePath)"] \| join(", "))"'` | VolumePath 与更新前一致 |
 | 5.2.3d | 持久盘 — 格式化盘 | `ssh <worker-ip> "lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT \| grep -E 'var/cpaas\|var/lib/containerd'"` | 2 块格式化挂载盘不变 |
 | 5.2.3e | 持久盘 — 空盘 | `ssh <worker-ip> "ls -l /dev/disk/by-capv/data-disk-1 /dev/disk/by-capv/data-disk-2"` | 2 块空盘 symlink 存在，仍未格式化 |
-| 5.2.3f | Pool slot | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | machineRef 指向新 Machine，hostname 不变 |
-| 5.2.3g | consumerRef | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.name}'` | 不变 |
+| 5.2.3f | Pool slot | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | machineRef 指向新 Machine，hostname 不变 |
+| 5.2.3g | consumerRef | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.name}'` | 不变 |
 
 ---
 
@@ -469,8 +469,8 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
 | 6.1.2 | Machine 状态 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: phase={.status.phase}{"\n"}{end}'` | 2 个 Running |
-| 6.1.3 | Slot 状态 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}, lastReleasedTime={.lastReleasedTime}{"\n"}{end}'` | 2 个 InUse + 2 个 Released（lastReleasedTime 已设置，machineRef 保留） |
-| 6.1.4 | ConsumerRef | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.name}'` | 仍为 `<bound-md>` |
+| 6.1.3 | Slot 状态 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}, lastReleasedTime={.lastReleasedTime}{"\n"}{end}'` | 2 个 InUse + 2 个 Released（lastReleasedTime 已设置，machineRef 保留） |
+| 6.1.4 | ConsumerRef | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.name}'` | 仍为 `<bound-md>` |
 | 6.1.5 | 工作负载集群 | `kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig get nodes`<br>`-l nodepool=<bound-md-nodepool-label>` | 2 个 Worker Ready |
 
 ### 6.2 Worker 超配
@@ -491,7 +491,7 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 |------|--------|------|----------|
 | 6.2.2 | 分配结果 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: phase={.status.phase}{"\n"}{end}'` | 4 个 Running + 1 个 Provisioning |
 | 6.2.3 | 找到 stuck machine | `kubectl get vspheremachines -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>`<br>`-o json \| jq -r '.items[] \| select(.status.ready != true) \| .metadata.name'` | 输出 stuck machine 名称 |
-| 6.2.4 | 卡住原因 | `kubectl get vspheremachine <stuck-machine-name> -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}: {.status} ({.reason}) - {.message}{"\n"}{end}'` | `ResourcePoolReady: False (NoAvailableSlots) - "no available slots..."` |
+| 6.2.4 | 卡住原因 | `kubectl get vspheremachine <stuck-machine-name> -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}: {.status} ({.reason}) - {.message}{"\n"}{end}'` | `MachineConfigPoolReady: False (NoAvailableSlots) - "no available slots..."` |
 
 **操作（恢复）：**
 
@@ -514,8 +514,8 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
 | 6.3.2 | Machine 状态 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<bound-md>` | No resources found |
-| 6.3.3 | Slot 状态 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, lastReleasedTime={.lastReleasedTime}{"\n"}{end}'` | 之前 InUse 的 slot → Released |
-| 6.3.4 | ConsumerRef | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.name}'` | 仍存在（Released slot 未回收，pool 不是 fully reusable） |
+| 6.3.3 | Slot 状态 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, lastReleasedTime={.lastReleasedTime}{"\n"}{end}'` | 之前 InUse 的 slot → Released |
+| 6.3.4 | ConsumerRef | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.name}'` | 仍存在（Released slot 未回收，pool 不是 fully reusable） |
 | 6.3.5 | vCenter VM 清理 | `govc find / -type m -name '<cluster-name>-*' \| grep -i worker` | 无输出 |
 
 ---
@@ -535,8 +535,8 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.1.1a | 确认 Released slot | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.resourceStatuses[] \| select(.state=="Released") \| "\(.hostname): lastReleasedTime=\(.lastReleasedTime)"'` | 至少 1 个 Released |
-| 7.1.1b | 确认可回收持久盘 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] \| select(.persistentDisks != null) \| "\(.hostname): \([.persistentDisks[] \| select(.volumePath != null and .volumePath != "") \| "\(.name)=\(.volumePath)"] \| join(", "))"'` | Released slot 有 VolumePath |
+| 7.1.1a | 确认 Released slot | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.configStatuses[] \| select(.state=="Released") \| "\(.hostname): lastReleasedTime=\(.lastReleasedTime)"'` | 至少 1 个 Released |
+| 7.1.1b | 确认可回收持久盘 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] \| select(.persistentDisks != null) \| "\(.hostname): \([.persistentDisks[] \| select(.volumePath != null and .volumePath != "") \| "\(.name)=\(.volumePath)"] \| join(", "))"'` | Released slot 有 VolumePath |
 
 #### 7.1.2 加速过期并观察回收
 
@@ -544,7 +544,7 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 
 | 步骤 | 操作 | 命令 |
 |------|------|------|
-| 7.1.2a | 加速过期 | `kubectl patch vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`--type=merge --subresource=status`<br>`-p '{"status":{"resourceStatuses":[{"hostname":"<released-slot-hostname>","state":"Released","lastReleasedTime":"<25-hours-ago-RFC3339>"}, ...]}}'` |
+| 7.1.2a | 加速过期 | `kubectl patch vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`--type=merge --subresource=status`<br>`-p '{"status":{"configStatuses":[{"hostname":"<released-slot-hostname>","state":"Released","lastReleasedTime":"<25-hours-ago-RFC3339>"}, ...]}}'` |
 
 > 注意：需包含所有 slot 的 status，否则会覆盖其他 slot 状态。
 
@@ -552,9 +552,9 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.1.2b | 磁盘回收状态 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.resourceStatuses[] \| select(.hostname=="<released-slot-hostname>") \| "state=\(.state), reclaimStatus=\(.reclaimStatus)"'` | `reclaimStatus.state=Running` → `Completed`（等待 ~30s 后检查） |
-| 7.1.2c | VolumePath/DiskUUID 清空 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.resources[] \| select(.hostname=="<released-slot-hostname>") \| "\(.hostname): \([.persistentDisks[] \| "\(.name): volumePath=\(.volumePath), diskUUID=\(.diskUUID)"] \| join(", "))"'` | volumePath 和 diskUUID 均为空或 null |
-| 7.1.2d | Slot 变为 Available | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.resourceStatuses[] \| select(.hostname=="<released-slot-hostname>") \| "state=\(.state), lastReleasedTime=\(.lastReleasedTime), machineRef=\(.machineRef)"'` | `state=Available`，`lastReleasedTime=null`，`machineRef=null` |
+| 7.1.2b | 磁盘回收状态 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.configStatuses[] \| select(.hostname=="<released-slot-hostname>") \| "state=\(.state), reclaimStatus=\(.reclaimStatus)"'` | `reclaimStatus.state=Running` → `Completed`（等待 ~30s 后检查） |
+| 7.1.2c | VolumePath/DiskUUID 清空 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.spec.configs[] \| select(.hostname=="<released-slot-hostname>") \| "\(.hostname): \([.persistentDisks[] \| "\(.name): volumePath=\(.volumePath), diskUUID=\(.diskUUID)"] \| join(", "))"'` | volumePath 和 diskUUID 均为空或 null |
+| 7.1.2d | Slot 变为 Available | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace> -o json \|`<br>`jq -r '.status.configStatuses[] \| select(.hostname=="<released-slot-hostname>") \| "state=\(.state), lastReleasedTime=\(.lastReleasedTime), machineRef=\(.machineRef)"'` | `state=Available`，`lastReleasedTime=null`，`machineRef=null` |
 | 7.1.2e | vCenter 验证 | `govc datastore.ls -dc=<datacenter> -ds=<datastore> <released-vm-folder>/` | vmdk 文件已不存在 |
 
 ### 7.2 ConsumerRef 自动清空
@@ -565,9 +565,9 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.2.1 | 清空前 — consumerRef | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.name}'` | 仍指向旧 MD |
-| 7.2.2 | 清空前 — slot 状态 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}{"\n"}{end}'` | 全部 Available |
-| 7.2.3 | 等待自动清空 | `sleep 30`<br>`kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef}'` | 空 |
+| 7.2.1 | 清空前 — consumerRef | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.name}'` | 仍指向旧 MD |
+| 7.2.2 | 清空前 — slot 状态 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}{"\n"}{end}'` | 全部 Available |
+| 7.2.3 | 等待自动清空 | `sleep 30`<br>`kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef}'` | 空 |
 
 ### 7.3 ConsumerRef 切换
 
@@ -585,8 +585,8 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.3.2 | ConsumerRef 切换 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.kind}/{.status.consumerRef.name}'` | `MachineDeployment/<other-md>` |
-| 7.3.3 | Slot 分配 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | `<other-md>` failureDomain 对应 DC 的 slot InUse |
+| 7.3.2 | ConsumerRef 切换 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='consumerRef={.status.consumerRef.kind}/{.status.consumerRef.name}'` | `MachineDeployment/<other-md>` |
+| 7.3.3 | Slot 分配 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, machine={.machineRef.name}{"\n"}{end}'` | `<other-md>` failureDomain 对应 DC 的 slot InUse |
 | 7.3.4 | Machine 状态 | `kubectl get machines -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<other-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: phase={.status.phase}, node={.status.nodeRef.name}{"\n"}{end}'` | 1 个 Running |
 | 7.3.5 | IP 与 slot 一致 | `kubectl get vspherevms -n <namespace>`<br>`-l cluster.x-k8s.io/deployment-name=<other-md>`<br>`-o jsonpath='{range .items[*]}{.metadata.name}: addresses={.status.addresses}{"\n"}{end}'` | IP 与 slot NIC1/NIC2 一致 |
 | 7.3.6 | 格式化盘 | `ssh <new-worker-ip> "lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT \| grep -E 'var/cpaas\|var/lib/containerd'"` | 2 块格式化挂载盘正确 |
@@ -601,7 +601,7 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.4.1 | ClusterRef conditions | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'` | `ClusterRefReady=True`，`VCenterAvailable=True` |
+| 7.4.1 | ClusterRef conditions | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'` | `ClusterRefReady=True`，`VCenterAvailable=True` |
 
 #### 7.4.2 ClusterRef 指向不存在的 Cluster
 
@@ -609,7 +609,7 @@ kubectl get machines -n <namespace> -l cluster.x-k8s.io/deployment-name=<bound-m
 
 ```yaml
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereResourcePool
+kind: VSphereMachineConfigPool
 metadata:
   name: test-invalid-clusterref
   namespace: <namespace>
@@ -631,13 +631,13 @@ spec:
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.4.2b | condition | `sleep 30`<br>`kubectl get vsphereresourcepool test-invalid-clusterref -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'` | `ClusterRefReady=False (ClusterNotFound)` |
+| 7.4.2b | condition | `sleep 30`<br>`kubectl get vspheremachineconfigpool test-invalid-clusterref -n <namespace>`<br>`-o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'` | `ClusterRefReady=False (ClusterNotFound)` |
 
 **操作（清理）：**
 
 | 步骤 | 操作 | 命令 |
 |------|------|------|
-| 7.4.2c | 清理 | `kubectl delete vsphereresourcepool test-invalid-clusterref -n <namespace>` |
+| 7.4.2c | 清理 | `kubectl delete vspheremachineconfigpool test-invalid-clusterref -n <namespace>` |
 
 #### 7.4.3 ClusterRef 可修改（consumerRef 为空）
 
@@ -645,7 +645,7 @@ spec:
 
 ```yaml
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereResourcePool
+kind: VSphereMachineConfigPool
 metadata:
   name: test-clusterref-mutable
   namespace: <namespace>
@@ -662,7 +662,7 @@ spec:
 | 步骤 | 操作 | 命令 |
 |------|------|------|
 | 7.4.3a | 创建 pool | `cat <<EOF \| kubectl apply -f -`<br>(上述 YAML)<br>`EOF` |
-| 7.4.3b | 修改 clusterRef | `kubectl patch vsphereresourcepool test-clusterref-mutable -n <namespace> --type=merge`<br>`-p '{"spec":{"clusterRef":{"name":"another-cluster"}}}'` |
+| 7.4.3b | 修改 clusterRef | `kubectl patch vspheremachineconfigpool test-clusterref-mutable -n <namespace> --type=merge`<br>`-p '{"spec":{"clusterRef":{"name":"another-cluster"}}}'` |
 
 **验证：**
 
@@ -674,7 +674,7 @@ spec:
 
 | 步骤 | 操作 | 命令 |
 |------|------|------|
-| 7.4.3d | 清理 | `kubectl delete vsphereresourcepool test-clusterref-mutable -n <namespace>` |
+| 7.4.3d | 清理 | `kubectl delete vspheremachineconfigpool test-clusterref-mutable -n <namespace>` |
 
 #### 7.4.4 ClusterRef 不可修改（consumerRef 非空）
 
@@ -682,7 +682,7 @@ spec:
 
 | 步骤 | 操作 | 命令 | 预期结果 |
 |------|------|------|----------|
-| 7.4.4 | 修改已绑定 pool 的 clusterRef | `kubectl patch vsphereresourcepool <cp-pool-name> -n <namespace> --type=merge`<br>`-p '{"spec":{"clusterRef":{"name":"another-cluster"}}}'` | 被拒绝，`"cannot change clusterRef while consumerRef is set"` |
+| 7.4.4 | 修改已绑定 pool 的 clusterRef | `kubectl patch vspheremachineconfigpool <cp-pool-name> -n <namespace> --type=merge`<br>`-p '{"spec":{"clusterRef":{"name":"another-cluster"}}}'` | 被拒绝，`"cannot change clusterRef while consumerRef is set"` |
 
 ### 7.5 Pool 删除
 
@@ -692,13 +692,13 @@ spec:
 
 | 步骤 | 操作 | 命令 |
 |------|------|------|
-| 7.5.1a | 尝试删除 | `kubectl delete vsphereresourcepool <cp-pool-name> -n <namespace> --wait=false` |
+| 7.5.1a | 尝试删除 | `kubectl delete vspheremachineconfigpool <cp-pool-name> -n <namespace> --wait=false` |
 
 **验证：**
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.5.1b | finalizer 阻止删除 | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='deletionTimestamp={.metadata.deletionTimestamp}, finalizers={.metadata.finalizers}'` | `deletionTimestamp` 已设置，finalizer 仍存在 |
+| 7.5.1b | finalizer 阻止删除 | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='deletionTimestamp={.metadata.deletionTimestamp}, finalizers={.metadata.finalizers}'` | `deletionTimestamp` 已设置，finalizer 仍存在 |
 
 #### 7.5.2 无 Machine 引用时正常删除
 
@@ -706,7 +706,7 @@ spec:
 
 ```yaml
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereResourcePool
+kind: VSphereMachineConfigPool
 metadata:
   name: test-pool-delete
   namespace: <namespace>
@@ -724,13 +724,13 @@ spec:
 | 步骤 | 操作 | 命令 |
 |------|------|------|
 | 7.5.2a | 创建测试 pool | `cat <<EOF \| kubectl apply -f -`<br>(上述 YAML)<br>`EOF` |
-| 7.5.2b | 删除 pool | `sleep 10`<br>`kubectl delete vsphereresourcepool test-pool-delete -n <namespace>` |
+| 7.5.2b | 删除 pool | `sleep 10`<br>`kubectl delete vspheremachineconfigpool test-pool-delete -n <namespace>` |
 
 **验证：**
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.5.2c | 确认已删除 | `kubectl get vsphereresourcepool test-pool-delete -n <namespace>` | NotFound |
+| 7.5.2c | 确认已删除 | `kubectl get vspheremachineconfigpool test-pool-delete -n <namespace>` | NotFound |
 
 #### 7.5.3 有回收任务运行时阻止删除
 
@@ -740,31 +740,31 @@ spec:
 
 | 步骤 | 操作 | 命令 |
 |------|------|------|
-| 7.5.3a | 回收进行中尝试删除 | `kubectl delete vsphereresourcepool <worker-pool-name> -n <namespace> --wait=false` |
+| 7.5.3a | 回收进行中尝试删除 | `kubectl delete vspheremachineconfigpool <worker-pool-name> -n <namespace> --wait=false` |
 
 **验证：**
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 7.5.3b | finalizer 阻止删除 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='deletionTimestamp={.metadata.deletionTimestamp}, finalizers={.metadata.finalizers}'` | finalizer 阻止删除，等回收完成后自动删除 |
+| 7.5.3b | finalizer 阻止删除 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='deletionTimestamp={.metadata.deletionTimestamp}, finalizers={.metadata.finalizers}'` | finalizer 阻止删除，等回收完成后自动删除 |
 
 ---
 
 ## 8. Webhook 验证
 
-**测试目的：** 验证准入 Webhook 对非法资源配置的拦截能力。手动提交各种非法 YAML，确保 VSphereResourcePool、KubeadmControlPlane、MachineDeployment 的创建/修改在违反约束时被正确拒绝。测试完成后清理临时资源。
+**测试目的：** 验证准入 Webhook 对非法资源配置的拦截能力。手动提交各种非法 YAML，确保 VSphereMachineConfigPool、KubeadmControlPlane、MachineDeployment 的创建/修改在违反约束时被正确拒绝。测试完成后清理临时资源。
 
-### 8.1 VSphereResourcePool Webhook
+### 8.1 VSphereMachineConfigPool Webhook
 
 **操作 & 验证（逐条提交非法配置，验证被拒绝）：**
 
 | 步骤 | 测试场景 | 命令 | 预期结果 |
 |------|----------|------|----------|
-| 8.1.1 | clusterRef.name 为空 | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`kind: VSphereResourcePool`<br>`metadata:`<br>`  name: test-webhook-no-clusterref`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterRef:`<br>`    apiVersion: cluster.x-k8s.io/v1beta1`<br>`    kind: Cluster`<br>`    name: ""`<br>`  datacenter: "<datacenter>"`<br>`  resources:`<br>`  - hostname: "test-host"`<br>`EOF` | 拒绝，`"clusterRef.name"` `"must be set"` |
-| 8.1.2 | clusterRef.apiVersion 不匹配 | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`kind: VSphereResourcePool`<br>`metadata:`<br>`  name: test-webhook-bad-apiversion`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterRef:`<br>`    apiVersion: v1`<br>`    kind: Cluster`<br>`    name: <cluster-name>`<br>`  datacenter: "<datacenter>"`<br>`  resources:`<br>`  - hostname: "test-host"`<br>`EOF` | 拒绝，`"must be cluster.x-k8s.io/v1beta1"` |
-| 8.1.3 | clusterRef.kind 不匹配 | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`kind: VSphereResourcePool`<br>`metadata:`<br>`  name: test-webhook-bad-kind`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterRef:`<br>`    apiVersion: cluster.x-k8s.io/v1beta1`<br>`    kind: MachineDeployment`<br>`    name: <cluster-name>`<br>`  datacenter: "<datacenter>"`<br>`  resources:`<br>`  - hostname: "test-host"`<br>`EOF` | 拒绝，`"must be Cluster"` |
-| 8.1.4 | clusterRef.namespace 不匹配 | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`kind: VSphereResourcePool`<br>`metadata:`<br>`  name: test-webhook-bad-ns`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterRef:`<br>`    apiVersion: cluster.x-k8s.io/v1beta1`<br>`    kind: Cluster`<br>`    name: <cluster-name>`<br>`    namespace: other-namespace`<br>`  datacenter: "<datacenter>"`<br>`  resources:`<br>`  - hostname: "test-host"`<br>`EOF` | 拒绝，`"must match pool namespace"` |
-| 8.1.5 | consumerRef 非空时修改 clusterRef | `kubectl patch vsphereresourcepool <cp-pool-name> -n <namespace> --type=merge`<br>`-p '{"spec":{"clusterRef":{"name":"another-cluster"}}}' 2>&1` | 拒绝，`"cannot change clusterRef while consumerRef is set"` |
+| 8.1.1 | clusterRef.name 为空 | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`kind: VSphereMachineConfigPool`<br>`metadata:`<br>`  name: test-webhook-no-clusterref`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterRef:`<br>`    apiVersion: cluster.x-k8s.io/v1beta1`<br>`    kind: Cluster`<br>`    name: ""`<br>`  datacenter: "<datacenter>"`<br>`  resources:`<br>`  - hostname: "test-host"`<br>`EOF` | 拒绝，`"clusterRef.name"` `"must be set"` |
+| 8.1.2 | clusterRef.apiVersion 不匹配 | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`kind: VSphereMachineConfigPool`<br>`metadata:`<br>`  name: test-webhook-bad-apiversion`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterRef:`<br>`    apiVersion: v1`<br>`    kind: Cluster`<br>`    name: <cluster-name>`<br>`  datacenter: "<datacenter>"`<br>`  resources:`<br>`  - hostname: "test-host"`<br>`EOF` | 拒绝，`"must be cluster.x-k8s.io/v1beta1"` |
+| 8.1.3 | clusterRef.kind 不匹配 | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`kind: VSphereMachineConfigPool`<br>`metadata:`<br>`  name: test-webhook-bad-kind`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterRef:`<br>`    apiVersion: cluster.x-k8s.io/v1beta1`<br>`    kind: MachineDeployment`<br>`    name: <cluster-name>`<br>`  datacenter: "<datacenter>"`<br>`  resources:`<br>`  - hostname: "test-host"`<br>`EOF` | 拒绝，`"must be Cluster"` |
+| 8.1.4 | clusterRef.namespace 不匹配 | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`kind: VSphereMachineConfigPool`<br>`metadata:`<br>`  name: test-webhook-bad-ns`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterRef:`<br>`    apiVersion: cluster.x-k8s.io/v1beta1`<br>`    kind: Cluster`<br>`    name: <cluster-name>`<br>`    namespace: other-namespace`<br>`  datacenter: "<datacenter>"`<br>`  resources:`<br>`  - hostname: "test-host"`<br>`EOF` | 拒绝，`"must match pool namespace"` |
+| 8.1.5 | consumerRef 非空时修改 clusterRef | `kubectl patch vspheremachineconfigpool <cp-pool-name> -n <namespace> --type=merge`<br>`-p '{"spec":{"clusterRef":{"name":"another-cluster"}}}' 2>&1` | 拒绝，`"cannot change clusterRef while consumerRef is set"` |
 
 ### 8.2 KCP Consumer Webhook — 引用已被绑定的 pool
 
@@ -793,9 +793,9 @@ spec:
       network:
         devices:
         - networkName: "<nic1-network>"
-      resourcePoolRef:
+      machineConfigPoolRef:
         apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: VSphereResourcePool
+        kind: VSphereMachineConfigPool
         name: <cp-pool-name>
         namespace: <namespace>
 ```
@@ -808,7 +808,7 @@ spec:
 
 | 步骤 | 测试场景 | 命令 | 预期结果 |
 |------|----------|------|----------|
-| 8.2.2 | 创建引用该 template 的 KCP | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: controlplane.cluster.x-k8s.io/v1beta1`<br>`kind: KubeadmControlPlane`<br>`metadata:`<br>`  name: test-webhook-kcp`<br>`  namespace: <namespace>`<br>`spec:`<br>`  replicas: 1`<br>`  version: "<k8s-version>"`<br>`  machineTemplate:`<br>`    infrastructureRef:`<br>`      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`      kind: VSphereMachineTemplate`<br>`      name: test-webhook-kcp-template`<br>`  kubeadmConfigSpec:`<br>`    clusterConfiguration: {}`<br>`    initConfiguration: {}`<br>`    joinConfiguration: {}`<br>`EOF` | 拒绝，`"resource pool <cp-pool-name> is bound to"` |
+| 8.2.2 | 创建引用该 template 的 KCP | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: controlplane.cluster.x-k8s.io/v1beta1`<br>`kind: KubeadmControlPlane`<br>`metadata:`<br>`  name: test-webhook-kcp`<br>`  namespace: <namespace>`<br>`spec:`<br>`  replicas: 1`<br>`  version: "<k8s-version>"`<br>`  machineTemplate:`<br>`    infrastructureRef:`<br>`      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`      kind: VSphereMachineTemplate`<br>`      name: test-webhook-kcp-template`<br>`  kubeadmConfigSpec:`<br>`    clusterConfiguration: {}`<br>`    initConfiguration: {}`<br>`    joinConfiguration: {}`<br>`EOF` | 拒绝，`"machine config pool <cp-pool-name> is bound to"` |
 
 **操作（清理）：**
 
@@ -853,9 +853,9 @@ spec:
       network:
         devices:
         - networkName: "<nic1-network>"
-      resourcePoolRef:
+      machineConfigPoolRef:
         apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: VSphereResourcePool
+        kind: VSphereMachineConfigPool
         name: <cp-pool-name>
         namespace: <namespace>
 ```
@@ -868,7 +868,7 @@ spec:
 
 | 步骤 | 测试场景 | 命令 | 预期结果 |
 |------|----------|------|----------|
-| 8.3.2b | 创建引用该 template 的 MD | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: cluster.x-k8s.io/v1beta1`<br>`kind: MachineDeployment`<br>`metadata:`<br>`  name: test-webhook-md-bound`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterName: <cluster-name>`<br>`  replicas: 1`<br>`  selector:`<br>`    matchLabels:`<br>`      nodepool: test-bound`<br>`  template:`<br>`    metadata:`<br>`      labels:`<br>`        cluster.x-k8s.io/cluster-name: <cluster-name>`<br>`        nodepool: test-bound`<br>`    spec:`<br>`      clusterName: <cluster-name>`<br>`      version: "<k8s-version>"`<br>`      bootstrap:`<br>`        configRef:`<br>`          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1`<br>`          kind: KubeadmConfigTemplate`<br>`          name: <worker-bootstrap-name>`<br>`      infrastructureRef:`<br>`        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`        kind: VSphereMachineTemplate`<br>`        name: test-webhook-md-template`<br>`EOF` | 拒绝，`"resource pool <cp-pool-name> is bound to KubeadmControlPlane"` |
+| 8.3.2b | 创建引用该 template 的 MD | `cat <<EOF \| kubectl apply -f - 2>&1`<br>`apiVersion: cluster.x-k8s.io/v1beta1`<br>`kind: MachineDeployment`<br>`metadata:`<br>`  name: test-webhook-md-bound`<br>`  namespace: <namespace>`<br>`spec:`<br>`  clusterName: <cluster-name>`<br>`  replicas: 1`<br>`  selector:`<br>`    matchLabels:`<br>`      nodepool: test-bound`<br>`  template:`<br>`    metadata:`<br>`      labels:`<br>`        cluster.x-k8s.io/cluster-name: <cluster-name>`<br>`        nodepool: test-bound`<br>`    spec:`<br>`      clusterName: <cluster-name>`<br>`      version: "<k8s-version>"`<br>`      bootstrap:`<br>`        configRef:`<br>`          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1`<br>`          kind: KubeadmConfigTemplate`<br>`          name: <worker-bootstrap-name>`<br>`      infrastructureRef:`<br>`        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1`<br>`        kind: VSphereMachineTemplate`<br>`        name: test-webhook-md-template`<br>`EOF` | 拒绝，`"machine config pool <cp-pool-name> is bound to KubeadmControlPlane"` |
 
 **操作（清理）：**
 
@@ -880,7 +880,7 @@ spec:
 
 ## 9. 集群删除
 
-**测试目的：** 验证集群删除时的级联清理行为：所有 Machine、VSphereVM、VSphereMachine、VSphereCluster、Cluster 资源被正确删除，vCenter 中 VM 被清理，同时静态资源池（VSphereResourcePool）作为独立生命周期的资源不被级联删除，其 slot 从 InUse 转为 Released。
+**测试目的：** 验证集群删除时的级联清理行为：所有 Machine、VSphereVM、VSphereMachine、VSphereCluster、Cluster 资源被正确删除，vCenter 中 VM 被清理，同时静态资源池（VSphereMachineConfigPool）作为独立生命周期的资源不被级联删除，其 slot 从 InUse 转为 Released。
 
 **操作：**
 
@@ -900,9 +900,9 @@ spec:
 
 | 步骤 | 检查项 | 命令 | 预期结果 |
 |------|--------|------|----------|
-| 9.3 | pool 仍存在 | `kubectl get vsphereresourcepools -n <namespace>` | CP pool 和 Worker pool 仍存在 |
-| 9.4 | CP pool slot 状态 | `kubectl get vsphereresourcepool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, lastReleasedTime={.lastReleasedTime}{"\n"}{end}'` | 之前 InUse → Released |
-| 9.5 | Worker pool slot 状态 | `kubectl get vsphereresourcepool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.resourceStatuses[*]}{.hostname}: state={.state}, lastReleasedTime={.lastReleasedTime}{"\n"}{end}'` | 同上 |
+| 9.3 | pool 仍存在 | `kubectl get vspheremachineconfigpools -n <namespace>` | CP pool 和 Worker pool 仍存在 |
+| 9.4 | CP pool slot 状态 | `kubectl get vspheremachineconfigpool <cp-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, lastReleasedTime={.lastReleasedTime}{"\n"}{end}'` | 之前 InUse → Released |
+| 9.5 | Worker pool slot 状态 | `kubectl get vspheremachineconfigpool <worker-pool-name> -n <namespace>`<br>`-o jsonpath='{range .status.configStatuses[*]}{.hostname}: state={.state}, lastReleasedTime={.lastReleasedTime}{"\n"}{end}'` | 同上 |
 
 **验证（vCenter 清理）：**
 

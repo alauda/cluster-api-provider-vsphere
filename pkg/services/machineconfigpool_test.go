@@ -47,22 +47,22 @@ func TestAllocateSlot(t *testing.T) {
 	}
 
 	t.Run("should reuse already assigned slot", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-1"},
 				},
 			},
-			Status: infrav1.VSphereResourcePoolStatus{
-				ResourceStatuses: []infrav1.ResourceSlotStatus{
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
 					{
 						Hostname: "host-1",
-						State:    "InUse",
+						State:    infrav1.MachineConfigSlotStateInUse,
 						MachineRef: &corev1.ObjectReference{
 							Name:      machine.Name,
 							Namespace: machine.Namespace,
@@ -80,22 +80,22 @@ func TestAllocateSlot(t *testing.T) {
 	})
 
 	t.Run("should prefer Released slot over Available", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-reuse",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-available"},
 					{Hostname: "host-released"},
 				},
 			},
-			Status: infrav1.VSphereResourcePoolStatus{
-				ResourceStatuses: []infrav1.ResourceSlotStatus{
-					{Hostname: "host-available", State: "Available"},
-					{Hostname: "host-released", State: "Released"},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-available", State: infrav1.MachineConfigSlotStateAvailable},
+					{Hostname: "host-released", State: infrav1.MachineConfigSlotStateReleased},
 				},
 			},
 		}
@@ -106,25 +106,25 @@ func TestAllocateSlot(t *testing.T) {
 		g.Expect(slot.Hostname).To(Equal("host-released"))
 
 		// Verify status update
-		updatedPool := &infrav1.VSphereResourcePool{}
+		updatedPool := &infrav1.VSphereMachineConfigPool{}
 		_ = c.Get(ctx, client.ObjectKeyFromObject(pool), updatedPool)
-		g.Expect(updatedPool.Status.ResourceStatuses[1].State).To(Equal("InUse"))
-		g.Expect(updatedPool.Status.ResourceStatuses[1].MachineRef.Name).To(Equal(machine.Name))
+		g.Expect(updatedPool.Status.ConfigStatuses[1].State).To(Equal(infrav1.MachineConfigSlotStateInUse))
+		g.Expect(updatedPool.Status.ConfigStatuses[1].MachineRef.Name).To(Equal(machine.Name))
 	})
 
 	t.Run("should return error when no slots available", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-full",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Resources: []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				Configs: []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
-			Status: infrav1.VSphereResourcePoolStatus{
-				ResourceStatuses: []infrav1.ResourceSlotStatus{
-					{Hostname: "host-1", State: "InUse", MachineRef: &corev1.ObjectReference{Name: "other"}},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-1", State: infrav1.MachineConfigSlotStateInUse, MachineRef: &corev1.ObjectReference{Name: "other"}},
 				},
 			},
 		}
@@ -136,15 +136,15 @@ func TestAllocateSlot(t *testing.T) {
 	})
 
 	t.Run("should select slot matching desired datacenter", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-datacenter",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-default",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-default"},
 					{Hostname: "host-target", Datacenter: "dc-target"},
 				},
@@ -158,15 +158,15 @@ func TestAllocateSlot(t *testing.T) {
 	})
 
 	t.Run("should return error when no slot matches desired datacenter", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-no-match",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-default",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-default"},
 				},
 			},
@@ -179,14 +179,14 @@ func TestAllocateSlot(t *testing.T) {
 	})
 
 	t.Run("should require slot to satisfy both template and failure domain datacenters", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-template-and-failure-domain",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-a", Datacenter: "dc-template"},
 					{Hostname: "host-b", Datacenter: "dc-fd"},
 				},
@@ -200,23 +200,23 @@ func TestAllocateSlot(t *testing.T) {
 	})
 
 	t.Run("should select slot matching failure domain datacenters when template datacenter is empty", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-failure-domain-match",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-a"},
 					{Hostname: "host-b", Datacenter: "dc-fd"},
 				},
 			},
-			Status: infrav1.VSphereResourcePoolStatus{
-				ResourceStatuses: []infrav1.ResourceSlotStatus{
-					{Hostname: "host-a", State: "Available"},
-					{Hostname: "host-b", State: "Released"},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-a", State: infrav1.MachineConfigSlotStateAvailable},
+					{Hostname: "host-b", State: infrav1.MachineConfigSlotStateReleased},
 				},
 			},
 		}
@@ -229,23 +229,23 @@ func TestAllocateSlot(t *testing.T) {
 	})
 
 	t.Run("should treat wildcard template datacenter as unspecified when matching failure domain datacenters", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-failure-domain-match-wildcard",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-a"},
 					{Hostname: "host-b", Datacenter: "dc-fd"},
 				},
 			},
-			Status: infrav1.VSphereResourcePoolStatus{
-				ResourceStatuses: []infrav1.ResourceSlotStatus{
-					{Hostname: "host-a", State: "Available"},
-					{Hostname: "host-b", State: "Available"},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-a", State: infrav1.MachineConfigSlotStateAvailable},
+					{Hostname: "host-b", State: infrav1.MachineConfigSlotStateAvailable},
 				},
 			},
 		}
@@ -258,15 +258,15 @@ func TestAllocateSlot(t *testing.T) {
 	})
 
 	t.Run("should return error when no slot matches failure domain datacenters", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-failure-domain-no-match",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-a"},
 				},
 			},
@@ -279,15 +279,15 @@ func TestAllocateSlot(t *testing.T) {
 	})
 
 	t.Run("should backfill the resolved datacenter onto the selected slot", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-pool-backfill-datacenter",
 				Namespace: "default",
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-a"},
 				},
 			},
@@ -306,16 +306,16 @@ func TestReleaseSlot(t *testing.T) {
 	_ = infrav1.AddToScheme(scheme)
 
 	ctx := context.Background()
-	pool := &infrav1.VSphereResourcePool{
+	pool := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-pool-release",
 			Namespace: "default",
 		},
-		Status: infrav1.VSphereResourcePoolStatus{
-			ResourceStatuses: []infrav1.ResourceSlotStatus{
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{
 				{
 					Hostname: "host-1",
-					State:    "InUse",
+					State:    infrav1.MachineConfigSlotStateInUse,
 					MachineRef: &corev1.ObjectReference{
 						Name:      "my-machine",
 						Namespace: "default",
@@ -329,10 +329,10 @@ func TestReleaseSlot(t *testing.T) {
 	err := ReleaseSlot(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, &corev1.ObjectReference{Name: "my-machine", Namespace: "default"})
 	g.Expect(err).NotTo(HaveOccurred())
 
-	updatedPool := &infrav1.VSphereResourcePool{}
+	updatedPool := &infrav1.VSphereMachineConfigPool{}
 	_ = c.Get(ctx, client.ObjectKeyFromObject(pool), updatedPool)
-	g.Expect(updatedPool.Status.ResourceStatuses[0].State).To(Equal("Released"))
-	g.Expect(updatedPool.Status.ResourceStatuses[0].LastReleasedTime).NotTo(BeNil())
+	g.Expect(updatedPool.Status.ConfigStatuses[0].State).To(Equal(infrav1.MachineConfigSlotStateReleased))
+	g.Expect(updatedPool.Status.ConfigStatuses[0].LastReleasedTime).NotTo(BeNil())
 }
 
 func TestGetSlotForMachine(t *testing.T) {
@@ -341,23 +341,23 @@ func TestGetSlotForMachine(t *testing.T) {
 	_ = infrav1.AddToScheme(scheme)
 
 	ctx := context.Background()
-	pool := &infrav1.VSphereResourcePool{
+	pool := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-pool-lookup",
 			Namespace: "default",
 		},
-		Spec: infrav1.VSphereResourcePoolSpec{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Resources: []infrav1.ResourceSlot{
+			Configs: []infrav1.MachineConfigSlot{
 				{Hostname: "host-a"},
 				{Hostname: "host-b"},
 			},
 		},
-		Status: infrav1.VSphereResourcePoolStatus{
-			ResourceStatuses: []infrav1.ResourceSlotStatus{
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{
 				{
 					Hostname: "host-b",
-					State:    "InUse",
+					State:    infrav1.MachineConfigSlotStateInUse,
 					MachineRef: &corev1.ObjectReference{
 						Name:      "my-machine",
 						Namespace: "default",
@@ -374,27 +374,27 @@ func TestGetSlotForMachine(t *testing.T) {
 	g.Expect(slot.Hostname).To(Equal("host-b"))
 }
 
-func TestResolveResourcePoolDatacenter(t *testing.T) {
+func TestResolveMachineConfigPoolDatacenter(t *testing.T) {
 	g := NewWithT(t)
 
-	pool := &infrav1.VSphereResourcePool{
-		Spec: infrav1.VSphereResourcePoolSpec{
+	pool := &infrav1.VSphereMachineConfigPool{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Datacenter: "dc-pool",
 		},
 	}
 
-	slotWithOwnDatacenter := &infrav1.ResourceSlot{
+	slotWithOwnDatacenter := &infrav1.MachineConfigSlot{
 		Hostname:   "host-1",
 		Datacenter: "dc-slot",
 	}
-	slotWithoutDatacenter := &infrav1.ResourceSlot{
+	slotWithoutDatacenter := &infrav1.MachineConfigSlot{
 		Hostname: "host-2",
 	}
 
-	g.Expect(ResolveResourcePoolDatacenter(pool, slotWithOwnDatacenter)).To(Equal("dc-slot"))
-	g.Expect(ResolveResourcePoolDatacenter(pool, slotWithoutDatacenter)).To(Equal("dc-pool"))
-	g.Expect(ResolveResourcePoolDatacenter(nil, slotWithoutDatacenter)).To(BeEmpty())
+	g.Expect(ResolveMachineConfigPoolDatacenter(pool, slotWithOwnDatacenter)).To(Equal("dc-slot"))
+	g.Expect(ResolveMachineConfigPoolDatacenter(pool, slotWithoutDatacenter)).To(Equal("dc-pool"))
+	g.Expect(ResolveMachineConfigPoolDatacenter(nil, slotWithoutDatacenter)).To(BeEmpty())
 }
 
 func TestDatacentersWithAvailableSlots(t *testing.T) {
@@ -406,21 +406,21 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 
 	t.Run("available and released slots are counted", func(t *testing.T) {
 		g := NewWithT(t)
-		pools := []infrav1.VSphereResourcePool{{
-			Spec: infrav1.VSphereResourcePoolSpec{
+		pools := []infrav1.VSphereMachineConfigPool{{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 				Datacenter: "dc-1",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-1"},
 					{Hostname: "host-2"},
 					{Hostname: "host-3", Datacenter: "dc-2"},
 				},
 			},
-			Status: infrav1.VSphereResourcePoolStatus{
-				ResourceStatuses: []infrav1.ResourceSlotStatus{
-					{Hostname: "host-1", State: "InUse"},
-					{Hostname: "host-2", State: "Released"},
-					{Hostname: "host-3", State: "Available"},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-1", State: infrav1.MachineConfigSlotStateInUse},
+					{Hostname: "host-2", State: infrav1.MachineConfigSlotStateReleased},
+					{Hostname: "host-3", State: infrav1.MachineConfigSlotStateAvailable},
 				},
 			},
 		}}
@@ -431,19 +431,19 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 
 	t.Run("all slots in use excludes datacenter", func(t *testing.T) {
 		g := NewWithT(t)
-		pools := []infrav1.VSphereResourcePool{{
-			Spec: infrav1.VSphereResourcePoolSpec{
+		pools := []infrav1.VSphereMachineConfigPool{{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 				Datacenter: "dc-1",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-1"},
 					{Hostname: "host-2"},
 				},
 			},
-			Status: infrav1.VSphereResourcePoolStatus{
-				ResourceStatuses: []infrav1.ResourceSlotStatus{
-					{Hostname: "host-1", State: "InUse"},
-					{Hostname: "host-2", State: "InUse"},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-1", State: infrav1.MachineConfigSlotStateInUse},
+					{Hostname: "host-2", State: infrav1.MachineConfigSlotStateInUse},
 				},
 			},
 		}}
@@ -453,11 +453,11 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 
 	t.Run("uninitialized slots count as available", func(t *testing.T) {
 		g := NewWithT(t)
-		pools := []infrav1.VSphereResourcePool{{
-			Spec: infrav1.VSphereResourcePoolSpec{
+		pools := []infrav1.VSphereMachineConfigPool{{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 				Datacenter: "dc-1",
-				Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+				Configs:  []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 			// No status entries
 		}}
@@ -467,11 +467,11 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 
 	t.Run("slot-level datacenter overrides pool-level", func(t *testing.T) {
 		g := NewWithT(t)
-		pools := []infrav1.VSphereResourcePool{{
-			Spec: infrav1.VSphereResourcePoolSpec{
+		pools := []infrav1.VSphereMachineConfigPool{{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 				Datacenter: "dc-pool",
-				Resources: []infrav1.ResourceSlot{
+				Configs: []infrav1.MachineConfigSlot{
 					{Hostname: "host-1", Datacenter: "dc-slot"},
 				},
 			},
@@ -483,24 +483,24 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 
 	t.Run("multiple pools aggregate available datacenters", func(t *testing.T) {
 		g := NewWithT(t)
-		pools := []infrav1.VSphereResourcePool{
+		pools := []infrav1.VSphereMachineConfigPool{
 			{
-				Spec: infrav1.VSphereResourcePoolSpec{
+				Spec: infrav1.VSphereMachineConfigPoolSpec{
 					ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 					Datacenter: "dc-1",
-					Resources:  []infrav1.ResourceSlot{{Hostname: "host-1"}},
+					Configs:  []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 				},
-				Status: infrav1.VSphereResourcePoolStatus{
-					ResourceStatuses: []infrav1.ResourceSlotStatus{
-						{Hostname: "host-1", State: "InUse"},
+				Status: infrav1.VSphereMachineConfigPoolStatus{
+					ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+						{Hostname: "host-1", State: infrav1.MachineConfigSlotStateInUse},
 					},
 				},
 			},
 			{
-				Spec: infrav1.VSphereResourcePoolSpec{
+				Spec: infrav1.VSphereMachineConfigPoolSpec{
 					ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 					Datacenter: "dc-1",
-					Resources:  []infrav1.ResourceSlot{{Hostname: "host-2"}},
+					Configs:  []infrav1.MachineConfigSlot{{Hostname: "host-2"}},
 				},
 				// host-2 has no status -> available
 			},
@@ -512,54 +512,54 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 
 func TestIsPoolFullyReusable(t *testing.T) {
 	g := NewWithT(t)
-	pool := &infrav1.VSphereResourcePool{
-		Spec: infrav1.VSphereResourcePoolSpec{
+	pool := &infrav1.VSphereMachineConfigPool{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}},
+			Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}},
 		},
-		Status: infrav1.VSphereResourcePoolStatus{
-			ResourceStatuses: []infrav1.ResourceSlotStatus{{Hostname: "slot-1", State: "Available"}},
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{Hostname: "slot-1", State: infrav1.MachineConfigSlotStateAvailable}},
 		},
 	}
 	g.Expect(IsPoolFullyReusable(pool)).To(BeTrue())
 
 	released := pool.DeepCopy()
 	now := metav1.Now()
-	released.Status.ResourceStatuses[0].State = "Released"
-	released.Status.ResourceStatuses[0].LastReleasedTime = &now
+	released.Status.ConfigStatuses[0].State = infrav1.MachineConfigSlotStateReleased
+	released.Status.ConfigStatuses[0].LastReleasedTime = &now
 	g.Expect(IsPoolFullyReusable(released)).To(BeFalse())
 
 	withTask := pool.DeepCopy()
-	withTask.Status.ResourceStatuses[0].ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{TaskRef: "task-1", State: "Running"}
+	withTask.Status.ConfigStatuses[0].ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{TaskRef: "task-1", State: "Running"}
 	g.Expect(IsPoolFullyReusable(withTask)).To(BeFalse())
 
 	withDisk := pool.DeepCopy()
-	withDisk.Spec.Resources[0].PersistentDisks = []infrav1.PersistentDisk{{Name: "disk-1", VolumePath: "[ds] vm/disk.vmdk"}}
+	withDisk.Spec.Configs[0].PersistentDisks = []infrav1.PersistentDisk{{Name: "disk-1", VolumePath: "[ds] vm/disk.vmdk"}}
 	g.Expect(IsPoolFullyReusable(withDisk)).To(BeFalse())
 
 	withRetry := pool.DeepCopy()
 	retryAfter := metav1.Now()
-	withRetry.Status.ResourceStatuses[0].ReclaimStatus = &infrav1.ResourceSlotReclaimStatus{RetryAfter: &retryAfter, State: "Failed"}
+	withRetry.Status.ConfigStatuses[0].ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{RetryAfter: &retryAfter, State: "Failed"}
 	g.Expect(IsPoolFullyReusable(withRetry)).To(BeFalse())
 }
 
 
-func TestFindResourcePoolForMachine(t *testing.T) {
+func TestFindMachineConfigPoolForMachine(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 
 	ctx := context.Background()
-	poolA := &infrav1.VSphereResourcePool{
+	poolA := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pool-a",
 			Namespace: "default",
 		},
-		Status: infrav1.VSphereResourcePoolStatus{
-			ResourceStatuses: []infrav1.ResourceSlotStatus{
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{
 				{
 					Hostname: "host-a",
-					State:    "InUse",
+					State:    infrav1.MachineConfigSlotStateInUse,
 					MachineRef: &corev1.ObjectReference{
 						Name:      "other-machine",
 						Namespace: "default",
@@ -568,16 +568,16 @@ func TestFindResourcePoolForMachine(t *testing.T) {
 			},
 		},
 	}
-	poolB := &infrav1.VSphereResourcePool{
+	poolB := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pool-b",
 			Namespace: "default",
 		},
-		Status: infrav1.VSphereResourcePoolStatus{
-			ResourceStatuses: []infrav1.ResourceSlotStatus{
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{
 				{
 					Hostname: "host-b",
-					State:    "InUse",
+					State:    infrav1.MachineConfigSlotStateInUse,
 					MachineRef: &corev1.ObjectReference{
 						Name:      "my-machine",
 						Namespace: "default",
@@ -589,7 +589,7 @@ func TestFindResourcePoolForMachine(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(poolA, poolB).WithStatusSubresource(poolA, poolB).Build()
 
-	poolRef, err := FindResourcePoolForMachine(ctx, c, "default", &corev1.ObjectReference{Name: "my-machine", Namespace: "default", UID: "machine-uid"})
+	poolRef, err := FindMachineConfigPoolForMachine(ctx, c, "default", &corev1.ObjectReference{Name: "my-machine", Namespace: "default", UID: "machine-uid"})
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(poolRef).NotTo(BeNil())
 	g.Expect(poolRef.Name).To(Equal("pool-b"))
@@ -605,14 +605,14 @@ func TestPersistSlotChangesPersistsUnitNumber(t *testing.T) {
 	_ = infrav1.AddToScheme(scheme)
 
 	ctx := context.Background()
-	pool := &infrav1.VSphereResourcePool{
+	pool := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-pool-persist",
 			Namespace: "default",
 		},
-		Spec: infrav1.VSphereResourcePoolSpec{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Resources: []infrav1.ResourceSlot{
+			Configs: []infrav1.MachineConfigSlot{
 				{
 					Hostname: "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{
@@ -625,7 +625,7 @@ func TestPersistSlotChangesPersistsUnitNumber(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).Build()
 
 	unitNumber := int32(3)
-	err := PersistSlotChanges(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, &infrav1.ResourceSlot{
+	err := PersistSlotChanges(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, &infrav1.MachineConfigSlot{
 		Hostname: "host-1",
 		PersistentDisks: []infrav1.PersistentDisk{
 			{
@@ -638,12 +638,12 @@ func TestPersistSlotChangesPersistsUnitNumber(t *testing.T) {
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 
-	updatedPool := &infrav1.VSphereResourcePool{}
+	updatedPool := &infrav1.VSphereMachineConfigPool{}
 	_ = c.Get(ctx, client.ObjectKeyFromObject(pool), updatedPool)
-	g.Expect(updatedPool.Spec.Resources[0].PersistentDisks[0].UnitNumber).NotTo(BeNil())
-	g.Expect(*updatedPool.Spec.Resources[0].PersistentDisks[0].UnitNumber).To(Equal(unitNumber))
-	g.Expect(updatedPool.Spec.Resources[0].PersistentDisks[0].VolumePath).To(Equal("[datastore1] disk-1/disk-1.vmdk"))
-	g.Expect(updatedPool.Spec.Resources[0].PersistentDisks[0].DiskUUID).To(Equal("disk-uuid"))
+	g.Expect(updatedPool.Spec.Configs[0].PersistentDisks[0].UnitNumber).NotTo(BeNil())
+	g.Expect(*updatedPool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(Equal(unitNumber))
+	g.Expect(updatedPool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(Equal("[datastore1] disk-1/disk-1.vmdk"))
+	g.Expect(updatedPool.Spec.Configs[0].PersistentDisks[0].DiskUUID).To(Equal("disk-uuid"))
 }
 
 func TestResolveMachineConsumerRef(t *testing.T) {
@@ -730,10 +730,10 @@ func TestApplyDiskBackfill(t *testing.T) {
 
 	t.Run("backfills VolumePath DiskUUID UnitNumber", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereResourcePool{
-			Spec: infrav1.VSphereResourcePoolSpec{
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Resources: []infrav1.ResourceSlot{{
+				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "disk-a", SizeGiB: 20},
@@ -741,24 +741,24 @@ func TestApplyDiskBackfill(t *testing.T) {
 				}},
 			},
 		}
-		updated := ApplyDiskBackfill(pool, &infrav1.ResourceSlot{
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
 			Hostname: "host-1",
 			PersistentDisks: []infrav1.PersistentDisk{
 				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
 			},
 		})
 		g.Expect(updated).To(BeTrue())
-		g.Expect(pool.Spec.Resources[0].PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk.vmdk"))
-		g.Expect(pool.Spec.Resources[0].PersistentDisks[0].DiskUUID).To(Equal("uuid-1"))
-		g.Expect(*pool.Spec.Resources[0].PersistentDisks[0].UnitNumber).To(Equal(int32(1)))
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk.vmdk"))
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].DiskUUID).To(Equal("uuid-1"))
+		g.Expect(*pool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(Equal(int32(1)))
 	})
 
 	t.Run("returns false when nothing changed", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereResourcePool{
-			Spec: infrav1.VSphereResourcePoolSpec{
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Resources: []infrav1.ResourceSlot{{
+				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
@@ -766,7 +766,7 @@ func TestApplyDiskBackfill(t *testing.T) {
 				}},
 			},
 		}
-		updated := ApplyDiskBackfill(pool, &infrav1.ResourceSlot{
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
 			Hostname: "host-1",
 			PersistentDisks: []infrav1.PersistentDisk{
 				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
@@ -777,10 +777,10 @@ func TestApplyDiskBackfill(t *testing.T) {
 
 	t.Run("skips disk with mismatched UnitNumber", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereResourcePool{
-			Spec: infrav1.VSphereResourcePoolSpec{
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Resources: []infrav1.ResourceSlot{{
+				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(0)},
@@ -788,28 +788,28 @@ func TestApplyDiskBackfill(t *testing.T) {
 				}},
 			},
 		}
-		updated := ApplyDiskBackfill(pool, &infrav1.ResourceSlot{
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
 			Hostname: "host-1",
 			PersistentDisks: []infrav1.PersistentDisk{
 				{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(1), VolumePath: "[ds] wrong/disk.vmdk"},
 			},
 		})
 		g.Expect(updated).To(BeFalse(), "should skip update when UnitNumber disagrees")
-		g.Expect(pool.Spec.Resources[0].PersistentDisks[0].VolumePath).To(BeEmpty())
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(BeEmpty())
 	})
 
 	t.Run("no-op for non-matching hostname", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereResourcePool{
-			Spec: infrav1.VSphereResourcePoolSpec{
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Resources: []infrav1.ResourceSlot{{
+				Configs: []infrav1.MachineConfigSlot{{
 					Hostname:        "host-1",
 					PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20}},
 				}},
 			},
 		}
-		updated := ApplyDiskBackfill(pool, &infrav1.ResourceSlot{
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
 			Hostname: "host-other",
 			PersistentDisks: []infrav1.PersistentDisk{
 				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk"},
@@ -820,8 +820,8 @@ func TestApplyDiskBackfill(t *testing.T) {
 
 	t.Run("nil pool or slot returns false", func(t *testing.T) {
 		g := NewWithT(t)
-		g.Expect(ApplyDiskBackfill(nil, &infrav1.ResourceSlot{})).To(BeFalse())
-		g.Expect(ApplyDiskBackfill(&infrav1.VSphereResourcePool{}, nil)).To(BeFalse())
+		g.Expect(ApplyDiskBackfill(nil, &infrav1.MachineConfigSlot{})).To(BeFalse())
+		g.Expect(ApplyDiskBackfill(&infrav1.VSphereMachineConfigPool{}, nil)).To(BeFalse())
 	})
 }
 

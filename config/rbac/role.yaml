@@ -86,7 +86,7 @@ rules:
   - vspherefailuredomains.infrastructure.cluster.x-k8s.io
   - vspheremachines.infrastructure.cluster.x-k8s.io
   - vspheremachinetemplates.infrastructure.cluster.x-k8s.io
-  - vsphereresourcepools.infrastructure.cluster.x-k8s.io
+  - vspheremachineconfigpools.infrastructure.cluster.x-k8s.io
   - vspherevms.infrastructure.cluster.x-k8s.io
   resources:
   - customresourcedefinitions

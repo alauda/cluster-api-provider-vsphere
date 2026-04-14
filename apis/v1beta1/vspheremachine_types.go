@@ -148,9 +148,9 @@ type VSphereMachineSpec struct {
 	// +optional
 	NamingStrategy *VSphereVMNamingStrategy `json:"namingStrategy,omitempty"`
 
-	// ResourcePoolRef is a reference to the VSphereResourcePool to use for this machine.
+	// MachineConfigPoolRef is a reference to the VSphereMachineConfigPool to use for this machine.
 	// +optional
-	ResourcePoolRef *corev1.ObjectReference `json:"resourcePoolRef,omitempty"`
+	MachineConfigPoolRef *corev1.ObjectReference `json:"machineConfigPoolRef,omitempty"`
 }
 
 // VSphereVMNamingStrategy defines the naming strategy for the VSphereVMs.

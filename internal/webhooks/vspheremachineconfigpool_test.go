@@ -14,7 +14,7 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 )
 
-func TestVSphereResourcePoolValidateCreate(t *testing.T) {
+func TestVSphereMachineConfigPoolValidateCreate(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
@@ -22,7 +22,7 @@ func TestVSphereResourcePoolValidateCreate(t *testing.T) {
 	t.Run("valid pool", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := newPool()
-		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), pool)
 		g.Expect(err).NotTo(HaveOccurred())
 	})
@@ -31,7 +31,7 @@ func TestVSphereResourcePoolValidateCreate(t *testing.T) {
 		g := NewWithT(t)
 		pool := newPool()
 		pool.Spec.ClusterRef.Name = ""
-		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), pool)
 		g.Expect(err).To(HaveOccurred())
 	})
@@ -39,10 +39,10 @@ func TestVSphereResourcePoolValidateCreate(t *testing.T) {
 	t.Run("reject network without primary networkName", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := newPool()
-		pool.Spec.Resources[0].Network = &infrav1.ResourceSlotNetwork{
+		pool.Spec.Configs[0].Network = &infrav1.MachineConfigSlotNetwork{
 			Primary: infrav1.NetworkConfig{},
 		}
-		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), pool)
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring("primary"))
@@ -51,15 +51,15 @@ func TestVSphereResourcePoolValidateCreate(t *testing.T) {
 	t.Run("reject invalid hostname for kubernetes node name", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := newPool()
-		pool.Spec.Resources[0].Hostname = "Node_01"
-		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		pool.Spec.Configs[0].Hostname = "Node_01"
+		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), pool)
 		g.Expect(err).To(HaveOccurred())
-		g.Expect(err.Error()).To(ContainSubstring("spec.resources[0].hostname"))
+		g.Expect(err.Error()).To(ContainSubstring("spec.configs[0].hostname"))
 	})
 }
 
-func TestVSphereResourcePoolValidateUpdate(t *testing.T) {
+func TestVSphereMachineConfigPoolValidateUpdate(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
@@ -72,7 +72,7 @@ func TestVSphereResourcePoolValidateUpdate(t *testing.T) {
 		}
 		newPool := oldPool.DeepCopy()
 		newPool.Spec.ClusterRef.Name = "other-cluster"
-		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateUpdate(context.Background(), oldPool, newPool)
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring("clusterRef"))
@@ -83,18 +83,18 @@ func TestVSphereResourcePoolValidateUpdate(t *testing.T) {
 		oldPool := newPool()
 		newPool := oldPool.DeepCopy()
 		newPool.Spec.ClusterRef.Name = "other-cluster"
-		webhook := &VSphereResourcePool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateUpdate(context.Background(), oldPool, newPool)
 		g.Expect(err).NotTo(HaveOccurred())
 	})
 }
 
-func newPool() *infrav1.VSphereResourcePool {
-	return &infrav1.VSphereResourcePool{
+func newPool() *infrav1.VSphereMachineConfigPool {
+	return &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
-		Spec: infrav1.VSphereResourcePoolSpec{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Resources:  []infrav1.ResourceSlot{{Hostname: "slot-1"}},
+			Configs:  []infrav1.MachineConfigSlot{{Hostname: "slot-1"}},
 		},
 	}
 }

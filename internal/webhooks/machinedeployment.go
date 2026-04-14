@@ -70,14 +70,14 @@ func (webhook *MachineDeployment) validatePoolRef(ctx context.Context, obj *clus
 		return allErrs
 	}
 
-	poolRef := template.Spec.Template.Spec.ResourcePoolRef
+	poolRef := template.Spec.Template.Spec.MachineConfigPoolRef
 	if poolRef == nil {
 		return allErrs
 	}
-	pool := &infrav1.VSphereResourcePool{}
+	pool := &infrav1.VSphereMachineConfigPool{}
 	if err := webhook.Client.Get(ctx, client.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
 		if apierrors.IsNotFound(err) {
-			allErrs = append(allErrs, field.Invalid(templatePath.Child("name"), template.Name, "referenced resource pool does not exist"))
+			allErrs = append(allErrs, field.Invalid(templatePath.Child("name"), template.Name, "referenced machine config pool does not exist"))
 		} else {
 			allErrs = append(allErrs, field.InternalError(templatePath, err))
 		}
@@ -92,7 +92,7 @@ func (webhook *MachineDeployment) validatePoolRef(ctx context.Context, obj *clus
 		UID:        obj.UID,
 	}
 	if pool.Status.ConsumerRef != nil && !services.ConsumerRefsEqual(pool.Status.ConsumerRef, self) {
-		allErrs = append(allErrs, field.Forbidden(templatePath, fmt.Sprintf("resource pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Status.ConsumerRef.Kind, pool.Status.ConsumerRef.Namespace, pool.Status.ConsumerRef.Name)))
+		allErrs = append(allErrs, field.Forbidden(templatePath, fmt.Sprintf("machine config pool %s/%s is bound to %s %s/%s", pool.Namespace, pool.Name, pool.Status.ConsumerRef.Kind, pool.Status.ConsumerRef.Namespace, pool.Status.ConsumerRef.Name)))
 	}
 
 	if err := rejectOtherObjectsReferencingPool(ctx, webhook.Client, poolRef, self); err != nil {

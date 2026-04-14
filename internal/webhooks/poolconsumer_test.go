@@ -27,7 +27,7 @@ func TestKubeadmControlPlaneValidatePoolRef(t *testing.T) {
 		Spec: infrav1.VSphereMachineTemplateSpec{
 			Template: infrav1.VSphereMachineTemplateResource{
 				Spec: infrav1.VSphereMachineSpec{
-					ResourcePoolRef: &corev1.ObjectReference{Name: "pool-a", Namespace: "default"},
+					MachineConfigPoolRef: &corev1.ObjectReference{Name: "pool-a", Namespace: "default"},
 				},
 			},
 		},
@@ -42,9 +42,9 @@ func TestKubeadmControlPlaneValidatePoolRef(t *testing.T) {
 	}
 
 	t.Run("allow unbound pool", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-			Spec:       infrav1.VSphereResourcePoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
+			Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
 		}
 		webhook := &KubeadmControlPlane{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(template, kcp, pool).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), kcp)
@@ -52,10 +52,10 @@ func TestKubeadmControlPlaneValidatePoolRef(t *testing.T) {
 	})
 
 	t.Run("reject pool bound to another consumer", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-			Spec:       infrav1.VSphereResourcePoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
-			Status: infrav1.VSphereResourcePoolStatus{
+			Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
 				ConsumerRef: &corev1.ObjectReference{
 					APIVersion: clusterv1.GroupVersion.String(),
 					Kind:       "MachineDeployment",
@@ -70,10 +70,10 @@ func TestKubeadmControlPlaneValidatePoolRef(t *testing.T) {
 	})
 
 	t.Run("allow pool already bound to self", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-			Spec:       infrav1.VSphereResourcePoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
-			Status: infrav1.VSphereResourcePoolStatus{
+			Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
 				ConsumerRef: &corev1.ObjectReference{
 					APIVersion: controlplanev1.GroupVersion.String(),
 					Kind:       "KubeadmControlPlane",
@@ -100,7 +100,7 @@ func TestMachineDeploymentValidatePoolRef(t *testing.T) {
 		Spec: infrav1.VSphereMachineTemplateSpec{
 			Template: infrav1.VSphereMachineTemplateResource{
 				Spec: infrav1.VSphereMachineSpec{
-					ResourcePoolRef: &corev1.ObjectReference{Name: "pool-a", Namespace: "default"},
+					MachineConfigPoolRef: &corev1.ObjectReference{Name: "pool-a", Namespace: "default"},
 				},
 			},
 		},
@@ -117,9 +117,9 @@ func TestMachineDeploymentValidatePoolRef(t *testing.T) {
 	}
 
 	t.Run("allow unbound pool", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-			Spec:       infrav1.VSphereResourcePoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
+			Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
 		}
 		webhook := &MachineDeployment{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(template, md, pool).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), md)
@@ -133,9 +133,9 @@ func TestMachineDeploymentValidatePoolRef(t *testing.T) {
 		otherMD.Name = "md-b"
 		otherMD.Spec.Template.Spec.InfrastructureRef.Name = "md-template-b"
 
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-			Spec:       infrav1.VSphereResourcePoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
+			Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
 		}
 		webhook := &MachineDeployment{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(template, md, otherTemplate, otherMD, pool).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), md)
@@ -143,10 +143,10 @@ func TestMachineDeploymentValidatePoolRef(t *testing.T) {
 	})
 
 	t.Run("allow pool already bound to self", func(t *testing.T) {
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-			Spec:       infrav1.VSphereResourcePoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Resources: []infrav1.ResourceSlot{{Hostname: "slot-1"}}},
-			Status: infrav1.VSphereResourcePoolStatus{
+			Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
 				ConsumerRef: &corev1.ObjectReference{
 					APIVersion: clusterv1.GroupVersion.String(),
 					Kind:       "MachineDeployment",

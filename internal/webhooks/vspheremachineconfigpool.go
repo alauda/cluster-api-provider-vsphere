@@ -17,54 +17,54 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 )
 
-// +kubebuilder:webhook:verbs=create;update,path=/validate-infrastructure-cluster-x-k8s-io-v1beta1-vsphereresourcepool,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,groups=infrastructure.cluster.x-k8s.io,resources=vsphereresourcepools,versions=v1beta1,name=validation.vsphereresourcepool.infrastructure.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1beta1
+// +kubebuilder:webhook:verbs=create;update,path=/validate-infrastructure-cluster-x-k8s-io-v1beta1-vspheremachineconfigpool,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,groups=infrastructure.cluster.x-k8s.io,resources=vspheremachineconfigpools,versions=v1beta1,name=validation.vspheremachineconfigpool.infrastructure.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1beta1
 
-type VSphereResourcePool struct {
+type VSphereMachineConfigPool struct {
 	Client client.Client
 }
 
-var _ webhook.CustomValidator = &VSphereResourcePool{}
+var _ webhook.CustomValidator = &VSphereMachineConfigPool{}
 
-func (webhook *VSphereResourcePool) SetupWebhookWithManager(mgr ctrl.Manager) error {
+func (webhook *VSphereMachineConfigPool) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	webhook.Client = mgr.GetClient()
 	return ctrl.NewWebhookManagedBy(mgr).
-		For(&infrav1.VSphereResourcePool{}).
+		For(&infrav1.VSphereMachineConfigPool{}).
 		WithValidator(webhook).
 		Complete()
 }
 
-func (webhook *VSphereResourcePool) ValidateCreate(_ context.Context, raw runtime.Object) (admission.Warnings, error) {
-	obj, ok := raw.(*infrav1.VSphereResourcePool)
+func (webhook *VSphereMachineConfigPool) ValidateCreate(_ context.Context, raw runtime.Object) (admission.Warnings, error) {
+	obj, ok := raw.(*infrav1.VSphereMachineConfigPool)
 	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereResourcePool but got a %T", raw))
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereMachineConfigPool but got a %T", raw))
 	}
 	return nil, AggregateObjErrors(obj.GroupVersionKind().GroupKind(), obj.Name, webhook.validate(nil, obj))
 }
 
-func (webhook *VSphereResourcePool) ValidateUpdate(_ context.Context, oldRaw runtime.Object, newRaw runtime.Object) (admission.Warnings, error) {
-	oldObj, ok := oldRaw.(*infrav1.VSphereResourcePool)
+func (webhook *VSphereMachineConfigPool) ValidateUpdate(_ context.Context, oldRaw runtime.Object, newRaw runtime.Object) (admission.Warnings, error) {
+	oldObj, ok := oldRaw.(*infrav1.VSphereMachineConfigPool)
 	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereResourcePool but got a %T", oldRaw))
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereMachineConfigPool but got a %T", oldRaw))
 	}
-	newObj, ok := newRaw.(*infrav1.VSphereResourcePool)
+	newObj, ok := newRaw.(*infrav1.VSphereMachineConfigPool)
 	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereResourcePool but got a %T", newRaw))
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a VSphereMachineConfigPool but got a %T", newRaw))
 	}
 	return nil, AggregateObjErrors(newObj.GroupVersionKind().GroupKind(), newObj.Name, webhook.validate(oldObj, newObj))
 }
 
-func (webhook *VSphereResourcePool) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+func (webhook *VSphereMachineConfigPool) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
 	return nil, nil
 }
 
-func (webhook *VSphereResourcePool) validate(oldObj, newObj *infrav1.VSphereResourcePool) field.ErrorList {
+func (webhook *VSphereMachineConfigPool) validate(oldObj, newObj *infrav1.VSphereMachineConfigPool) field.ErrorList {
 	allErrs := webhook.validateClusterRef(oldObj, newObj)
 	allErrs = append(allErrs, webhook.validateSlotHostnames(newObj)...)
 	allErrs = append(allErrs, webhook.validateSlotNetworks(newObj)...)
 	return allErrs
 }
 
-func (webhook *VSphereResourcePool) validateClusterRef(oldObj, newObj *infrav1.VSphereResourcePool) field.ErrorList {
+func (webhook *VSphereMachineConfigPool) validateClusterRef(oldObj, newObj *infrav1.VSphereMachineConfigPool) field.ErrorList {
 	var allErrs field.ErrorList
 	clusterRefPath := field.NewPath("spec", "clusterRef")
 	ref := newObj.Spec.ClusterRef
@@ -90,18 +90,18 @@ func (webhook *VSphereResourcePool) validateClusterRef(oldObj, newObj *infrav1.V
 	return allErrs
 }
 
-func (webhook *VSphereResourcePool) validateSlotNetworks(pool *infrav1.VSphereResourcePool) field.ErrorList {
+func (webhook *VSphereMachineConfigPool) validateSlotNetworks(pool *infrav1.VSphereMachineConfigPool) field.ErrorList {
 	var allErrs field.ErrorList
 	if pool == nil {
 		return allErrs
 	}
 
-	for i := range pool.Spec.Resources {
-		slotPath := field.NewPath("spec", "resources").Index(i).Child("network")
-		if pool.Spec.Resources[i].Network == nil {
+	for i := range pool.Spec.Configs {
+		slotPath := field.NewPath("spec", "configs").Index(i).Child("network")
+		if pool.Spec.Configs[i].Network == nil {
 			continue
 		}
-		if pool.Spec.Resources[i].Network.Primary.NetworkName == "" {
+		if pool.Spec.Configs[i].Network.Primary.NetworkName == "" {
 			allErrs = append(allErrs, field.Required(slotPath.Child("primary", "networkName"), "must be set when network is configured"))
 		}
 	}
@@ -109,15 +109,15 @@ func (webhook *VSphereResourcePool) validateSlotNetworks(pool *infrav1.VSphereRe
 	return allErrs
 }
 
-func (webhook *VSphereResourcePool) validateSlotHostnames(pool *infrav1.VSphereResourcePool) field.ErrorList {
+func (webhook *VSphereMachineConfigPool) validateSlotHostnames(pool *infrav1.VSphereMachineConfigPool) field.ErrorList {
 	var allErrs field.ErrorList
 	if pool == nil {
 		return allErrs
 	}
 
-	for i := range pool.Spec.Resources {
-		hostnamePath := field.NewPath("spec", "resources").Index(i).Child("hostname")
-		hostname := pool.Spec.Resources[i].Hostname
+	for i := range pool.Spec.Configs {
+		hostnamePath := field.NewPath("spec", "configs").Index(i).Child("hostname")
+		hostname := pool.Spec.Configs[i].Hostname
 		for _, err := range validation.IsDNS1123Subdomain(hostname) {
 			allErrs = append(allErrs, field.Invalid(hostnamePath, hostname, err))
 		}

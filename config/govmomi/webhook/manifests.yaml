@@ -163,6 +163,27 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-infrastructure-cluster-x-k8s-io-v1beta1-vspheremachineconfigpool
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: validation.vspheremachineconfigpool.infrastructure.cluster.x-k8s.io
+  rules:
+  - apiGroups:
+    - infrastructure.cluster.x-k8s.io
+    apiVersions:
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - vspheremachineconfigpools
+  sideEffects: None
+- admissionReviewVersions:
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-infrastructure-cluster-x-k8s-io-v1beta1-vspheremachinetemplate
   failurePolicy: Fail
   matchPolicy: Equivalent
@@ -177,27 +198,6 @@ webhooks:
     - UPDATE
     resources:
     - vspheremachinetemplates
-  sideEffects: None
-- admissionReviewVersions:
-  - v1beta1
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
-      path: /validate-infrastructure-cluster-x-k8s-io-v1beta1-vsphereresourcepool
-  failurePolicy: Fail
-  matchPolicy: Equivalent
-  name: validation.vsphereresourcepool.infrastructure.cluster.x-k8s.io
-  rules:
-  - apiGroups:
-    - infrastructure.cluster.x-k8s.io
-    apiVersions:
-    - v1beta1
-    operations:
-    - CREATE
-    - UPDATE
-    resources:
-    - vsphereresourcepools
   sideEffects: None
 - admissionReviewVersions:
   - v1beta1

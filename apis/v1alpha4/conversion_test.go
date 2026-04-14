@@ -88,7 +88,14 @@ func CustomNewFieldFuzzFunc(runtimeserializer.CodecFactory) []interface{} {
 	return []interface{}{
 		CustomSpecNewFieldFuzzer,
 		CustomStatusNewFieldFuzzer,
+		CustomVSphereMachineSpecNewFieldFuzzer,
 	}
+}
+
+func CustomVSphereMachineSpecNewFieldFuzzer(in *infrav1.VSphereMachineSpec, c fuzz.Continue) {
+	c.FuzzNoCustom(in)
+
+	in.MachineConfigPoolRef = nil
 }
 
 func CustomSpecNewFieldFuzzer(in *infrav1.VirtualMachineCloneSpec, c fuzz.Continue) {

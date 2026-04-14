@@ -119,7 +119,7 @@ func GetMachinePreferredIPAddress(machine *infrav1.VSphereMachine) (string, erro
 // GetPrimaryNodeIPAddress returns the kubelet node IP for the given VM and slot.
 // When a slot network is configured, the primary device must resolve to an IP.
 // Otherwise, the first resolved device IP is used.
-func GetPrimaryNodeIPAddress(vsphereVM infrav1.VSphereVM, slot *infrav1.ResourceSlot, ipamState map[string]infrav1.NetworkDeviceSpec, networkStatuses ...infrav1.NetworkStatus) (string, error) {
+func GetPrimaryNodeIPAddress(vsphereVM infrav1.VSphereVM, slot *infrav1.MachineConfigSlot, ipamState map[string]infrav1.NetworkDeviceSpec, networkStatuses ...infrav1.NetworkStatus) (string, error) {
 	devices := observedNetworkDevices(vsphereVM, ipamState, networkStatuses...)
 
 	if slot != nil && slot.Network != nil {

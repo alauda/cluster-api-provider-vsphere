@@ -181,7 +181,7 @@ func TestCreateDataDisks(t *testing.T) {
 		devices            object.VirtualDeviceList
 		controller         types.BaseVirtualController
 		dataDisks          []infrav1.VSphereDisk
-		resourceSlot       *infrav1.ResourceSlot
+		machineConfigSlot       *infrav1.MachineConfigSlot
 		expectedUnitNumber []int
 		expectedCreateOps  []bool
 		err                string
@@ -270,7 +270,7 @@ func TestCreateDataDisks(t *testing.T) {
 			dataDisks: []infrav1.VSphereDisk{
 				{Name: "disk-1", SizeGiB: 10},
 			},
-			resourceSlot: &infrav1.ResourceSlot{
+			machineConfigSlot: &infrav1.MachineConfigSlot{
 				Hostname: "host-1",
 				PersistentDisks: []infrav1.PersistentDisk{
 					{Name: "disk-1", VolumePath: "[datastore1] disk-1/disk-1.vmdk"},
@@ -280,13 +280,13 @@ func TestCreateDataDisks(t *testing.T) {
 			expectedCreateOps:  []bool{false},
 		},
 		{
-			name:       "Create persistent disk on datastore from resource slot",
+			name:       "Create persistent disk on datastore from machine config slot",
 			devices:    deviceList,
 			controller: controller,
 			dataDisks: []infrav1.VSphereDisk{
 				{Name: "disk-1", SizeGiB: 10},
 			},
-			resourceSlot: &infrav1.ResourceSlot{
+			machineConfigSlot: &infrav1.MachineConfigSlot{
 				Hostname: "host-1",
 				PersistentDisks: []infrav1.PersistentDisk{
 					{Name: "disk-1", Datastore: "datastore1"},
@@ -296,13 +296,13 @@ func TestCreateDataDisks(t *testing.T) {
 			expectedCreateOps:  []bool{true},
 		},
 		{
-			name:       "Create persistent disk with storage policy from resource slot",
+			name:       "Create persistent disk with storage policy from machine config slot",
 			devices:    deviceList,
 			controller: controller,
 			dataDisks: []infrav1.VSphereDisk{
 				{Name: "disk-1", SizeGiB: 10},
 			},
-			resourceSlot: &infrav1.ResourceSlot{
+			machineConfigSlot: &infrav1.MachineConfigSlot{
 				Hostname: "host-1",
 				PersistentDisks: []infrav1.PersistentDisk{
 					{Name: "disk-1", StoragePolicy: testDefaultStoragePolicy},
@@ -328,7 +328,7 @@ func TestCreateDataDisks(t *testing.T) {
 					},
 				},
 			}
-			vmContext := &capvcontext.VMContext{VSphereVM: vsphereVM, ResourceSlot: tc.resourceSlot, Session: session}
+			vmContext := &capvcontext.VMContext{VSphereVM: vsphereVM, MachineConfigSlot: tc.machineConfigSlot, Session: session}
 			newDisks, funcError := createDataDisks(ctx.TODO(), vmContext, tc.devices)
 			if (tc.err != "" && funcError == nil) || (tc.err == "" && funcError != nil) || (funcError != nil && tc.err != funcError.Error()) {
 				t.Fatalf("Expected to get '%v' error from assignUnitNumber, got: '%v'", tc.err, funcError)
@@ -362,8 +362,8 @@ func TestCreateDataDisks(t *testing.T) {
 
 					// Check to see if the provision type matches.
 					backingInfo := disk.GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().Backing.(*types.VirtualDiskFlatVer2BackingInfo)
-					if tc.resourceSlot != nil && len(tc.resourceSlot.PersistentDisks) > index {
-						pd := tc.resourceSlot.PersistentDisks[index]
+					if tc.machineConfigSlot != nil && len(tc.machineConfigSlot.PersistentDisks) > index {
+						pd := tc.machineConfigSlot.PersistentDisks[index]
 						switch {
 						case pd.VolumePath != "":
 							g.Expect(backingInfo.FileName).To(gomega.Equal(pd.VolumePath))
@@ -391,7 +391,7 @@ func TestCreateDataDisks(t *testing.T) {
 						// If not set, the behaviour may depend on the configuration of the backing datastore.
 					}
 				}
-				if tc.resourceSlot != nil && tc.resourceSlot.PersistentDisks[0].UnitNumber == nil {
+				if tc.machineConfigSlot != nil && tc.machineConfigSlot.PersistentDisks[0].UnitNumber == nil {
 					t.Fatal("expected persistent disk unit number to be backfilled")
 				}
 			}

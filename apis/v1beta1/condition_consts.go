@@ -35,9 +35,9 @@ const (
 	// and hence not yet reporting their status.
 	WaitingForFailureDomainStatusReason = "WaitingForFailureDomainStatus"
 
-	// FailureDomainsExhaustedByResourcePoolReason (Severity=Warning) documents that all failure domains
-	// were excluded because their datacenters have no available resource pool slots.
-	FailureDomainsExhaustedByResourcePoolReason = "FailureDomainsExhaustedByResourcePool"
+	// FailureDomainsExhaustedByMachineConfigPoolReason (Severity=Warning) documents that all failure domains
+	// were excluded because their datacenters have no available machine config pool slots.
+	FailureDomainsExhaustedByMachineConfigPoolReason = "FailureDomainsExhaustedByMachineConfigPool"
 )
 
 // Conditions and condition Reasons for the VSphereMachine and the VSphereVM object.
@@ -229,7 +229,7 @@ const (
 	IPAddressClaimNotFoundReason = "IPAddressClaimNotFound"
 )
 
-// Conditions and condition Reasons for the VSphereResourcePool object.
+// Conditions and condition Reasons for the VSphereMachineConfigPool object.
 
 const (
 	// ClusterRefReadyCondition reports whether the referenced Cluster and
@@ -252,24 +252,24 @@ const (
 	IdentityCredentialsUnavailableReason = "IdentityCredentialsUnavailable"
 )
 
-// Conditions and condition Reasons for VSphereMachine resource pool allocation.
+// Conditions and condition Reasons for VSphereMachine machine config pool allocation.
 
 const (
-	// ResourcePoolReadyCondition reports whether the static resource pool slot
-	// has been successfully allocated for this machine. Only set when
-	// spec.resourcePoolRef is configured.
-	ResourcePoolReadyCondition clusterv1.ConditionType = "ResourcePoolReady"
+	// MachineConfigPoolReadyCondition reports whether the static machine config
+	// pool slot has been successfully allocated for this machine. Only set when
+	// spec.machineConfigPoolRef is configured.
+	MachineConfigPoolReadyCondition clusterv1.ConditionType = "MachineConfigPoolReady"
 
-	// ResourcePoolSlotAllocatedReason documents that a slot has been allocated.
-	ResourcePoolSlotAllocatedReason = "SlotAllocated"
+	// MachineConfigPoolSlotAllocatedReason documents that a slot has been allocated.
+	MachineConfigPoolSlotAllocatedReason = "SlotAllocated"
 
-	// ResourcePoolBoundToOtherConsumerReason (Severity=Warning) documents that
+	// MachineConfigPoolBoundToOtherConsumerReason (Severity=Warning) documents that
 	// the pool is bound to a different consumer (KCP or MachineDeployment).
-	ResourcePoolBoundToOtherConsumerReason = "PoolBoundToOtherConsumer"
+	MachineConfigPoolBoundToOtherConsumerReason = "PoolBoundToOtherConsumer"
 
-	// ResourcePoolNoAvailableSlotsReason (Severity=Warning) documents that no
+	// MachineConfigPoolNoAvailableSlotsReason (Severity=Warning) documents that no
 	// slots matching the required datacenter/failure domain are available.
-	ResourcePoolNoAvailableSlotsReason = "NoAvailableSlots"
+	MachineConfigPoolNoAvailableSlotsReason = "NoAvailableSlots"
 )
 
 const (

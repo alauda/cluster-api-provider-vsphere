@@ -672,9 +672,9 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 		return false, pkgerrors.Wrap(err, "unable to list VSphereDeploymentZones")
 	}
 
-	// Check resource pool slot availability per datacenter to filter out
+	// Check machine config pool slot availability per datacenter to filter out
 	// failure domains that have no allocatable slots.
-	availableDatacenters, hasResourcePools := r.computeAvailableDatacenters(ctx, clusterCtx)
+	availableDatacenters, hasMachineConfigPools := r.computeAvailableDatacenters(ctx, clusterCtx)
 
 	readyNotReported, notReady, excludedByPool := 0, 0, 0
 	failureDomains := clusterv1.FailureDomains{}
@@ -697,8 +697,8 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 				ControlPlane: ptr.Deref(zone.Spec.ControlPlane, true),
 			}
 			allReadyDomains[zone.Name] = fdSpec
-			if hasResourcePools && !r.zoneHasAvailableSlots(ctx, zone, availableDatacenters) {
-				log.Info("Excluding failure domain: no resource pool slots available for its datacenter",
+			if hasMachineConfigPools && !r.zoneHasAvailableSlots(ctx, zone, availableDatacenters) {
+				log.Info("Excluding failure domain: no machine config pool slots available for its datacenter",
 					"zone", zone.Name, "failureDomain", zone.Spec.FailureDomain)
 				excludedByPool++
 				continue
@@ -710,7 +710,7 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 	}
 
 	if excludedByPool > 0 {
-		log.Info("Failure domains excluded due to resource pool slot exhaustion", "excludedCount", excludedByPool)
+		log.Info("Failure domains excluded due to machine config pool slot exhaustion", "excludedCount", excludedByPool)
 		// Safety net: never report an empty FailureDomains map when ready zones
 		// exist. An empty map causes CAPI to create Machines without FD assignment,
 		// which could grab any DC's slot when one later becomes available.
@@ -737,18 +737,18 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 		if excludedByPool > 0 && excludedByPool == len(allReadyDomains) {
 			// All ready zones were exhausted; all were kept to prevent nil FD assignment.
 			conditions.MarkFalse(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition,
-				infrav1.FailureDomainsExhaustedByResourcePoolReason, clusterv1.ConditionSeverityWarning,
-				"all failure domains have no available resource pool slots (total %d)", excludedByPool)
+				infrav1.FailureDomainsExhaustedByMachineConfigPoolReason, clusterv1.ConditionSeverityWarning,
+				"all failure domains have no available machine config pool slots (total %d)", excludedByPool)
 			v1beta2conditions.Set(clusterCtx.VSphereCluster, metav1.Condition{
 				Type:    infrav1.VSphereClusterFailureDomainsReadyV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  infrav1.VSphereClusterFailureDomainsNotReadyV1Beta2Reason,
-				Message: fmt.Sprintf("All failure domains have no available resource pool slots (total %d)", excludedByPool),
+				Message: fmt.Sprintf("All failure domains have no available machine config pool slots (total %d)", excludedByPool),
 			})
 		} else if notReady > 0 || excludedByPool > 0 {
 			msg := "one or more failure domains are not ready"
 			if excludedByPool > 0 {
-				msg = fmt.Sprintf("one or more failure domains are not ready or have no available resource pool slots (excluded %d)", excludedByPool)
+				msg = fmt.Sprintf("one or more failure domains are not ready or have no available machine config pool slots (excluded %d)", excludedByPool)
 			}
 			conditions.MarkFalse(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition, infrav1.FailureDomainsSkippedReason, clusterv1.ConditionSeverityInfo, msg)
 			v1beta2conditions.Set(clusterCtx.VSphereCluster, metav1.Condition{
@@ -895,18 +895,18 @@ func (r *clusterReconciler) deploymentZoneToCluster(ctx context.Context, o clien
 	return requests
 }
 
-// computeAvailableDatacenters lists all VSphereResourcePools for this cluster
+// computeAvailableDatacenters lists all VSphereMachineConfigPools for this cluster
 // and returns the set of datacenters that have at least one allocatable slot.
-// The second return value indicates whether any resource pools exist.
+// The second return value indicates whether any machine config pools exist.
 func (r *clusterReconciler) computeAvailableDatacenters(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (map[string]struct{}, bool) {
 	log := ctrl.LoggerFrom(ctx)
-	var poolList infrav1.VSphereResourcePoolList
+	var poolList infrav1.VSphereMachineConfigPoolList
 	if err := r.Client.List(ctx, &poolList, client.InNamespace(clusterCtx.Cluster.Namespace)); err != nil {
-		log.Error(err, "Failed to list VSphereResourcePools, skipping slot-based filtering")
+		log.Error(err, "Failed to list VSphereMachineConfigPools, skipping slot-based filtering")
 		return nil, false
 	}
 
-	var clusterPools []infrav1.VSphereResourcePool
+	var clusterPools []infrav1.VSphereMachineConfigPool
 	for i := range poolList.Items {
 		if poolList.Items[i].Spec.ClusterRef.Name == clusterCtx.Cluster.Name &&
 			poolList.Items[i].Spec.ClusterRef.Namespace == clusterCtx.Cluster.Namespace {
@@ -922,7 +922,7 @@ func (r *clusterReconciler) computeAvailableDatacenters(ctx context.Context, clu
 }
 
 // zoneHasAvailableSlots checks whether the given deployment zone's datacenter
-// has available resource pool slots. Returns true conservatively if the
+// has available machine config pool slots. Returns true conservatively if the
 // failure domain cannot be resolved.
 func (r *clusterReconciler) zoneHasAvailableSlots(ctx context.Context, zone infrav1.VSphereDeploymentZone, availableDatacenters map[string]struct{}) bool {
 	log := ctrl.LoggerFrom(ctx)
@@ -945,11 +945,11 @@ func (r *clusterReconciler) zoneHasAvailableSlots(ctx context.Context, zone infr
 	return ok
 }
 
-// resourcePoolToCluster maps a VSphereResourcePool to the VSphereCluster
+// machineConfigPoolToCluster maps a VSphereMachineConfigPool to the VSphereCluster
 // that owns the referenced CAPI Cluster.
-func (r *clusterReconciler) resourcePoolToCluster(ctx context.Context, o client.Object) []ctrl.Request {
+func (r *clusterReconciler) machineConfigPoolToCluster(ctx context.Context, o client.Object) []ctrl.Request {
 	log := ctrl.LoggerFrom(ctx)
-	pool, ok := o.(*infrav1.VSphereResourcePool)
+	pool, ok := o.(*infrav1.VSphereMachineConfigPool)
 	if !ok {
 		return nil
 	}
@@ -963,7 +963,7 @@ func (r *clusterReconciler) resourcePoolToCluster(ctx context.Context, o client.
 		Namespace: pool.Spec.ClusterRef.Namespace,
 		Name:      pool.Spec.ClusterRef.Name,
 	}, cluster); err != nil {
-		log.V(4).Error(err, "Failed to get Cluster for VSphereResourcePool", "pool", klog.KObj(pool))
+		log.V(4).Error(err, "Failed to get Cluster for VSphereMachineConfigPool", "pool", klog.KObj(pool))
 		return nil
 	}
 

@@ -254,7 +254,7 @@ func Test_buildKubeletServingCertCloudConfig(t *testing.T) {
 			},
 		},
 	}
-	vmCtx.ResourceSlot = &infrav1.ResourceSlot{
+	vmCtx.MachineConfigSlot = &infrav1.MachineConfigSlot{
 		Hostname: "worker-01",
 	}
 	vmCtx.State = &infrav1.VirtualMachine{
@@ -342,7 +342,7 @@ func TestResolveNodeIdentityAllowsMissingNodeIP(t *testing.T) {
 				Namespace: "cpaas-system",
 			},
 		}
-		vmCtx.ResourceSlot = &infrav1.ResourceSlot{
+		vmCtx.MachineConfigSlot = &infrav1.MachineConfigSlot{
 			Hostname: "worker-01",
 		}
 
@@ -370,9 +370,9 @@ func TestResolveNodeIdentityAllowsMissingNodeIP(t *testing.T) {
 				},
 			},
 		}
-		vmCtx.ResourceSlot = &infrav1.ResourceSlot{
+		vmCtx.MachineConfigSlot = &infrav1.MachineConfigSlot{
 			Hostname: "worker-02",
-			Network: &infrav1.ResourceSlotNetwork{
+			Network: &infrav1.MachineConfigSlotNetwork{
 				Primary: infrav1.NetworkConfig{NetworkName: "net-a"},
 			},
 		}

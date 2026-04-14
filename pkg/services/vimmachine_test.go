@@ -400,7 +400,7 @@ func Test_mergeSlotNetwork(t *testing.T) {
 			},
 		}
 
-		service.mergeSlotNetwork(vm, &infrav1.ResourceSlotNetwork{
+		service.mergeSlotNetwork(vm, &infrav1.MachineConfigSlotNetwork{
 			Primary: infrav1.NetworkConfig{
 				NetworkName: "slot-network",
 				DeviceName:  "ens192",
@@ -447,7 +447,7 @@ func Test_mergeSlotNetwork(t *testing.T) {
 			},
 		}
 
-		service.mergeSlotNetwork(vm, &infrav1.ResourceSlotNetwork{
+		service.mergeSlotNetwork(vm, &infrav1.MachineConfigSlotNetwork{
 			Primary: infrav1.NetworkConfig{
 				NetworkName: "slot-network",
 				DeviceName:  "ens224",
@@ -592,7 +592,7 @@ func Test_VimMachineService_createOrPatchVSphereVM(t *testing.T) {
 		g.Expect(vmName).To(Equal(fakeLongClusterName))
 	})
 
-	t.Run("uses resource slot datacenter over failure domain datacenter", func(t *testing.T) {
+	t.Run("uses machine config slot datacenter over failure domain datacenter", func(t *testing.T) {
 		g := NewWithT(t)
 		controllerManagerContext := fake.NewControllerManagerContext(getVSphereVM(hostAddr, corev1.ConditionTrue), deplZone("one"), failureDomain("one"))
 		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
@@ -600,7 +600,7 @@ func Test_VimMachineService_createOrPatchVSphereVM(t *testing.T) {
 		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
 		failureDomain := "zone-one"
 		machineCtx.Machine.Spec.FailureDomain = &failureDomain
-		machineCtx.ResourceSlot = &infrav1.ResourceSlot{
+		machineCtx.MachineConfigSlot = &infrav1.MachineConfigSlot{
 			Hostname:   "worker-01",
 			Datacenter: "dc-slot",
 		}
@@ -613,15 +613,15 @@ func Test_VimMachineService_createOrPatchVSphereVM(t *testing.T) {
 
 	t.Run("falls back to pool datacenter when slot datacenter is empty", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereResourcePool{
+		pool := &infrav1.VSphereMachineConfigPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "pool-1",
 				Namespace: fake.Namespace,
 			},
-			Spec: infrav1.VSphereResourcePoolSpec{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Datacenter: "dc-pool",
-				Resources: []infrav1.ResourceSlot{{
+				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "worker-01",
 				}},
 			},
@@ -632,11 +632,11 @@ func Test_VimMachineService_createOrPatchVSphereVM(t *testing.T) {
 		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
 		failureDomain := "zone-one"
 		machineCtx.Machine.Spec.FailureDomain = &failureDomain
-		machineCtx.VSphereMachine.Spec.ResourcePoolRef = &corev1.ObjectReference{
+		machineCtx.VSphereMachine.Spec.MachineConfigPoolRef = &corev1.ObjectReference{
 			Name:      pool.Name,
 			Namespace: pool.Namespace,
 		}
-		machineCtx.ResourceSlot = &infrav1.ResourceSlot{
+		machineCtx.MachineConfigSlot = &infrav1.MachineConfigSlot{
 			Hostname: "worker-01",
 		}
 		vimMachineService := &VimMachineService{controllerManagerContext.Client}
@@ -717,7 +717,7 @@ func Test_VimMachineService_reconcileProviderID(t *testing.T) {
 	})
 }
 
-func TestVimMachineServiceResolveResourcePoolDatacenterConstraints(t *testing.T) {
+func TestVimMachineServiceResolveMachineConfigPoolDatacenterConstraints(t *testing.T) {
 	deplZone := func(suffix string) *infrav1.VSphereDeploymentZone {
 		return &infrav1.VSphereDeploymentZone{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("zone-%s", suffix)},
@@ -785,20 +785,20 @@ func TestVimMachineServiceResolveResourcePoolDatacenterConstraints(t *testing.T)
 	})
 }
 
-func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T) {
+func TestVimMachineServiceReconcileMachineConfigPoolBackfillsDatacenter(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
-	pool := &infrav1.VSphereResourcePool{
+	pool := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pool-1",
 			Namespace: fake.Namespace,
 		},
-		Spec: infrav1.VSphereResourcePoolSpec{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Datacenter: "dc-pool",
-			Resources: []infrav1.ResourceSlot{
+			Configs: []infrav1.MachineConfigSlot{
 				{Hostname: "worker-01"},
 			},
 		},
@@ -845,33 +845,33 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsDatacenter(t *testing.T)
 			},
 		},
 	}
-	machineCtx.VSphereMachine.Spec.ResourcePoolRef = &corev1.ObjectReference{
+	machineCtx.VSphereMachine.Spec.MachineConfigPoolRef = &corev1.ObjectReference{
 		Name:      pool.Name,
 		Namespace: pool.Namespace,
 	}
 	machineCtx.VSphereMachine.Spec.Datacenter = ""
 
 	vimMachineService := &VimMachineService{Client: client}
-	err := vimMachineService.reconcileResourcePool(ctx, machineCtx)
+	err := vimMachineService.reconcileMachineConfigPool(ctx, machineCtx)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(machineCtx.ResourceSlot).NotTo(BeNil())
-	g.Expect(machineCtx.ResourceSlot.Datacenter).To(Equal("dc-pool"))
+	g.Expect(machineCtx.MachineConfigSlot).NotTo(BeNil())
+	g.Expect(machineCtx.MachineConfigSlot.Datacenter).To(Equal("dc-pool"))
 }
 
-func TestVimMachineServiceReconcileResourcePoolBackfillsWildcardDatacenter(t *testing.T) {
+func TestVimMachineServiceReconcileMachineConfigPoolBackfillsWildcardDatacenter(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
-	pool := &infrav1.VSphereResourcePool{
+	pool := &infrav1.VSphereMachineConfigPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pool-1",
 			Namespace: fake.Namespace,
 		},
-		Spec: infrav1.VSphereResourcePoolSpec{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 			Datacenter: "dc-pool",
-			Resources: []infrav1.ResourceSlot{
+			Configs: []infrav1.MachineConfigSlot{
 				{Hostname: "worker-01"},
 			},
 		},
@@ -918,17 +918,17 @@ func TestVimMachineServiceReconcileResourcePoolBackfillsWildcardDatacenter(t *te
 			},
 		},
 	}
-	machineCtx.VSphereMachine.Spec.ResourcePoolRef = &corev1.ObjectReference{
+	machineCtx.VSphereMachine.Spec.MachineConfigPoolRef = &corev1.ObjectReference{
 		Name:      pool.Name,
 		Namespace: pool.Namespace,
 	}
 	machineCtx.VSphereMachine.Spec.Datacenter = "*"
 
 	vimMachineService := &VimMachineService{Client: client}
-	err := vimMachineService.reconcileResourcePool(ctx, machineCtx)
+	err := vimMachineService.reconcileMachineConfigPool(ctx, machineCtx)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(machineCtx.ResourceSlot).NotTo(BeNil())
-	g.Expect(machineCtx.ResourceSlot.Datacenter).To(Equal("dc-pool"))
+	g.Expect(machineCtx.MachineConfigSlot).NotTo(BeNil())
+	g.Expect(machineCtx.MachineConfigSlot.Datacenter).To(Equal("dc-pool"))
 }
 
 func Test_VimMachineService_reconcileNetwork(t *testing.T) {

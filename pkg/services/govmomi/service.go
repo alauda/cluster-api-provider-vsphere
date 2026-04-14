@@ -157,7 +157,7 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 			})
 			return vm, err
 		}
-		if err := persistResourceSlotBackfill(ctx, vmCtx); err != nil {
+		if err := persistMachineConfigSlotBackfill(ctx, vmCtx); err != nil {
 			return vm, err
 		}
 		log.Info("createVM call completed")
@@ -289,7 +289,7 @@ func (vms *VMService) DestroyVM(ctx context.Context, vmCtx *capvcontext.VMContex
 	}
 
 	// Detach persistent disks before destruction to prevent them from being deleted.
-	if virtualMachineCtx.ResourceSlot != nil && len(virtualMachineCtx.ResourceSlot.PersistentDisks) > 0 {
+	if virtualMachineCtx.MachineConfigSlot != nil && len(virtualMachineCtx.MachineConfigSlot.PersistentDisks) > 0 {
 		if err := vms.detachPersistentDisks(ctx, virtualMachineCtx); err != nil {
 			return reconcile.Result{}, vm, errors.Wrapf(err, "failed to detach persistent disks for vm %s", virtualMachineCtx)
 		}
@@ -404,8 +404,8 @@ func (vms *VMService) reconcileMetadata(ctx context.Context, virtualMachineCtx *
 	}
 
 	var persistentDisks []infrav1.PersistentDisk
-	if virtualMachineCtx.ResourceSlot != nil {
-		persistentDisks = virtualMachineCtx.ResourceSlot.PersistentDisks
+	if virtualMachineCtx.MachineConfigSlot != nil {
+		persistentDisks = virtualMachineCtx.MachineConfigSlot.PersistentDisks
 	}
 
 	identity, err := resolveNodeIdentity(virtualMachineCtx)
@@ -786,8 +786,8 @@ func (vms *VMService) reconcileBootstrapUserData(ctx context.Context, virtualMac
 		return false, err
 	}
 
-	if virtualMachineCtx.ResourceSlot != nil && len(virtualMachineCtx.ResourceSlot.PersistentDisks) > 0 {
-		diskConfig, err := util.GetPersistentDiskCloudConfig(virtualMachineCtx.ResourceSlot.PersistentDisks)
+	if virtualMachineCtx.MachineConfigSlot != nil && len(virtualMachineCtx.MachineConfigSlot.PersistentDisks) > 0 {
+		diskConfig, err := util.GetPersistentDiskCloudConfig(virtualMachineCtx.MachineConfigSlot.PersistentDisks)
 		if err != nil {
 			return false, err
 		}
@@ -885,7 +885,7 @@ func (vms *VMService) getBootstrapData(ctx context.Context, vmCtx *capvcontext.V
 		return nil, "", errors.New("error retrieving bootstrap data: secret value key is missing")
 	}
 
-	log.Info("Loaded bootstrap data", "format", string(format), "bytes", len(value), "hasResourceSlot", vmCtx.ResourceSlot != nil)
+	log.Info("Loaded bootstrap data", "format", string(format), "bytes", len(value), "hasMachineConfigSlot", vmCtx.MachineConfigSlot != nil)
 
 	return value, bootstrapv1.Format(format), nil
 }
@@ -982,9 +982,9 @@ func resolveNodeIdentity(virtualMachineCtx *virtualMachineContext) (*nodeIdentit
 	identity := &nodeIdentity{
 		Hostname: virtualMachineCtx.VSphereVM.Name,
 	}
-	if virtualMachineCtx.ResourceSlot != nil {
-		if virtualMachineCtx.ResourceSlot.Hostname != "" {
-			identity.Hostname = virtualMachineCtx.ResourceSlot.Hostname
+	if virtualMachineCtx.MachineConfigSlot != nil {
+		if virtualMachineCtx.MachineConfigSlot.Hostname != "" {
+			identity.Hostname = virtualMachineCtx.MachineConfigSlot.Hostname
 		}
 		var networkStatuses []infrav1.NetworkStatus
 		if virtualMachineCtx.State != nil {
@@ -992,7 +992,7 @@ func resolveNodeIdentity(virtualMachineCtx *virtualMachineContext) (*nodeIdentit
 		}
 		nodeIP, err := util.GetPrimaryNodeIPAddress(
 			*virtualMachineCtx.VSphereVM,
-			virtualMachineCtx.ResourceSlot,
+			virtualMachineCtx.MachineConfigSlot,
 			virtualMachineCtx.IPAMState,
 			networkStatuses...,
 		)
@@ -1117,7 +1117,7 @@ func (vms *VMService) detachPersistentDisks(ctx context.Context, virtualMachineC
 	disks := devices.SelectByType((*types.VirtualDisk)(nil))
 	var deviceChanges []types.BaseVirtualDeviceConfigSpec
 
-	if virtualMachineCtx.ResourceSlot == nil {
+	if virtualMachineCtx.MachineConfigSlot == nil {
 		return nil
 	}
 
@@ -1133,7 +1133,7 @@ func (vms *VMService) detachPersistentDisks(ctx context.Context, virtualMachineC
 			}
 		}
 		if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
-			for _, pd := range virtualMachineCtx.ResourceSlot.PersistentDisks {
+			for _, pd := range virtualMachineCtx.MachineConfigSlot.PersistentDisks {
 				match := false
 				if pd.VolumePath != "" {
 					// VolumePath is the most precise identifier — use it as the primary match.
@@ -1176,7 +1176,7 @@ func (vms *VMService) detachPersistentDisks(ctx context.Context, virtualMachineC
 }
 
 func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtualMachineCtx *virtualMachineContext) error {
-	if virtualMachineCtx.ResourceSlot == nil || len(virtualMachineCtx.ResourceSlot.PersistentDisks) == 0 {
+	if virtualMachineCtx.MachineConfigSlot == nil || len(virtualMachineCtx.MachineConfigSlot.PersistentDisks) == 0 {
 		return nil
 	}
 
@@ -1190,8 +1190,8 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 	updated := false
 	usedDiskKeys := map[int32]struct{}{}
 
-	for i := range virtualMachineCtx.ResourceSlot.PersistentDisks {
-		pd := &virtualMachineCtx.ResourceSlot.PersistentDisks[i]
+	for i := range virtualMachineCtx.MachineConfigSlot.PersistentDisks {
+		pd := &virtualMachineCtx.MachineConfigSlot.PersistentDisks[i]
 		disk := findPersistentDiskDevice(pd, disks, usedDiskKeys, scsiKeys)
 		if disk == nil {
 			continue
@@ -1217,7 +1217,7 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 	}
 
 	if updated {
-		return persistResourceSlotBackfill(ctx, &virtualMachineCtx.VMContext)
+		return persistMachineConfigSlotBackfill(ctx, &virtualMachineCtx.VMContext)
 	}
 	return nil
 }
@@ -1302,28 +1302,28 @@ func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDe
 	return match
 }
 
-func persistResourceSlotBackfill(ctx context.Context, vmCtx *capvcontext.VMContext) error {
-	if vmCtx == nil || vmCtx.Client == nil || vmCtx.ResourceSlot == nil {
+func persistMachineConfigSlotBackfill(ctx context.Context, vmCtx *capvcontext.VMContext) error {
+	if vmCtx == nil || vmCtx.Client == nil || vmCtx.MachineConfigSlot == nil {
 		return nil
 	}
 
 	machine, err := util.GetOwnerVSphereMachine(ctx, vmCtx.Client, vmCtx.VSphereVM.ObjectMeta)
-	if err != nil || machine == nil || machine.Spec.ResourcePoolRef == nil {
+	if err != nil || machine == nil || machine.Spec.MachineConfigPoolRef == nil {
 		return err
 	}
 
 	poolKey := client.ObjectKey{
-		Namespace: machine.Spec.ResourcePoolRef.Namespace,
-		Name:      machine.Spec.ResourcePoolRef.Name,
+		Namespace: machine.Spec.MachineConfigPoolRef.Namespace,
+		Name:      machine.Spec.MachineConfigPoolRef.Name,
 	}
 
 	for range 3 {
-		pool := &infrav1.VSphereResourcePool{}
+		pool := &infrav1.VSphereMachineConfigPool{}
 		if err := vmCtx.Client.Get(ctx, poolKey, pool); err != nil {
-			return errors.Wrapf(err, "failed to get resource pool for vm %s", vmCtx.VSphereVM.Name)
+			return errors.Wrapf(err, "failed to get machine config pool for vm %s", vmCtx.VSphereVM.Name)
 		}
 
-		if !services.ApplyDiskBackfill(pool, vmCtx.ResourceSlot) {
+		if !services.ApplyDiskBackfill(pool, vmCtx.MachineConfigSlot) {
 			return nil
 		}
 
@@ -1331,9 +1331,9 @@ func persistResourceSlotBackfill(ctx context.Context, vmCtx *capvcontext.VMConte
 			if apierrors.IsConflict(err) {
 				continue
 			}
-			return errors.Wrapf(err, "failed to persist resource pool disk backfill for vm %s", vmCtx.VSphereVM.Name)
+			return errors.Wrapf(err, "failed to persist machine config pool disk backfill for vm %s", vmCtx.VSphereVM.Name)
 		}
 		return nil
 	}
-	return errors.Errorf("transient conflict while persisting resource pool disk backfill for vm %s, exhausted retries", vmCtx.VSphereVM.Name)
+	return errors.Errorf("transient conflict while persisting machine config pool disk backfill for vm %s, exhausted retries", vmCtx.VSphereVM.Name)
 }

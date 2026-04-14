@@ -62,12 +62,12 @@ func (webhook *VSphereMachineTemplate) SetupWebhookWithManager(mgr ctrl.Manager)
 	return (&webhooks.VSphereMachineTemplate{}).SetupWebhookWithManager(mgr)
 }
 
-// VSphereResourcePool implements a validation webhook for VSphereResourcePool.
-type VSphereResourcePool struct{}
+// VSphereMachineConfigPool implements a validation webhook for VSphereMachineConfigPool.
+type VSphereMachineConfigPool struct{}
 
-// SetupWebhookWithManager sets up VSphereResourcePool webhooks.
-func (webhook *VSphereResourcePool) SetupWebhookWithManager(mgr ctrl.Manager) error {
-	return (&webhooks.VSphereResourcePool{}).SetupWebhookWithManager(mgr)
+// SetupWebhookWithManager sets up VSphereMachineConfigPool webhooks.
+func (webhook *VSphereMachineConfigPool) SetupWebhookWithManager(mgr ctrl.Manager) error {
+	return (&webhooks.VSphereMachineConfigPool{}).SetupWebhookWithManager(mgr)
 }
 
 // KubeadmControlPlane implements a validation webhook for KubeadmControlPlane.

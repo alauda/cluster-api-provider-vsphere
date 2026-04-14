@@ -138,7 +138,7 @@ remove those orphan directories before rebuilding:
 env GOVC_DATACENTER=Datacenter2 govc datastore.rm -ds vm-store <orphan-dir>...
 ```
 
-This matters because a rebuild can fail even when the old `VSphereResourcePool`
+This matters because a rebuild can fail even when the old `VSphereMachineConfigPool`
 status looks clean. In one live case, the second control-plane machine failed
 with:
 
