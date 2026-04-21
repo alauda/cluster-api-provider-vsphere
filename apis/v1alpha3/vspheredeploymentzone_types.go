@@ -71,7 +71,7 @@ type VSphereDeploymentZoneStatus struct {
 	// +optional
 	Ready *bool `json:"ready,omitempty"`
 
-	// Conditions defines current service state of the VSphereMachine.
+	// Conditions defines current service state of the VSphereDeploymentZone.
 	// +optional
 	Conditions Conditions `json:"conditions,omitempty"`
 }

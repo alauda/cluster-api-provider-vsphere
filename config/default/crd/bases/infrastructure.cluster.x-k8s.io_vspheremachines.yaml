@@ -1230,8 +1230,8 @@ spec:
                               type: boolean
                             useRoutes:
                               description: |-
-                                UseRoutes when `true`, the routes from the DHCP server will be installed
-                                in the routing table.
+                                UseRoutes can take the values `true`, `false`, or `route`. When `true`,
+                                the routes from the DHCP server will be installed in the routing table.
                               type: string
                           type: object
                         dhcp6:
@@ -1293,8 +1293,8 @@ spec:
                               type: boolean
                             useRoutes:
                               description: |-
-                                UseRoutes when `true`, the routes from the DHCP server will be installed
-                                in the routing table.
+                                UseRoutes can take the values `true`, `false`, or `route`. When `true`,
+                                the routes from the DHCP server will be installed in the routing table.
                               type: string
                           type: object
                         gateway4:

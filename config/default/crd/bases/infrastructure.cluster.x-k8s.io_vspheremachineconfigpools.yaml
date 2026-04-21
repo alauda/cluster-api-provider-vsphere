@@ -112,7 +112,7 @@ spec:
                         kubeadm nodeRegistration.name and the kubelet serving certificate DNS SAN.
                       maxLength: 253
                       minLength: 1
-                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                       type: string
                     network:
                       description: Network describes the primary and additional network

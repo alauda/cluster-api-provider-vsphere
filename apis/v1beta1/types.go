@@ -474,8 +474,8 @@ type DHCPOverrides struct {
 	// by systemd-timesyncd and take precedence.
 	// +optional
 	UseNTP *bool `json:"useNTP,omitempty"`
-	// UseRoutes when `true`, the routes from the DHCP server will be installed
-	// in the routing table.
+	// UseRoutes can take the values `true`, `false`, or `route`. When `true`,
+	// the routes from the DHCP server will be installed in the routing table.
 	// +optional
 	UseRoutes *string `json:"useRoutes,omitempty"`
 }
