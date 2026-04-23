@@ -33,7 +33,7 @@ const (
 type VSphereMachineSpec struct {
 	VirtualMachineCloneSpec `json:",inline"`
 
-	// ProviderID is the virtual machine's BIOS UUID formated as
+	// ProviderID is the virtual machine's BIOS UUID formatted as
 	// vsphere://12345678-1234-1234-1234-123456789abc
 	// +optional
 	ProviderID *string `json:"providerID,omitempty"`

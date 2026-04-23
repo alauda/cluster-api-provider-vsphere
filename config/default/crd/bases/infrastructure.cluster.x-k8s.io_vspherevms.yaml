@@ -102,7 +102,7 @@ spec:
               cloneMode:
                 description: |-
                   CloneMode specifies the type of clone operation.
-                  The LinkedClone mode is only support for templates that have at least
+                  The LinkedClone mode is only supported for templates that have at least
                   one snapshot. If the template has no snapshots, then CloneMode defaults
                   to FullClone.
                   When LinkedClone mode is enabled the DiskGiB field is ignored as it is
@@ -182,7 +182,7 @@ spec:
                           type: string
                         gateway6:
                           description: |-
-                            Gateway4 is the IPv4 gateway used by this device.
+                            Gateway6 is the IPv6 gateway used by this device.
                             Required when DHCP6 is false.
                           type: string
                         ipAddrs:
@@ -295,8 +295,7 @@ spec:
                 type: integer
               numCoresPerSocket:
                 description: |-
-                  NumCPUs is the number of cores among which to distribute CPUs in this
-                  virtual machine.
+                  NumCoresPerSocket is the number of cores per socket in a virtual machine.
                   Defaults to the eponymous property value in the template from which the
                   virtual machine is cloned.
                 format: int32
@@ -353,7 +352,7 @@ spec:
               cloneMode:
                 description: |-
                   CloneMode is the type of clone operation used to clone this VM. Since
-                  LinkedMode is the default but fails gracefully if the source of the
+                  LinkedClone is the default but fails gracefully if the source of the
                   clone has no snapshots, this field may be used to determine the actual
                   type of clone operation used to create this VM.
                 type: string
@@ -473,7 +472,7 @@ spec:
               snapshot:
                 description: |-
                   Snapshot is the name of the snapshot from which the VM was cloned if
-                  LinkedMode is enabled.
+                  LinkedClone is enabled.
                 type: string
               taskRef:
                 description: |-
@@ -573,7 +572,7 @@ spec:
               cloneMode:
                 description: |-
                   CloneMode specifies the type of clone operation.
-                  The LinkedClone mode is only support for templates that have at least
+                  The LinkedClone mode is only supported for templates that have at least
                   one snapshot. If the template has no snapshots, then CloneMode defaults
                   to FullClone.
                   When LinkedClone mode is enabled the DiskGiB field is ignored as it is
@@ -653,7 +652,7 @@ spec:
                           type: string
                         gateway6:
                           description: |-
-                            Gateway4 is the IPv4 gateway used by this device.
+                            Gateway6 is the IPv6 gateway used by this device.
                             Required when DHCP6 is false.
                           type: string
                         ipAddrs:
@@ -766,8 +765,7 @@ spec:
                 type: integer
               numCoresPerSocket:
                 description: |-
-                  NumCPUs is the number of cores among which to distribute CPUs in this
-                  virtual machine.
+                  NumCoresPerSocket is the number of cores per socket in a virtual machine.
                   Defaults to the eponymous property value in the template from which the
                   virtual machine is cloned.
                 format: int32
@@ -824,7 +822,7 @@ spec:
               cloneMode:
                 description: |-
                   CloneMode is the type of clone operation used to clone this VM. Since
-                  LinkedMode is the default but fails gracefully if the source of the
+                  LinkedClone is the default but fails gracefully if the source of the
                   clone has no snapshots, this field may be used to determine the actual
                   type of clone operation used to create this VM.
                 type: string
@@ -944,7 +942,7 @@ spec:
               snapshot:
                 description: |-
                   Snapshot is the name of the snapshot from which the VM was cloned if
-                  LinkedMode is enabled.
+                  LinkedClone is enabled.
                 type: string
               taskRef:
                 description: |-
@@ -1049,7 +1047,7 @@ spec:
               cloneMode:
                 description: |-
                   CloneMode specifies the type of clone operation.
-                  The LinkedClone mode is only support for templates that have at least
+                  The LinkedClone mode is only supported for templates that have at least
                   one snapshot. If the template has no snapshots, then CloneMode defaults
                   to FullClone.
                   When LinkedClone mode is enabled the DiskGiB field is ignored as it is
@@ -1322,7 +1320,9 @@ spec:
                             Required when DHCP4 is false.
                           type: string
                         gateway6:
-                          description: Gateway4 is the IPv4 gateway used by this device.
+                          description: |-
+                            Gateway6 is the IPv6 gateway used by this device.
+                            Required when DHCP6 is false.
                           type: string
                         ipAddrs:
                           description: |-
@@ -1442,8 +1442,7 @@ spec:
                 type: integer
               numCoresPerSocket:
                 description: |-
-                  NumCPUs is the number of cores among which to distribute CPUs in this
-                  virtual machine.
+                  NumCoresPerSocket is the number of cores per socket in a virtual machine.
                   Defaults to the eponymous property value in the template from which the
                   virtual machine is cloned.
                 format: int32
@@ -1498,7 +1497,7 @@ spec:
                 description: |-
                   PowerOffMode describes the desired behavior when powering off a VM.
 
-                  There are three, supported power off modes: hard, soft, and
+                  There are three supported power off modes: hard, soft, and
                   trySoft. The first mode, hard, is the equivalent of a physical
                   system's power cord being ripped from the wall. The soft mode
                   requires the VM's guest to have VM Tools installed and attempts to
@@ -1571,7 +1570,7 @@ spec:
               cloneMode:
                 description: |-
                   CloneMode is the type of clone operation used to clone this VM. Since
-                  LinkedMode is the default but fails gracefully if the source of the
+                  LinkedClone is the default but fails gracefully if the source of the
                   clone has no snapshots, this field may be used to determine the actual
                   type of clone operation used to create this VM.
                 type: string
@@ -1711,7 +1710,7 @@ spec:
               snapshot:
                 description: |-
                   Snapshot is the name of the snapshot from which the VM was cloned if
-                  LinkedMode is enabled.
+                  LinkedClone is enabled.
                 type: string
               taskRef:
                 description: |-

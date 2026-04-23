@@ -107,7 +107,7 @@ spec:
           status:
             properties:
               conditions:
-                description: Conditions defines current service state of the VSphereCluster.
+                description: Conditions defines current service state of the VSphereClusterIdentity.
                 items:
                   description: Condition defines an observation of a Cluster API resource
                     operational state.
@@ -249,7 +249,7 @@ spec:
           status:
             properties:
               conditions:
-                description: Conditions defines current service state of the VSphereCluster.
+                description: Conditions defines current service state of the VSphereClusterIdentity.
                 items:
                   description: Condition defines an observation of a Cluster API resource
                     operational state.
@@ -391,7 +391,7 @@ spec:
             description: VSphereClusterIdentityStatus contains the status of the VSphereClusterIdentity.
             properties:
               conditions:
-                description: Conditions defines current service state of the VSphereCluster.
+                description: Conditions defines current service state of the VSphereClusterIdentity.
                 items:
                   description: Condition defines an observation of a Cluster API resource
                     operational state.

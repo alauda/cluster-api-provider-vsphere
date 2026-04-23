@@ -150,11 +150,11 @@ type CPIGlobalConfig struct {
 	ServiceAccount string `gcfg:"service-account,omitempty" json:"serviceAccount,omitempty"`
 
 	// SecretsDirectory is a directory in which secrets may be found. This
-	// may used in the event that:
+	// may be used in the event that:
 	// 1. It is not desirable to use the K8s API to watch changes to secrets
 	// 2. The cloud controller manager is not running in a K8s environment,
 	//    such as DC/OS. For example, the container storage interface (CSI) is
-	//    container orcehstrator (CO) agnostic, and should support non-K8s COs.
+	//    container orchestrator (CO) agnostic, and should support non-K8s COs.
 	// Defaults to /etc/cloud/credentials.
 	// +optional
 	SecretsDirectory string `gcfg:"secrets-directory,omitempty" json:"secretsDirectory,omitempty"`

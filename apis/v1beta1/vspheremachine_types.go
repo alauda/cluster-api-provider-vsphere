@@ -108,7 +108,7 @@ const (
 type VSphereMachineSpec struct {
 	VirtualMachineCloneSpec `json:",inline"`
 
-	// ProviderID is the virtual machine's BIOS UUID formated as
+	// ProviderID is the virtual machine's BIOS UUID formatted as
 	// vsphere://12345678-1234-1234-1234-123456789abc
 	// +optional
 	ProviderID *string `json:"providerID,omitempty"`
@@ -119,7 +119,7 @@ type VSphereMachineSpec struct {
 
 	// PowerOffMode describes the desired behavior when powering off a VM.
 	//
-	// There are three, supported power off modes: hard, soft, and
+	// There are three supported power off modes: hard, soft, and
 	// trySoft. The first mode, hard, is the equivalent of a physical
 	// system's power cord being ripped from the wall. The soft mode
 	// requires the VM's guest to have VM Tools installed and attempts to
@@ -253,7 +253,7 @@ type VSphereMachineV1Beta2Status struct {
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".metadata.labels.cluster\\.x-k8s\\.io/cluster-name",description="Cluster to which this VSphereMachine belongs"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.ready",description="Machine ready status"
 // +kubebuilder:printcolumn:name="ProviderID",type="string",JSONPath=".spec.providerID",description="VSphereMachine instance ID"
-// +kubebuilder:printcolumn:name="Machine",type="string",JSONPath=".metadata.ownerReferences[?(@.kind==\"Machine\")].name",description="Machine object which owns with this VSphereMachine",priority=1
+// +kubebuilder:printcolumn:name="Machine",type="string",JSONPath=".metadata.ownerReferences[?(@.kind==\"Machine\")].name",description="Machine object which owns this VSphereMachine",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation of Machine"
 
 // VSphereMachine is the Schema for the vspheremachines API.

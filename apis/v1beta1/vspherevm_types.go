@@ -197,7 +197,7 @@ type VSphereVMSpec struct {
 
 	// PowerOffMode describes the desired behavior when powering off a VM.
 	//
-	// There are three, supported power off modes: hard, soft, and
+	// There are three supported power off modes: hard, soft, and
 	// trySoft. The first mode, hard, is the equivalent of a physical
 	// system's power cord being ripped from the wall. The soft mode
 	// requires the VM's guest to have VM Tools installed and attempts to
@@ -243,14 +243,14 @@ type VSphereVMStatus struct {
 	Addresses []string `json:"addresses,omitempty"`
 
 	// CloneMode is the type of clone operation used to clone this VM. Since
-	// LinkedMode is the default but fails gracefully if the source of the
+	// LinkedClone is the default but fails gracefully if the source of the
 	// clone has no snapshots, this field may be used to determine the actual
 	// type of clone operation used to create this VM.
 	// +optional
 	CloneMode CloneMode `json:"cloneMode,omitempty"`
 
 	// Snapshot is the name of the snapshot from which the VM was cloned if
-	// LinkedMode is enabled.
+	// LinkedClone is enabled.
 	// +optional
 	Snapshot string `json:"snapshot,omitempty"`
 

@@ -179,7 +179,7 @@ spec:
                       cloneMode:
                         description: |-
                           CloneMode specifies the type of clone operation.
-                          The LinkedClone mode is only support for templates that have at least
+                          The LinkedClone mode is only supported for templates that have at least
                           one snapshot. If the template has no snapshots, then CloneMode defaults
                           to FullClone.
                           When LinkedClone mode is enabled the DiskGiB field is ignored as it is
@@ -264,7 +264,7 @@ spec:
                                   type: string
                                 gateway6:
                                   description: |-
-                                    Gateway4 is the IPv4 gateway used by this device.
+                                    Gateway6 is the IPv6 gateway used by this device.
                                     Required when DHCP6 is false.
                                   type: string
                                 ipAddrs:
@@ -379,15 +379,14 @@ spec:
                         type: integer
                       numCoresPerSocket:
                         description: |-
-                          NumCPUs is the number of cores among which to distribute CPUs in this
-                          virtual machine.
+                          NumCoresPerSocket is the number of cores per socket in a virtual machine.
                           Defaults to the eponymous property value in the template from which the
                           virtual machine is cloned.
                         format: int32
                         type: integer
                       providerID:
                         description: |-
-                          ProviderID is the virtual machine's BIOS UUID formated as
+                          ProviderID is the virtual machine's BIOS UUID formatted as
                           vsphere://12345678-1234-1234-1234-123456789abc
                         type: string
                       resourcePool:
@@ -501,7 +500,7 @@ spec:
                       cloneMode:
                         description: |-
                           CloneMode specifies the type of clone operation.
-                          The LinkedClone mode is only support for templates that have at least
+                          The LinkedClone mode is only supported for templates that have at least
                           one snapshot. If the template has no snapshots, then CloneMode defaults
                           to FullClone.
                           When LinkedClone mode is enabled the DiskGiB field is ignored as it is
@@ -586,7 +585,7 @@ spec:
                                   type: string
                                 gateway6:
                                   description: |-
-                                    Gateway4 is the IPv4 gateway used by this device.
+                                    Gateway6 is the IPv6 gateway used by this device.
                                     Required when DHCP6 is false.
                                   type: string
                                 ipAddrs:
@@ -701,15 +700,14 @@ spec:
                         type: integer
                       numCoresPerSocket:
                         description: |-
-                          NumCPUs is the number of cores among which to distribute CPUs in this
-                          virtual machine.
+                          NumCoresPerSocket is the number of cores per socket in a virtual machine.
                           Defaults to the eponymous property value in the template from which the
                           virtual machine is cloned.
                         format: int32
                         type: integer
                       providerID:
                         description: |-
-                          ProviderID is the virtual machine's BIOS UUID formated as
+                          ProviderID is the virtual machine's BIOS UUID formatted as
                           vsphere://12345678-1234-1234-1234-123456789abc
                         type: string
                       resourcePool:
@@ -829,7 +827,7 @@ spec:
                       cloneMode:
                         description: |-
                           CloneMode specifies the type of clone operation.
-                          The LinkedClone mode is only support for templates that have at least
+                          The LinkedClone mode is only supported for templates that have at least
                           one snapshot. If the template has no snapshots, then CloneMode defaults
                           to FullClone.
                           When LinkedClone mode is enabled the DiskGiB field is ignored as it is
@@ -1175,8 +1173,9 @@ spec:
                                     Required when DHCP4 is false.
                                   type: string
                                 gateway6:
-                                  description: Gateway4 is the IPv4 gateway used by
-                                    this device.
+                                  description: |-
+                                    Gateway6 is the IPv6 gateway used by this device.
+                                    Required when DHCP6 is false.
                                   type: string
                                 ipAddrs:
                                   description: |-
@@ -1298,8 +1297,7 @@ spec:
                         type: integer
                       numCoresPerSocket:
                         description: |-
-                          NumCPUs is the number of cores among which to distribute CPUs in this
-                          virtual machine.
+                          NumCoresPerSocket is the number of cores per socket in a virtual machine.
                           Defaults to the eponymous property value in the template from which the
                           virtual machine is cloned.
                         format: int32
@@ -1355,7 +1353,7 @@ spec:
                         description: |-
                           PowerOffMode describes the desired behavior when powering off a VM.
 
-                          There are three, supported power off modes: hard, soft, and
+                          There are three supported power off modes: hard, soft, and
                           trySoft. The first mode, hard, is the equivalent of a physical
                           system's power cord being ripped from the wall. The soft mode
                           requires the VM's guest to have VM Tools installed and attempts to
@@ -1371,7 +1369,7 @@ spec:
                         type: string
                       providerID:
                         description: |-
-                          ProviderID is the virtual machine's BIOS UUID formated as
+                          ProviderID is the virtual machine's BIOS UUID formatted as
                           vsphere://12345678-1234-1234-1234-123456789abc
                         type: string
                       resourcePool:

@@ -103,7 +103,7 @@ spec:
                 description: |-
                   PowerOffMode describes the desired behavior when powering off a VM.
 
-                  There are three, supported power off modes: hard, soft, and
+                  There are three supported power off modes: hard, soft, and
                   trySoft. The first mode, hard, is the equivalent of a physical
                   system's power cord being ripped from the wall. The soft mode
                   requires the VM's guest to have VM Tools installed and attempts to

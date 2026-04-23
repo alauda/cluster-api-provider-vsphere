@@ -10,6 +10,7 @@ rules:
   - configmaps
   - events
   - nodes
+  - secrets
   - serviceaccounts
   verbs:
   - create
@@ -31,6 +32,15 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - namespaces
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - persistentvolumeclaims
   verbs:
   - create
@@ -42,18 +52,9 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - secrets
   - services/status
   verbs:
   - get
-- apiGroups:
-  - ""
-  resources:
-  - services
-  verbs:
-  - get
-  - list
-  - watch
 - apiGroups:
   - apiextensions.k8s.io
   resources:
@@ -84,9 +85,9 @@ rules:
   - vsphereclustertemplates.infrastructure.cluster.x-k8s.io
   - vspheredeploymentzones.infrastructure.cluster.x-k8s.io
   - vspherefailuredomains.infrastructure.cluster.x-k8s.io
+  - vspheremachineconfigpools.infrastructure.cluster.x-k8s.io
   - vspheremachines.infrastructure.cluster.x-k8s.io
   - vspheremachinetemplates.infrastructure.cluster.x-k8s.io
-  - vspheremachineconfigpools.infrastructure.cluster.x-k8s.io
   - vspherevms.infrastructure.cluster.x-k8s.io
   resources:
   - customresourcedefinitions
@@ -134,34 +135,6 @@ rules:
   verbs:
   - get
   - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - namespaces
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - nodes
-  verbs:
-  - delete
-  - get
-  - list
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - crd.nsx.vmware.com

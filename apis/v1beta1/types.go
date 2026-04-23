@@ -99,7 +99,7 @@ type VirtualMachineCloneSpec struct {
 	Template string `json:"template"`
 
 	// CloneMode specifies the type of clone operation.
-	// The LinkedClone mode is only support for templates that have at least
+	// The LinkedClone mode is only supported for templates that have at least
 	// one snapshot. If the template has no snapshots, then CloneMode defaults
 	// to FullClone.
 	// When LinkedClone mode is enabled the DiskGiB field is ignored as it is
@@ -161,8 +161,7 @@ type VirtualMachineCloneSpec struct {
 	// virtual machine is cloned.
 	// +optional
 	NumCPUs int32 `json:"numCPUs,omitempty"`
-	// NumCPUs is the number of cores among which to distribute CPUs in this
-	// virtual machine.
+	// NumCoresPerSocket is the number of cores per socket in a virtual machine.
 	// Defaults to the eponymous property value in the template from which the
 	// virtual machine is cloned.
 	// +optional
@@ -364,7 +363,8 @@ type NetworkDeviceSpec struct {
 	// +optional
 	Gateway4 string `json:"gateway4,omitempty"`
 
-	// Gateway4 is the IPv4 gateway used by this device.
+	// Gateway6 is the IPv6 gateway used by this device.
+	// Required when DHCP6 is false.
 	// +optional
 	Gateway6 string `json:"gateway6,omitempty"`
 
