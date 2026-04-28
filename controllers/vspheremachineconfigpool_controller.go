@@ -56,6 +56,9 @@ const (
 	DefaultReleaseDelayHours = 24
 )
 
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachineconfigpools,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vspheremachineconfigpools/status,verbs=get;update;patch
+
 // AddVSphereMachineConfigPoolControllerToManager adds a VSphereMachineConfigPool controller to the manager.
 func AddVSphereMachineConfigPoolControllerToManager(ctx context.Context, controllerManagerCtx *capvcontext.ControllerManagerContext, mgr manager.Manager, options controller.Options) error {
 	reconciler := machineConfigPoolReconciler{

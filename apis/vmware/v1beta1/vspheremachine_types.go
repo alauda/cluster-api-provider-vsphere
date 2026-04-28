@@ -96,7 +96,7 @@ type VSphereMachineSpec struct {
 // VirtualMachineNamingStrategy defines the naming strategy for the VirtualMachines.
 type VirtualMachineNamingStrategy struct {
 	// Template defines the template to use for generating the name of the VirtualMachine object.
-	// If not defined, it will fall back to `{{ .machine.name }}`.
+	// If not defined, it will fall back to `{{ "{{ .machine.name }}" }}`.
 	// The templating has the following data available:
 	// * `.machine.name`: The name of the Machine object.
 	// The templating also has the following funcs available:

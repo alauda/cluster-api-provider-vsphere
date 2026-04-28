@@ -156,6 +156,7 @@ rules:
   - vsphereclusters
   - vspheredeploymentzones
   - vspherefailuredomains
+  - vspheremachineconfigpools
   - vspheremachines
   - vspherevms
   verbs:
@@ -172,6 +173,7 @@ rules:
   - vsphereclusteridentities/status
   - vsphereclusters/status
   - vspheredeploymentzones/status
+  - vspheremachineconfigpools/status
   - vspheremachines/status
   - vspherevms/status
   verbs:

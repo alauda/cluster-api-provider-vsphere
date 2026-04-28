@@ -4,6 +4,8 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.0
+  labels:
+    cluster.x-k8s.io/v1beta1: v1beta1
   name: vspheremachines.infrastructure.cluster.x-k8s.io
 spec:
   group: infrastructure.cluster.x-k8s.io
@@ -1109,7 +1111,7 @@ spec:
                   template:
                     description: |-
                       Template defines the template to use for generating the name of the VSphereVM object.
-                      If not defined, it will fall back to `{{ .machine.name }}`.
+                      If not defined, it will fall back to `{{ "{{ .machine.name }}" }}`.
                       The templating has the following data available:
                       * `.machine.name`: The name of the Machine object.
                       The templating also has the following funcs available:

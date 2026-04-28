@@ -345,6 +345,13 @@ generate-manifests: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc.
 		paths=./$(VCSIM_DIR)/controllers/... \
 		output:rbac:dir=$(VCSIM_RBAC_ROOT) \
 		rbac:roleName=manager-role
+	# Patch CAPI contract label into generated CRD files.
+	# controller-gen does not emit metadata.labels, so we add it here to ensure
+	# Helm-based deployments (which bypass kustomize commonLabels) carry the label
+	# that KCP uses to detect the provider contract version.
+	for f in $(CRD_ROOT)/*.yaml $(SUPERVISOR_CRD_ROOT)/*.yaml; do \
+		sed -i '/controller-gen.kubebuilder.io\/version:/a\  labels:\n    cluster.x-k8s.io/v1beta1: v1beta1' "$$f"; \
+	done
 
 .PHONY: generate-go-deepcopy
 generate-go-deepcopy: $(CONTROLLER_GEN) ## Generate deepcopy go code for core

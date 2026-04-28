@@ -156,7 +156,7 @@ type VSphereMachineSpec struct {
 // VSphereVMNamingStrategy defines the naming strategy for the VSphereVMs.
 type VSphereVMNamingStrategy struct {
 	// Template defines the template to use for generating the name of the VSphereVM object.
-	// If not defined, it will fall back to `{{ .machine.name }}`.
+	// If not defined, it will fall back to `{{ "{{ .machine.name }}" }}`.
 	// The templating has the following data available:
 	// * `.machine.name`: The name of the Machine object.
 	// The templating also has the following funcs available:
