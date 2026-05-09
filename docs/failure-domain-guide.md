@@ -86,10 +86,13 @@ spec:
                                          # （不允许 HostGroup：HostGroup 是 Cluster 内部的最细粒度，
                                          #   若作为 Region，Zone 在其下再无更细的切分层次可用）
     tagCategory: k8s-region              # vCenter Tag Category 名称（"键"）
+    autoConfigure: true                  # 显式开启，让 CAPV 自动创建 Category/Tag 并 attach；
+                                         # 默认值为 false（仅校验已存在的 Tag），详见 §3.1
   zone:                                  # Zone 定义（结构同上）
     name: zone-cluster-a
     type: ComputeCluster                 # Datacenter | ComputeCluster | HostGroup
     tagCategory: k8s-zone
+    autoConfigure: true                  # 同 region.autoConfigure，必须显式置 true
   topology:                              # 实际的 vSphere 基础设施
     datacenter: dc-bj-1                  # (必填) Datacenter 名称
     computeCluster: cluster-a            # (可选) ComputeCluster 名称；Zone/Region=ComputeCluster 或 HostGroup 时必填
@@ -206,7 +209,7 @@ Cluster (cluster-1)             ← Region 标签打在这里
 
 ### 2.4 vCenter 预置要求：谁建什么
 
-为避免"哪些要手工建、哪些 CAPV 会建"的混淆，下表逐对象列出**运维预置**与 **CAPV 自动操作**的边界。一句话总结：**vSphere 基础设施 + DRS 分组容器 + 亲和规则需要运维手动建；Tag 体系、VMGroup 成员关系和 VM 本身由 CAPV 自动管理**。
+为避免"哪些要手工建、哪些 CAPV 会建"的混淆，下表逐对象列出**运维预置**与 **CAPV 自动操作**的边界。一句话总结：**vSphere 基础设施 + DRS 分组容器 + 亲和规则需要运维手动建；VMGroup 成员关系和 VM 本身由 CAPV 自动管理；Tag 体系是否由 CAPV 自动管理取决于 `autoConfigure` 开关（默认 `false` 仅校验，需显式置 `true` 才自动创建，详见 §3.1）**。
 
 | 对象 / 能力 | 运维需提前创建 | CAPV 在此对象上的操作 |
 |---|---|---|
@@ -221,12 +224,12 @@ Cluster (cluster-1)             ← Region 标签打在这里
 | **HostGroup**（容器 + Host 成员） | ✅（仅 HostGroup 故障域场景） | 只读——用 `ListHostsFromGroup` 取成员后给每台 Host 打 Zone Tag；不会增删 Host |
 | **VMGroup**（容器） | ✅（仅 HostGroup 故障域场景，**可以是空 group**） | **自动把新建 VM Add 成员**（`reconcileVMGroupInfo`，见 `pkg/services/govmomi/service.go:1046`） |
 | **VM-Host Affinity Rule** | ✅（仅 HostGroup 故障域场景；运维选 `must run on` / `should run on` 强度） | 只 `VerifyAffinityRule` 存在性，不创建、不修改强度 |
-| Tag Category | ❌ | **自动创建**（VSphereDeploymentZone 控制器；基数固定 `SINGLE`，associable type 按故障域 `type` 设置）；若同名 Category 已存在但 associable type 不匹配，CAPV 会 **`UpdateCategory`** 修正 |
-| Tag | ❌ | **自动创建**（按 `region.name` / `zone.name`） |
-| Tag attach 到 Datacenter / ComputeCluster / Host | ❌ | **自动 attach** 到对应对象 |
+| Tag Category | ❌（开启 `autoConfigure: true` 时） / ✅（默认 `false` 时） | **`autoConfigure: true` 时自动创建**（VSphereDeploymentZone 控制器；设计目标基数为 `SINGLE`，associable type 按故障域 `type` 设置）；若同名 Category 已存在但 associable type 不匹配，CAPV 会 **`UpdateCategory`** 修正。**默认 `false` 时只校验，不创建**——见 §3.1 |
+| Tag | ❌（开启 `autoConfigure: true` 时） / ✅（默认 `false` 时） | 同上：`autoConfigure: true` 时按 `region.name` / `zone.name` 自动创建；默认仅校验 |
+| Tag attach 到 Datacenter / ComputeCluster / Host | ❌（开启 `autoConfigure: true` 时） / ✅（默认 `false` 时） | 同上：`autoConfigure: true` 时自动 attach；默认仅校验 |
 | Virtual Machine | ❌ | **自动 `CloneVM` + `ReconfigureVM`**：从 Template 克隆，按 `topology` + `placementConstraint` 决定落点，按 Slot（如有 ConfigPool）下发 hostname/IP/磁盘 |
 
-> 表中所有 ✅ 行如果对象不存在，CAPV reconcile 会失败并卡住（例如 VMGroup 不存在时 `FindVMGroup` 直接返回 `cannot find VM group <name>`），不会替你"先建后用"。
+> 表中所有 ✅ 行如果对象不存在，CAPV reconcile 会失败并卡住（例如 VMGroup 不存在时 `FindVMGroup` 直接返回 `cannot find VM group <name>`），不会替你"先建后用"。Tag Category / Tag / attach 三行的"运维需预置"取决于 `autoConfigure` 是否开启，详见 §3.1。
 
 ---
 
@@ -239,10 +242,15 @@ vCenter 的 Tag 系统由两层组成：
 - **Tag Category (标签类别)**: 标签的分组容器。每个类别定义：
   - 名称（如 `k8s-region`、`k8s-zone`）
   - 可关联的对象类型（Datacenter、ClusterComputeResource、HostSystem）
-  - **基数**：`SINGLE` 表示同一对象在该类别下最多挂一个 Tag，`MULTIPLE` 表示可挂多个。CAPV 创建 Category 时固定用 `SINGLE`——一个 Datacenter/Cluster/Host 不允许同时属于两个 Region 或两个 Zone。
+  - **基数**：`SINGLE` 表示同一对象在该类别下最多挂一个 Tag，`MULTIPLE` 表示可挂多个。CAPV 的设计目标是 `SINGLE`——一个 Datacenter/Cluster/Host 不应同时属于两个 Region 或两个 Zone，由 vCenter 在 attach 阶段强制保证；否则 CPI 给 Node 写 `topology.kubernetes.io/region|zone` 时会从多个 Tag 中非确定地取一个，topologySpreadConstraints 与 `StorageClass.allowedTopologies` 都会失效。当前实现使用 `MULTIPLE`（沿用上游历史选择），与设计目标不一致，需在后续迭代中改回 `SINGLE`；在此之前运维侧需自行确保同一对象在同 Category 下只挂一个 Tag。
 - **Tag (标签)**: 属于某个类别的具体标签值（如 `region-east`、`zone-cluster-a`）
 
-标签可以附加 (attach) 到 vSphere 对象上。**Tag Category、Tag 以及它们到目标对象的 attach 关系全部由 VSphereDeploymentZone 控制器自动创建**——运维只需在 `VSphereFailureDomain` 里写好 `tagCategory` 和 `name`；如果同名 Category 已存在但 associable type 不匹配，CAPV 会就地 Update 修正。
+标签可以附加 (attach) 到 vSphere 对象上。**Tag Category、Tag 以及它们到目标对象的 attach 关系是否由 VSphereDeploymentZone 控制器自动创建，取决于 `VSphereFailureDomain.spec.region.autoConfigure` 与 `spec.zone.autoConfigure` 两个开关**：
+
+- `autoConfigure: true`：CAPV 自动创建 Category（设计目标基数为 `SINGLE`，associable type 按故障域 `type` 设置；当前实现仍为 `MULTIPLE`，见 §3.1 上文）、自动创建 Tag、并 attach 到目标对象；如果同名 Category 已存在但 associable type 不匹配，CAPV 会就地 `UpdateCategory` 修正。
+- `autoConfigure: false`（**当前默认值**）：CAPV 仅校验 Category / Tag / attach 是否已存在，不创建任何东西。运维必须提前在 vCenter 上把 Category、Tag、以及到 Datacenter / ComputeCluster / Host 的 attach 全部建好，否则 DeploymentZone 不会进入 Ready。
+
+> ⚠️ **当前默认 `false` 与本文档其它示例假设不一致**——为了与"由 CAPV 自动管理 Tag 体系"的设计意图对齐，建议**显式在 `VSphereFailureDomain` 里写 `region.autoConfigure: true` 和 `zone.autoConfigure: true`**（见 §2.1 示例）。`autoConfigure` 字段已在 API 中标记为 `Deprecated: This field is going to be removed in a future release.`，未来版本会移除该字段并默认走自动创建路径；显式开启可与未来行为对齐，避免升级时 DeploymentZone 因仅校验失败而卡住。
 
 ### 3.2 Tag 与故障域类型的对应关系
 
@@ -254,7 +262,7 @@ vCenter 的 Tag 系统由两层组成：
 
 ### 3.3 用 govc 验证标签
 
-Tag Category 和 Tag 由 VSphereDeploymentZone 控制器自动创建、attach，不需要手动操作。以下 [govc](https://github.com/vmware/govmomi/tree/main/govc) 命令用于验证或排查：
+开启 `autoConfigure: true` 后，Tag Category 和 Tag 由 VSphereDeploymentZone 控制器自动创建、attach，不需要手动操作。以下 [govc](https://github.com/vmware/govmomi/tree/main/govc) 命令用于验证或排查（默认 `autoConfigure: false` 模式下也可以用同一组命令确认运维预置的 Tag 体系是否符合 DeploymentZone 校验要求）：
 
 ```bash
 export GOVC_URL="https://vcenter.example.com/sdk"
@@ -315,7 +323,7 @@ CAPV 的做法是在上报 `VSphereCluster.Status.FailureDomains` 前，先用�
 
 这样：**只有部分**故障域的 Slot 耗尽时，CAPV 会从上报结果里排除这些域，降低 Machine 被调度到无 Slot 域的概率；**所有**域都耗尽时，CAPV 会保留全部 ready domains 并通过 `FailureDomainsAvailable=False` / Reason `ExhaustedByMachineConfigPool` 暴露容量耗尽，此时新 Machine 仍可能因无 Slot 而创建失败（卡在 `MachineConfigPoolReady=False`），需要外部扩容 ConfigPool 或等待 `Released` Slot 复用。
 
-> ⚠️ **粒度限制：cluster-aware，不是 pool-aware**。上面第 2 步按 Datacenter 聚合时**不区分 Slot 属于哪个 Pool / Consumer**，所以即便 Pool 与 KCP/MD 是 1:1 绑定，"KCP-Pool 只有 DC-1 Slot、MD-Pool 只有 DC-2 Slot"的场景仍会让聚合结果显示两 DC 都可用，KCP Machine 可能被分到 DC-2 后卡死。根因是 `VSphereCluster.Status.FailureDomains` 是集群级单一列表，CAPI 没有"按 consumer 投影 FD"的 API，**真正做到 pool-aware 必须改 CAPI**。运维侧的近似手段：让各 Pool 的 Slot 覆盖**互不相交的 Datacenter**，并用 `VSphereDeploymentZone.spec.controlPlane` 严格区分控制面/工作节点的 FD；卡死时靠 MachineHealthCheck 兜底重建。
+> ⚠️ **粒度限制：cluster-aware，不是 pool-aware**。上面第 2 步按 Datacenter 聚合时**不区分 Slot 属于哪个 Pool / Consumer**，所以即便 Pool 与 KCP/MD 是 1:1 绑定，"KCP-Pool 只有 DC-1 Slot、MD-Pool 只有 DC-2 Slot"的场景仍会让聚合结果显示两 DC 都可用，KCP Machine 可能被分到 DC-2 后卡死。根因是 `VSphereCluster.Status.FailureDomains` 是集群级单一列表，CAPI 没有"按 consumer 投影 FD"的 API，**真正做到 pool-aware 必须改 CAPI**。运维侧的近似手段：让各 Pool 的 Slot 覆盖**互不相交的 Datacenter**，并用 `VSphereDeploymentZone.spec.controlPlane` 严格区分控制面/工作节点的 FD。一旦 Machine 已被分到无 Slot 的 Datacenter 卡住，**没有自愈通道**——CAPV 不会主动重新调度，cluster-aware 的可用域列表也不会因为单个 Machine 卡住而变化；恢复需要外部介入：扩容 ConfigPool、释放/复用 `Released` Slot，或调整 FD / Pool 规划后手工删除卡住的 Machine 让上层副本控制器重建。
 
 ### 4.3 配置池示例
 
