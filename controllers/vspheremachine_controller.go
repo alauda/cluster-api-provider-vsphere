@@ -30,6 +30,8 @@ import (
 	apitypes "k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -37,6 +39,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	"sigs.k8s.io/cluster-api/util/finalizers"
+	kcfg "sigs.k8s.io/cluster-api/util/kubeconfig"
 	clog "sigs.k8s.io/cluster-api/util/log"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/paused"
@@ -62,6 +65,15 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/vmoperator"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util/ovn"
+)
+
+const (
+	// cniAnnotation on the CAPI Cluster identifies the workload-cluster CNI.
+	// When its value equals cniKubeOVN, control-plane Machine deletion will
+	// kick the corresponding OVN raft member before the VM is destroyed.
+	cniAnnotation = "cpaas.io/network-type"
+	cniKubeOVN    = "kube-ovn"
 )
 
 const (
@@ -352,6 +364,13 @@ func (r *machineReconciler) reconcileDelete(ctx context.Context, machineCtx capv
 		Reason: infrav1.VSphereMachineVirtualMachineDeletingV1Beta2Reason,
 	})
 
+	// Evict this node from the OVN raft cluster before the VM is destroyed.
+	// Once the VM is gone the kicked member would be observed as Unreachable
+	// rather than Removed, which can stall leader election on small clusters.
+	if err := r.scaleDownCni(ctx, machineCtx); err != nil {
+		return reconcile.Result{}, errors.Wrap(err, "failed to scale down CNI for VSphereMachine")
+	}
+
 	if err := r.VMService.ReconcileDelete(ctx, machineCtx); err != nil {
 		if apierrors.IsNotFound(err) {
 			// The VM is deleted so remove the finalizer.
@@ -373,6 +392,80 @@ func (r *machineReconciler) reconcileDelete(ctx context.Context, machineCtx capv
 
 	// VM is being deleted
 	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// scaleDownCni kicks the OVN raft member corresponding to this Machine out of
+// the workload cluster's OVN cluster before the underlying VM is destroyed.
+//
+// It is a no-op unless every condition holds:
+//   - the workload cluster is annotated with cpaas.io/network-type=kube-ovn
+//   - this Machine is a control-plane member (only control-plane nodes host
+//     ovn-central, so worker deletions don't need to touch the raft cluster)
+//   - the control plane has been initialized (otherwise there's no API to talk
+//     to and no raft cluster to kick from)
+//   - the Cluster itself isn't being deleted (the whole OVN cluster is going
+//     away anyway, so kicking one member is wasted work)
+//   - the Machine has an InternalIP recorded (without it we have nothing to
+//     identify the raft member by)
+func (r *machineReconciler) scaleDownCni(ctx context.Context, machineCtx capvcontext.MachineContext) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	cluster := machineCtx.GetCluster()
+	machine := machineCtx.GetMachine()
+	if cluster == nil || machine == nil {
+		return nil
+	}
+
+	if cluster.GetAnnotations()[cniAnnotation] != cniKubeOVN {
+		return nil
+	}
+
+	if _, ok := machine.Labels[clusterv1.MachineControlPlaneLabel]; !ok {
+		return nil
+	}
+
+	if !conditions.IsTrue(cluster, clusterv1.ControlPlaneInitializedCondition) {
+		log.Info("Control plane not initialized, skipping CNI scale-down")
+		return nil
+	}
+
+	if !cluster.DeletionTimestamp.IsZero() {
+		log.Info("Cluster is being deleted, skipping CNI scale-down")
+		return nil
+	}
+
+	var memberIP string
+	for _, addr := range machine.Status.Addresses {
+		if addr.Type == clusterv1.MachineInternalIP && addr.Address != "" {
+			memberIP = addr.Address
+			break
+		}
+	}
+	if memberIP == "" {
+		log.Info("Machine has no InternalIP recorded, skipping CNI scale-down")
+		return nil
+	}
+
+	clusterKey := client.ObjectKeyFromObject(cluster)
+	kubeconfig, err := kcfg.FromSecret(ctx, r.Client, clusterKey)
+	if err != nil {
+		return errors.Wrapf(err, "failed to fetch workload kubeconfig for Cluster %s", clusterKey)
+	}
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return errors.Wrap(err, "failed to build workload REST config")
+	}
+	restConfig.Timeout = 30 * time.Second
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return errors.Wrap(err, "failed to build workload clientset")
+	}
+
+	log.Info("Kicking OVN raft member before VM deletion", "memberIP", memberIP)
+	if err := ovn.KickRaftMember(ctx, clientset, restConfig, ovn.CentralNamespace, memberIP); err != nil {
+		return errors.Wrapf(err, "failed to kick OVN raft member %s", memberIP)
+	}
+	return nil
 }
 
 func (r *machineReconciler) reconcileNormal(ctx context.Context, machineCtx capvcontext.MachineContext) (reconcile.Result, error) {
