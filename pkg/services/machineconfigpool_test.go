@@ -120,7 +120,7 @@ func TestAllocateSlot(t *testing.T) {
 			},
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Configs: []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 			Status: infrav1.VSphereMachineConfigPoolStatus{
 				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
@@ -457,7 +457,7 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 				Datacenter: "dc-1",
-				Configs:  []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 			},
 			// No status entries
 		}}
@@ -488,7 +488,7 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 				Spec: infrav1.VSphereMachineConfigPoolSpec{
 					ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 					Datacenter: "dc-1",
-					Configs:  []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
+					Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
 				},
 				Status: infrav1.VSphereMachineConfigPoolStatus{
 					ConfigStatuses: []infrav1.MachineConfigSlotStatus{
@@ -500,7 +500,7 @@ func TestDatacentersWithAvailableSlots(t *testing.T) {
 				Spec: infrav1.VSphereMachineConfigPoolSpec{
 					ClusterRef: corev1.ObjectReference{Name: "cluster-1"},
 					Datacenter: "dc-1",
-					Configs:  []infrav1.MachineConfigSlot{{Hostname: "host-2"}},
+					Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-2"}},
 				},
 				// host-2 has no status -> available
 			},
@@ -515,7 +515,7 @@ func TestIsPoolFullyReusable(t *testing.T) {
 	pool := &infrav1.VSphereMachineConfigPool{
 		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}},
+			Configs:    []infrav1.MachineConfigSlot{{Hostname: "slot-1"}},
 		},
 		Status: infrav1.VSphereMachineConfigPoolStatus{
 			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{Hostname: "slot-1", State: infrav1.MachineConfigSlotStateAvailable}},
@@ -542,7 +542,6 @@ func TestIsPoolFullyReusable(t *testing.T) {
 	withRetry.Status.ConfigStatuses[0].ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{RetryAfter: &retryAfter, State: "Failed"}
 	g.Expect(IsPoolFullyReusable(withRetry)).To(BeFalse())
 }
-
 
 func TestFindMachineConfigPoolForMachine(t *testing.T) {
 	g := NewWithT(t)
@@ -751,6 +750,36 @@ func TestApplyDiskBackfill(t *testing.T) {
 		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk.vmdk"))
 		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].DiskUUID).To(Equal("uuid-1"))
 		g.Expect(*pool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(Equal(int32(1)))
+	})
+
+	t.Run("backfills duplicate-size disks by name", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "disk-a", SizeGiB: 20},
+						{Name: "disk-b", SizeGiB: 20},
+					},
+				}},
+			},
+		}
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk-a.vmdk", DiskUUID: "uuid-a", UnitNumber: int32Ptr(0)},
+				{Name: "disk-b", SizeGiB: 20, VolumePath: "[ds] vm/disk-b.vmdk", DiskUUID: "uuid-b", UnitNumber: int32Ptr(1)},
+			},
+		})
+		g.Expect(updated).To(BeTrue())
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].DiskUUID).To(Equal("uuid-a"))
+		g.Expect(*pool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(Equal(int32(0)))
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[1].VolumePath).To(Equal("[ds] vm/disk-b.vmdk"))
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[1].DiskUUID).To(Equal("uuid-b"))
+		g.Expect(*pool.Spec.Configs[0].PersistentDisks[1].UnitNumber).To(Equal(int32(1)))
 	})
 
 	t.Run("returns false when nothing changed", func(t *testing.T) {
