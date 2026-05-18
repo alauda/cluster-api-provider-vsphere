@@ -62,6 +62,7 @@ import (
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/manager"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/version"
 	"sigs.k8s.io/cluster-api-provider-vsphere/webhooks"
 	vmwarewebhooks "sigs.k8s.io/cluster-api-provider-vsphere/webhooks/vmware"
@@ -163,6 +164,13 @@ func InitFlags(fs *pflag.FlagSet) {
 		"network-provider",
 		"",
 		"network provider to be used by Supervisor based clusters.",
+	)
+
+	fs.StringVar(
+		&standby.ConfigMapNamespace,
+		"system-namespace",
+		standby.DefaultConfigMapNamespace,
+		"Namespace containing system resources used by the controller manager.",
 	)
 
 	// Flags common between CAPI and CAPV

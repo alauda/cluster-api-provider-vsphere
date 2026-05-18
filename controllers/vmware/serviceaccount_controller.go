@@ -50,6 +50,7 @@ import (
 	vmwarev1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/vmware/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	vmwarecontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context/vmware"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
@@ -99,7 +100,7 @@ func AddServiceAccountProviderControllerToManager(ctx context.Context, controlle
 		).
 		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
 		WatchesRawSource(r.clusterCache.GetClusterSource("providerserviceaccount", clusterToSupervisorVSphereClusterFunc(r.Client))).
-		Complete(r)
+		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "providerserviceaccount", r))
 }
 
 // ServiceAccountReconciler reconciles changes to ProviderServiceAccounts.

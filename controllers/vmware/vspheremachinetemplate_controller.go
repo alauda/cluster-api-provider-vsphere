@@ -35,6 +35,7 @@ import (
 
 	vmwarev1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/vmware/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 )
 
 // +kubebuilder:rbac:groups=vmware.infrastructure.cluster.x-k8s.io,resources=vspheremachinetemplates,verbs=get;list;watch;create;update;patch;delete
@@ -57,7 +58,7 @@ func AddVSphereMachineTemplateControllerToManager(ctx context.Context, controlle
 			handler.EnqueueRequestsFromMapFunc(r.enqueueVirtualMachineClassToVSphereMachineTemplateRequests),
 		).
 		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerContext.WatchFilterValue)).
-		Complete(r)
+		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheremachinetemplate", r))
 }
 
 type vSphereMachineTemplateReconciler struct {

@@ -45,6 +45,7 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	pkgidentity "sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 )
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vsphereclusteridentities,verbs=get;list;watch;create;update;patch;delete
@@ -64,7 +65,7 @@ func AddVsphereClusterIdentityControllerToManager(ctx context.Context, controlle
 		For(&infrav1.VSphereClusterIdentity{}).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
-		Complete(reconciler)
+		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vsphereclusteridentity", reconciler))
 }
 
 type clusterIdentityReconciler struct {

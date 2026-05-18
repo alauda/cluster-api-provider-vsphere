@@ -57,6 +57,7 @@ import (
 	vmwarev1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/vmware/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	vmwarecontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context/vmware"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 )
 
 const (
@@ -116,7 +117,7 @@ func AddServiceDiscoveryControllerToManager(ctx context.Context, controllerManag
 		).
 		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
 		WatchesRawSource(r.clusterCache.GetClusterSource("servicediscovery/vspherecluster", clusterToSupervisorVSphereClusterFunc(r.Client))).
-		Complete(r)
+		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "servicediscovery/vspherecluster", r))
 }
 
 func clusterToSupervisorVSphereClusterFunc(ctrlclient client.Client) func(ctx context.Context, obj client.Object) []reconcile.Request {

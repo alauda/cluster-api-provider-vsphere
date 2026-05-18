@@ -43,8 +43,10 @@ import (
 	inframanager "sigs.k8s.io/cluster-api-provider-vsphere/pkg/manager"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/vmoperator"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 )
 
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;patch;update
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vsphereclusteridentities,verbs=get;list;watch;delete
@@ -93,7 +95,7 @@ func AddClusterControllerToManager(ctx context.Context, controllerManagerCtx *ca
 			)
 		}
 
-		return builder.Complete(reconciler)
+		return builder.Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspherecluster", reconciler))
 	}
 
 	reconciler := &clusterReconciler{
@@ -165,7 +167,7 @@ func AddClusterControllerToManager(ctx context.Context, controllerManagerCtx *ca
 		).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
 		WithEventFilter(predicates.ResourceIsNotExternallyManaged(mgr.GetScheme(), predicateLog)).
-		Build(reconciler)
+		Build(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspherecluster", reconciler))
 	if err != nil {
 		return err
 	}

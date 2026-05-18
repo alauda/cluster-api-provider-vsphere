@@ -65,6 +65,7 @@ import (
 	inframanager "sigs.k8s.io/cluster-api-provider-vsphere/pkg/manager"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/vmoperator"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util/ovn"
 )
@@ -143,7 +144,7 @@ func AddMachineControllerToManager(ctx context.Context, controllerManagerContext
 			WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerContext.WatchFilterValue)).
 			// Watch any VirtualMachine resources owned by this VSphereMachine
 			Owns(&vmoprv1.VirtualMachine{}).
-			Complete(r)
+			Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheremachine", r))
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -185,7 +186,7 @@ func AddMachineControllerToManager(ctx context.Context, controllerManagerContext
 			ctrlbldr.WithPredicates(
 				predicates.ClusterPausedTransitionsOrInfrastructureReady(mgr.GetScheme(), predicateLog),
 			),
-		).Complete(r)
+		).Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheremachine", r))
 }
 
 type machineReconciler struct {
