@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -405,8 +406,28 @@ func (r *machineReconciler) reconcileDelete(ctx context.Context, machineCtx capv
 //     to and no raft cluster to kick from)
 //   - the Cluster itself isn't being deleted (the whole OVN cluster is going
 //     away anyway, so kicking one member is wasted work)
-//   - the Machine has an InternalIP recorded (without it we have nothing to
-//     identify the raft member by)
+//   - the Machine has at least one IP recorded that matches an OVN raft member
+func ovnRaftCandidateIPs(addresses []clusterv1.MachineAddress) []string {
+	seen := make(map[string]struct{}, len(addresses))
+	candidateIPs := make([]string, 0, len(addresses))
+	for _, addr := range addresses {
+		if addr.Type != clusterv1.MachineInternalIP && addr.Type != clusterv1.MachineExternalIP {
+			continue
+		}
+		parsedIP, err := netip.ParseAddr(strings.TrimSpace(addr.Address))
+		if err != nil {
+			continue
+		}
+		ip := parsedIP.String()
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		candidateIPs = append(candidateIPs, ip)
+	}
+	return candidateIPs
+}
+
 func (r *machineReconciler) scaleDownCni(ctx context.Context, machineCtx capvcontext.MachineContext) error {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -434,15 +455,9 @@ func (r *machineReconciler) scaleDownCni(ctx context.Context, machineCtx capvcon
 		return nil
 	}
 
-	var memberIP string
-	for _, addr := range machine.Status.Addresses {
-		if addr.Type == clusterv1.MachineInternalIP && addr.Address != "" {
-			memberIP = addr.Address
-			break
-		}
-	}
-	if memberIP == "" {
-		log.Info("Machine has no InternalIP recorded, skipping CNI scale-down")
+	candidateIPs := ovnRaftCandidateIPs(machine.Status.Addresses)
+	if len(candidateIPs) == 0 {
+		log.Info("Machine has no IP address candidates recorded, skipping CNI scale-down")
 		return nil
 	}
 
@@ -461,10 +476,20 @@ func (r *machineReconciler) scaleDownCni(ctx context.Context, machineCtx capvcon
 		return errors.Wrap(err, "failed to build workload clientset")
 	}
 
-	log.Info("Kicking OVN raft member before VM deletion", "memberIP", memberIP)
-	if err := ovn.KickRaftMember(ctx, clientset, restConfig, ovn.CentralNamespace, memberIP); err != nil {
-		return errors.Wrapf(err, "failed to kick OVN raft member %s", memberIP)
+	log.Info("Resolving OVN raft member before VM deletion", "candidateIPs", candidateIPs)
+	memberIP, kickedDBs, err := ovn.KickRaftMemberFromCandidates(ctx, clientset, restConfig, ovn.CentralNamespace, candidateIPs)
+	if err != nil {
+		return errors.Wrap(err, "failed to kick OVN raft member from Machine IP candidates")
 	}
+	if memberIP == "" {
+		log.Info("No Machine IP candidate matched an OVN raft member, skipping CNI scale-down", "candidateIPs", candidateIPs)
+		return nil
+	}
+	if len(kickedDBs) == 0 {
+		log.Info("OVN raft member was already absent during kick", "memberIP", memberIP)
+		return nil
+	}
+	log.Info("Successfully kicked OVN raft member before VM deletion", "memberIP", memberIP, "databases", kickedDBs)
 	return nil
 }
 

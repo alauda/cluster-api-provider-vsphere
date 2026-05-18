@@ -702,20 +702,44 @@ func uniqueIPv4SANs(devices []infrav1.NetworkDeviceSpec) []string {
 	return out
 }
 
+func ValidatePersistentDiskBackfill(persistentDisks []infrav1.PersistentDisk) error {
+	var incomplete []string
+	for i := range persistentDisks {
+		disk := persistentDisks[i]
+		var missing []string
+		if disk.UnitNumber == nil {
+			missing = append(missing, "unitNumber")
+		}
+		if disk.VolumePath == "" {
+			missing = append(missing, "volumePath")
+		}
+		if disk.DiskUUID == "" {
+			missing = append(missing, "diskUUID")
+		}
+		if len(missing) > 0 {
+			incomplete = append(incomplete, fmt.Sprintf("disk %q missing %s", disk.Name, strings.Join(missing, ", ")))
+		}
+	}
+	if len(incomplete) > 0 {
+		return errors.Errorf("persistent disk metadata incomplete: %s", strings.Join(incomplete, "; "))
+	}
+	return nil
+}
+
 func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk) ([]byte, error) {
+	if len(persistentDisks) == 0 {
+		return nil, nil
+	}
+	if err := ValidatePersistentDiskBackfill(persistentDisks); err != nil {
+		return nil, err
+	}
 	normalizedPersistentDisks := make([]infrav1.PersistentDisk, 0, len(persistentDisks))
 	for i := range persistentDisks {
 		disk := persistentDisks[i]
-		if disk.UnitNumber == nil {
-			continue
-		}
 		if disk.FSFormat == "" && disk.MountPath != "" {
 			disk.FSFormat = "ext4"
 		}
 		normalizedPersistentDisks = append(normalizedPersistentDisks, disk)
-	}
-	if len(normalizedPersistentDisks) == 0 {
-		return nil, nil
 	}
 
 	var configFile strings.Builder

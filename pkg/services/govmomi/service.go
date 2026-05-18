@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -1189,10 +1190,11 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 	scsiKeys := findSCSIControllerKeys(devices)
 	updated := false
 	usedDiskKeys := map[int32]struct{}{}
+	referencedDiskKeys := findReferencedPersistentDiskKeys(virtualMachineCtx.MachineConfigSlot.PersistentDisks, disks, scsiKeys)
 
 	for i := range virtualMachineCtx.MachineConfigSlot.PersistentDisks {
 		pd := &virtualMachineCtx.MachineConfigSlot.PersistentDisks[i]
-		disk := findPersistentDiskDevice(pd, disks, usedDiskKeys, scsiKeys)
+		disk := findPersistentDiskDevice(pd, disks, usedDiskKeys, referencedDiskKeys, scsiKeys)
 		if disk == nil {
 			continue
 		}
@@ -1217,7 +1219,12 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 	}
 
 	if updated {
-		return persistMachineConfigSlotBackfill(ctx, &virtualMachineCtx.VMContext)
+		if err := persistMachineConfigSlotBackfill(ctx, &virtualMachineCtx.VMContext); err != nil {
+			return err
+		}
+	}
+	if err := util.ValidatePersistentDiskBackfill(virtualMachineCtx.MachineConfigSlot.PersistentDisks); err != nil {
+		return errors.Wrapf(err, "persistent disk metadata incomplete for machine config slot %q; refusing to generate persistent disk user-data or power on VM", virtualMachineCtx.MachineConfigSlot.Hostname)
 	}
 	return nil
 }
@@ -1234,16 +1241,17 @@ func findSCSIControllerKeys(devices object.VirtualDeviceList) map[int32]struct{}
 }
 
 // findPersistentDiskDevice locates the VM disk that corresponds to a persistent
-// disk spec.  It uses a three-tier match strategy:
+// disk spec. It uses a three-tier match strategy:
 //  1. VolumePath (exact VMDK file path — globally unique, most reliable)
 //  2. UnitNumber on a SCSI controller (stable across VM recreations when the
 //     same unit is reused)
-//  3. Capacity on a SCSI controller (last resort; returns nil if ambiguous)
+//  3. Capacity on a SCSI controller (last resort; chooses the first deterministic
+//     unused and unreferenced candidate)
 //
 // Tiers 2 and 3 are restricted to SCSI controllers because CAPV always places
-// persistent data disks on SCSI.  This prevents false matches against the OS
+// persistent data disks on SCSI. This prevents false matches against the OS
 // disk when it lives on an IDE or SATA controller.
-func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDeviceList, usedDiskKeys map[int32]struct{}, scsiKeys map[int32]struct{}) *types.VirtualDisk {
+func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDeviceList, usedDiskKeys, referencedDiskKeys map[int32]struct{}, scsiKeys map[int32]struct{}) *types.VirtualDisk {
 	if pd == nil {
 		return nil
 	}
@@ -1280,9 +1288,8 @@ func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDe
 		}
 	}
 
-	// Tier 3: match by capacity on a SCSI controller (must be unambiguous).
 	expectedCapacityKB := int64(pd.SizeGiB) * 1024 * 1024
-	var match *types.VirtualDisk
+	candidates := []*types.VirtualDisk{}
 	for _, d := range disks {
 		disk := d.(*types.VirtualDisk)
 		if _, onSCSI := scsiKeys[disk.GetVirtualDevice().ControllerKey]; !onSCSI {
@@ -1291,15 +1298,101 @@ func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDe
 		if _, used := usedDiskKeys[disk.Key]; used {
 			continue
 		}
+		if _, referenced := referencedDiskKeys[disk.Key]; referenced {
+			continue
+		}
 		if disk.CapacityInKB != expectedCapacityKB {
 			continue
 		}
-		if match != nil {
-			return nil
-		}
-		match = disk
+		candidates = append(candidates, disk)
 	}
-	return match
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return compareVirtualDisks(candidates[i], candidates[j]) < 0
+	})
+	return candidates[0]
+}
+
+func findReferencedPersistentDiskKeys(persistentDisks []infrav1.PersistentDisk, disks object.VirtualDeviceList, scsiKeys map[int32]struct{}) map[int32]struct{} {
+	referenced := map[int32]struct{}{}
+	for i := range persistentDisks {
+		pd := &persistentDisks[i]
+		if pd.VolumePath != "" {
+			for _, d := range disks {
+				disk := d.(*types.VirtualDisk)
+				if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok && backing.FileName == pd.VolumePath {
+					referenced[disk.Key] = struct{}{}
+				}
+			}
+		}
+		if pd.UnitNumber != nil {
+			for _, d := range disks {
+				disk := d.(*types.VirtualDisk)
+				if _, onSCSI := scsiKeys[disk.GetVirtualDevice().ControllerKey]; !onSCSI {
+					continue
+				}
+				if disk.UnitNumber != nil && *disk.UnitNumber == *pd.UnitNumber {
+					referenced[disk.Key] = struct{}{}
+				}
+			}
+		}
+	}
+	return referenced
+}
+
+func compareVirtualDisks(a, b *types.VirtualDisk) int {
+	if a.GetVirtualDevice().ControllerKey != b.GetVirtualDevice().ControllerKey {
+		if a.GetVirtualDevice().ControllerKey < b.GetVirtualDevice().ControllerKey {
+			return -1
+		}
+		return 1
+	}
+	if compareUnitNumber(a.UnitNumber, b.UnitNumber) != 0 {
+		return compareUnitNumber(a.UnitNumber, b.UnitNumber)
+	}
+	if a.Key != b.Key {
+		if a.Key < b.Key {
+			return -1
+		}
+		return 1
+	}
+	aPath := diskBackingFileName(a)
+	bPath := diskBackingFileName(b)
+	if aPath < bPath {
+		return -1
+	}
+	if aPath > bPath {
+		return 1
+	}
+	return 0
+}
+
+func compareUnitNumber(a, b *int32) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return 1
+	}
+	if b == nil {
+		return -1
+	}
+	if *a < *b {
+		return -1
+	}
+	if *a > *b {
+		return 1
+	}
+	return 0
+}
+
+func diskBackingFileName(disk *types.VirtualDisk) string {
+	if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+		return backing.FileName
+	}
+	return ""
 }
 
 func persistMachineConfigSlotBackfill(ctx context.Context, vmCtx *capvcontext.VMContext) error {

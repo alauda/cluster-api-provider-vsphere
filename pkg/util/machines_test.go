@@ -1033,6 +1033,7 @@ func Test_GetPersistentDiskCloudConfig(t *testing.T) {
 		Name:       "data-1",
 		UnitNumber: toInt32Ptr(2),
 		MountPath:  "/var/lib/data",
+		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "6000C29d-45cb-2787-e901-a2a0131b2e82",
 	}})
 	if err != nil {
@@ -1090,6 +1091,66 @@ func Test_GetPersistentDiskCloudConfig(t *testing.T) {
 	} {
 		if !strings.Contains(actualStr, expected) {
 			t.Fatalf("expected generated cloud-config to contain %q, got: %s", expected, actualStr)
+		}
+	}
+}
+
+func Test_GetPersistentDiskCloudConfigRequiresCompleteBackfill(t *testing.T) {
+	testCases := []struct {
+		name           string
+		persistentDisk infrav1.PersistentDisk
+		expectedField  string
+	}{
+		{
+			name: "missing unit number",
+			persistentDisk: infrav1.PersistentDisk{
+				Name:       "data-1",
+				VolumePath: "[ds] vm/data-1.vmdk",
+				DiskUUID:   "uuid-data-1",
+			},
+			expectedField: "unitNumber",
+		},
+		{
+			name: "missing volume path",
+			persistentDisk: infrav1.PersistentDisk{
+				Name:       "data-1",
+				UnitNumber: toInt32Ptr(1),
+				DiskUUID:   "uuid-data-1",
+			},
+			expectedField: "volumePath",
+		},
+		{
+			name: "missing disk uuid",
+			persistentDisk: infrav1.PersistentDisk{
+				Name:       "data-1",
+				UnitNumber: toInt32Ptr(1),
+				VolumePath: "[ds] vm/data-1.vmdk",
+			},
+			expectedField: "diskUUID",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{tc.persistentDisk})
+			if err == nil {
+				t.Fatal("expected incomplete persistent disk metadata to fail")
+			}
+			if !strings.Contains(err.Error(), "data-1") || !strings.Contains(err.Error(), tc.expectedField) {
+				t.Fatalf("expected error to mention disk and %s, got: %v", tc.expectedField, err)
+			}
+		})
+	}
+
+	err := util.ValidatePersistentDiskBackfill([]infrav1.PersistentDisk{
+		{Name: "data-1", VolumePath: "[ds] vm/data-1.vmdk"},
+		{Name: "data-2", UnitNumber: toInt32Ptr(2), DiskUUID: "uuid-data-2"},
+	})
+	if err == nil {
+		t.Fatal("expected aggregated validation error")
+	}
+	for _, expected := range []string{"data-1", "unitNumber", "diskUUID", "data-2", "volumePath"} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("expected aggregated error to contain %q, got: %v", expected, err)
 		}
 	}
 }
@@ -1344,6 +1405,8 @@ runcmd:
 		Name:       "data-1",
 		UnitNumber: toInt32Ptr(2),
 		MountPath:  "/var/lib/data",
+		VolumePath: "[ds] vm/data-1.vmdk",
+		DiskUUID:   "uuid-data-1",
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -1379,6 +1442,8 @@ runcmd:
 		Name:       "data-1",
 		UnitNumber: toInt32Ptr(2),
 		MountPath:  "/var/lib/data",
+		VolumePath: "[ds] vm/data-1.vmdk",
+		DiskUUID:   "uuid-data-1",
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -1412,6 +1477,7 @@ func Test_MergeCloudConfigUserData_WriteFilesReplaceByPath(t *testing.T) {
 		Name:       "data-1",
 		UnitNumber: toInt32Ptr(1),
 		MountPath:  "/var/lib/data",
+		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "old-uuid",
 	}})
 	if err != nil {
@@ -1421,6 +1487,7 @@ func Test_MergeCloudConfigUserData_WriteFilesReplaceByPath(t *testing.T) {
 		Name:       "data-1",
 		UnitNumber: toInt32Ptr(1),
 		MountPath:  "/var/lib/data",
+		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "new-uuid",
 	}})
 	if err != nil {
@@ -1479,6 +1546,8 @@ runcmd:
 		Name:       "data-1",
 		UnitNumber: toInt32Ptr(1),
 		MountPath:  "/var/lib/data",
+		VolumePath: "[ds] vm/data-1.vmdk",
+		DiskUUID:   "uuid-data-1",
 	}})
 	if err != nil {
 		t.Fatal(err)

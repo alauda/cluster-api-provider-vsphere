@@ -34,6 +34,49 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 )
 
+func TestOVNRaftCandidateIPs(t *testing.T) {
+	tests := []struct {
+		name      string
+		addresses []clusterv1.MachineAddress
+		want      []string
+	}{
+		{
+			name: "includes internal and external IPs",
+			addresses: []clusterv1.MachineAddress{
+				{Type: clusterv1.MachineInternalIP, Address: "192.168.129.242"},
+				{Type: clusterv1.MachineExternalIP, Address: "192.168.164.13"},
+			},
+			want: []string{"192.168.129.242", "192.168.164.13"},
+		},
+		{
+			name: "deduplicates normalized IPs",
+			addresses: []clusterv1.MachineAddress{
+				{Type: clusterv1.MachineInternalIP, Address: " 192.168.129.242 "},
+				{Type: clusterv1.MachineExternalIP, Address: "192.168.129.242"},
+			},
+			want: []string{"192.168.129.242"},
+		},
+		{
+			name: "ignores DNS empty and invalid addresses",
+			addresses: []clusterv1.MachineAddress{
+				{Type: clusterv1.MachineInternalDNS, Address: "machine-1"},
+				{Type: clusterv1.MachineExternalDNS, Address: "machine.example.com"},
+				{Type: clusterv1.MachineInternalIP, Address: ""},
+				{Type: clusterv1.MachineExternalIP, Address: "not-an-ip"},
+				{Type: clusterv1.MachineExternalIP, Address: "192.168.129.242"},
+			},
+			want: []string{"192.168.129.242"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(ovnRaftCandidateIPs(tt.addresses)).To(Equal(tt.want))
+		})
+	}
+}
+
 var _ = Describe("VsphereMachineReconciler", func() {
 	var (
 		capiCluster *clusterv1.Cluster
