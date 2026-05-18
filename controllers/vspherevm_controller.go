@@ -62,6 +62,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
@@ -122,7 +123,7 @@ func AddVMControllerToManager(ctx context.Context, controllerManagerCtx *capvcon
 			handler.EnqueueRequestsFromMapFunc(r.ipAddressClaimToVSphereVM),
 		).
 		WatchesRawSource(r.clusterCache.GetClusterSource("vspherevm", r.clusterToVSphereVMs)).
-		Complete(r)
+		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspherevm", r))
 }
 
 type vmReconciler struct {

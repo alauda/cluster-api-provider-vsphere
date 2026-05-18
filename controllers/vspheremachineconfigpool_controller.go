@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 )
 
 const (
@@ -74,7 +75,7 @@ func AddVSphereMachineConfigPoolControllerToManager(ctx context.Context, control
 		Watches(&infrav1.VSphereCluster{}, handler.EnqueueRequestsFromMapFunc(reconciler.vsphereClusterToMachineConfigPools)).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
-		Complete(reconciler)
+		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheremachineconfigpool", reconciler))
 }
 
 // clusterToMachineConfigPools maps a Cluster to the VSphereMachineConfigPools that reference it.

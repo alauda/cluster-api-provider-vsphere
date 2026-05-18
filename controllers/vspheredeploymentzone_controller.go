@@ -49,6 +49,7 @@ import (
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
@@ -81,7 +82,7 @@ func AddVSphereDeploymentZoneControllerToManager(ctx context.Context, controller
 			),
 		).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
-		Complete(reconciler)
+		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheredeploymentzone", reconciler))
 }
 
 type vsphereDeploymentZoneReconciler struct {
