@@ -28,8 +28,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +39,7 @@ import (
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-vsphere/internal/test/helpers/vcsim"
+	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/context/fake"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
 )
@@ -478,6 +481,147 @@ var _ = Describe("VIM based VSphere ClusterReconciler", func() {
 		})
 	})
 })
+
+func TestClusterReconciler_ControlPlaneReplicasAvailableForKubeOvnReconcile(t *testing.T) {
+	tests := []struct {
+		name           string
+		desired        int32
+		statusReplicas int32
+		wantReady      bool
+	}{
+		{
+			name:           "control plane replica count matches KCP replicas",
+			desired:        3,
+			statusReplicas: 3,
+			wantReady:      true,
+		},
+		{
+			name:           "control plane replica count is lower than KCP replicas",
+			desired:        3,
+			statusReplicas: 2,
+			wantReady:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			cluster := &clusterv1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-cluster",
+				},
+				Spec: clusterv1.ClusterSpec{
+					ControlPlaneRef: &corev1.ObjectReference{
+						APIVersion: controlplanev1.GroupVersion.String(),
+						Kind:       "KubeadmControlPlane",
+						Name:       "test-kcp",
+					},
+				},
+			}
+			objects := []client.Object{
+				cluster,
+				&controlplanev1.KubeadmControlPlane{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: cluster.Namespace,
+						Name:      cluster.Spec.ControlPlaneRef.Name,
+					},
+					Spec: controlplanev1.KubeadmControlPlaneSpec{
+						Replicas: ptr.To(tt.desired),
+					},
+					Status: controlplanev1.KubeadmControlPlaneStatus{
+						Replicas: tt.statusReplicas,
+					},
+				},
+			}
+
+			controllerManagerContext := fake.NewControllerManagerContext(objects...)
+			r := clusterReconciler{Client: controllerManagerContext.Client}
+			ready, err := r.controlPlaneReplicasAvailableForKubeOvnReconcile(ctx, cluster)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(ready).To(Equal(tt.wantReady))
+		})
+	}
+}
+
+func TestBuildKubeOvnAppReleaseSetsPullSecrets(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneEndpoint: clusterv1.APIEndpoint{Host: "api.test.example.com"},
+		},
+	}
+
+	appRelease := buildKubeOvnAppRelease(
+		cluster,
+		"registry.example.com",
+		"v1.0.0",
+		"192.168.0.0/16",
+		"10.96.0.0/12",
+		"100.64.0.0/16",
+		"global-registry-auth",
+		[]interface{}{"global-registry-auth", "extra-registry-auth"},
+	)
+
+	chartPullSecret, found, err := unstructured.NestedString(appRelease.Object, "spec", "source", "chartPullSecret")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(chartPullSecret).To(Equal("global-registry-auth"))
+
+	imagePullSecrets, found, err := unstructured.NestedSlice(appRelease.Object, "spec", "values", "global", "registry", "imagePullSecrets")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(imagePullSecrets).To(Equal([]interface{}{"global-registry-auth", "extra-registry-auth"}))
+}
+
+func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneReplicasMatch(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-cluster",
+			Annotations: map[string]string{
+				"cpaas.io/network-type":     "kube-ovn",
+				"cpaas.io/kube-ovn-version": "v1.0.0",
+				"cpaas.io/registry-address": "registry.example.com",
+			},
+		},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneRef: &corev1.ObjectReference{
+				APIVersion: controlplanev1.GroupVersion.String(),
+				Kind:       "KubeadmControlPlane",
+				Name:       "test-kcp",
+			},
+			ClusterNetwork: &clusterv1.ClusterNetwork{
+				Pods: &clusterv1.NetworkRanges{
+					CIDRBlocks: []string{"192.168.0.0/16"},
+				},
+				Services: &clusterv1.NetworkRanges{
+					CIDRBlocks: []string{"10.96.0.0/12"},
+				},
+			},
+		},
+	}
+	controllerManagerContext := fake.NewControllerManagerContext(cluster, &controlplanev1.KubeadmControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cluster.Namespace,
+			Name:      cluster.Spec.ControlPlaneRef.Name,
+		},
+		Spec: controlplanev1.KubeadmControlPlaneSpec{
+			Replicas: ptr.To[int32](3),
+		},
+		Status: controlplanev1.KubeadmControlPlaneStatus{
+			Replicas: 2,
+		},
+	})
+	r := clusterReconciler{Client: controllerManagerContext.Client}
+
+	result, err := r.reconcileKubeOvnAppRelease(ctx, &capvcontext.ClusterContext{Cluster: cluster})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+}
 
 func TestClusterReconciler_ReconcileDeploymentZones(t *testing.T) {
 	server := "vcenter123.foo.com"

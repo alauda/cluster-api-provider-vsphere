@@ -39,6 +39,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	clusterutilv1 "sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
@@ -348,17 +349,18 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 
 	clusterCtx.VSphereCluster.Status.Ready = true
 
-	if err := r.reconcileKubeOvnAppRelease(ctx, clusterCtx); err != nil {
-		return reconcile.Result{}, err
+	result, err := r.reconcileKubeOvnAppRelease(ctx, clusterCtx)
+	if err != nil || !result.IsZero() {
+		return result, err
 	}
 
 	return reconcile.Result{}, nil
 }
 
-func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clusterCtx *capvcontext.ClusterContext) error {
+func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {
 	cluster := clusterCtx.Cluster
 	if cluster == nil || cluster.Annotations["cpaas.io/network-type"] != "kube-ovn" {
-		return nil
+		return reconcile.Result{}, nil
 	}
 	var err error
 
@@ -366,7 +368,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	joinCIDR := cluster.Annotations["cpaas.io/kube-ovn-join-cidr"]
 	registry := cluster.Annotations["cpaas.io/registry-address"]
 	if registry == "" {
-		return fmt.Errorf("cpaas.io/registry-address annotation is required to deploy kube-ovn")
+		return reconcile.Result{}, fmt.Errorf("cpaas.io/registry-address annotation is required to deploy kube-ovn")
 	}
 
 	if targetVersion == "" {
@@ -374,58 +376,121 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		modulePlugin.SetAPIVersion(modulePluginGVK.GroupVersion().String())
 		modulePlugin.SetKind(modulePluginGVK.Kind)
 		if err := r.Client.Get(ctx, client.ObjectKey{Name: "kube-ovn"}, modulePlugin); err != nil {
-			return pkgerrors.Wrap(err, "failed to get kube-ovn ModulePlugin")
+			return reconcile.Result{}, pkgerrors.Wrap(err, "failed to get kube-ovn ModulePlugin")
 		}
 		var found bool
 		targetVersion, found, err = unstructured.NestedString(modulePlugin.Object, "status", "latestVersion")
 		if err != nil {
-			return pkgerrors.Wrap(err, "failed to read kube-ovn ModulePlugin status.latestVersion")
+			return reconcile.Result{}, pkgerrors.Wrap(err, "failed to read kube-ovn ModulePlugin status.latestVersion")
 		}
 		if !found || targetVersion == "" {
-			return fmt.Errorf("kube-ovn module plugin latestVersion is empty")
+			return reconcile.Result{}, fmt.Errorf("kube-ovn module plugin latestVersion is empty")
 		}
 	}
 
 	podCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, true)
 	serviceCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, false)
 	if podCIDR == "" || serviceCIDR == "" {
-		return fmt.Errorf("cluster network pod/service CIDR must be set before deploying kube-ovn")
+		return reconcile.Result{}, fmt.Errorf("cluster network pod/service CIDR must be set before deploying kube-ovn")
+	}
+
+	ready, err := r.controlPlaneReplicasAvailableForKubeOvnReconcile(ctx, cluster)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if !ready {
+		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	clientset, restConfig, err := r.newRemoteClients(ctx, cluster)
 	if err != nil {
-		return err
+		return reconcile.Result{}, err
 	}
 
-	imagePullSecrets, err := sentryImagePullSecrets(ctx, clientset)
+	chartPullSecret, imagePullSecrets, err := sentryPullSecrets(ctx, clientset)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return err
+		return reconcile.Result{}, err
 	}
 
-	appRelease := buildKubeOvnAppRelease(cluster, registry, targetVersion, podCIDR, serviceCIDR, joinCIDR, imagePullSecrets)
+	appRelease := buildKubeOvnAppRelease(cluster, registry, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets)
 	dc, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
-		return pkgerrors.Wrap(err, "failed to create dynamic client for workload cluster")
+		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to create dynamic client for workload cluster")
 	}
 
 	current, err := dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Get(ctx, appRelease.GetName(), metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		_, err = dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Create(ctx, appRelease, metav1.CreateOptions{})
-		return err
+		return reconcile.Result{}, err
 	}
 	if err != nil {
-		return pkgerrors.Wrap(err, "failed to get existing kube-ovn AppRelease")
+		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to get existing kube-ovn AppRelease")
 	}
 
 	if !reflect.DeepEqual(current.Object["spec"], appRelease.Object["spec"]) {
 		current.Object["spec"] = appRelease.Object["spec"]
 		_, err = dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Update(ctx, current, metav1.UpdateOptions{})
 		if err != nil {
-			return pkgerrors.Wrap(err, "failed to update kube-ovn AppRelease")
+			return reconcile.Result{}, pkgerrors.Wrap(err, "failed to update kube-ovn AppRelease")
 		}
 	}
 
-	return nil
+	return reconcile.Result{}, nil
+}
+
+func (r *clusterReconciler) controlPlaneReplicasAvailableForKubeOvnReconcile(ctx context.Context, cluster *clusterv1.Cluster) (bool, error) {
+	log := ctrl.LoggerFrom(ctx)
+	kcp, err := r.kubeadmControlPlaneForCluster(ctx, cluster)
+	if err != nil {
+		return false, err
+	}
+	if kcp == nil {
+		log.Info("Skipping kube-ovn AppRelease reconcile until KubeadmControlPlane is available")
+		return false, nil
+	}
+	if !kcp.DeletionTimestamp.IsZero() {
+		log.Info("Skipping kube-ovn AppRelease reconcile while KubeadmControlPlane is deleting", "KubeadmControlPlane", klog.KObj(kcp))
+		return false, nil
+	}
+
+	desiredReplicas := int32(1)
+	if kcp.Spec.Replicas != nil {
+		desiredReplicas = *kcp.Spec.Replicas
+	}
+	if kcp.Status.Replicas != desiredReplicas {
+		log.Info("Skipping kube-ovn AppRelease reconcile until control plane replica count matches KubeadmControlPlane", "controlPlaneReplicas", kcp.Status.Replicas, "desiredControlPlaneReplicas", desiredReplicas)
+		return false, nil
+	}
+	return true, nil
+}
+
+func (r *clusterReconciler) kubeadmControlPlaneForCluster(ctx context.Context, cluster *clusterv1.Cluster) (*controlplanev1.KubeadmControlPlane, error) {
+	if cluster.Spec.ControlPlaneRef != nil {
+		if cluster.Spec.ControlPlaneRef.Kind != "KubeadmControlPlane" || cluster.Spec.ControlPlaneRef.APIVersion != controlplanev1.GroupVersion.String() {
+			return nil, nil
+		}
+		namespace := cluster.Spec.ControlPlaneRef.Namespace
+		if namespace == "" {
+			namespace = cluster.Namespace
+		}
+		kcp := &controlplanev1.KubeadmControlPlane{}
+		if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: cluster.Spec.ControlPlaneRef.Name}, kcp); err != nil {
+			return nil, pkgerrors.Wrap(err, "failed to get KubeadmControlPlane")
+		}
+		return kcp, nil
+	}
+
+	kcpList := &controlplanev1.KubeadmControlPlaneList{}
+	if err := r.Client.List(ctx, kcpList, client.InNamespace(cluster.Namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: cluster.Name}); err != nil {
+		return nil, pkgerrors.Wrap(err, "failed to list KubeadmControlPlane objects")
+	}
+	if len(kcpList.Items) == 0 {
+		return nil, nil
+	}
+	if len(kcpList.Items) > 1 {
+		return nil, fmt.Errorf("multiple KubeadmControlPlane objects found, expected 1, found %d", len(kcpList.Items))
+	}
+	return &kcpList.Items[0], nil
 }
 
 func (r *clusterReconciler) newRemoteClients(ctx context.Context, cluster *clusterv1.Cluster) (kubernetes.Interface, *rest.Config, error) {
@@ -462,19 +527,19 @@ func firstCIDRBlock(network *clusterv1.ClusterNetwork, pod bool) string {
 	return ""
 }
 
-func sentryImagePullSecrets(ctx context.Context, clientset kubernetes.Interface) ([]interface{}, error) {
+func sentryPullSecrets(ctx context.Context, clientset kubernetes.Interface) (string, []interface{}, error) {
 	sa, err := clientset.CoreV1().ServiceAccounts("cpaas-system").Get(ctx, "sentry", metav1.GetOptions{})
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if len(sa.ImagePullSecrets) == 0 {
-		return nil, nil
+		return "", nil, nil
 	}
 	secrets := make([]interface{}, 0, len(sa.ImagePullSecrets))
 	for _, s := range sa.ImagePullSecrets {
 		secrets = append(secrets, s.Name)
 	}
-	return secrets, nil
+	return sa.ImagePullSecrets[0].Name, secrets, nil
 }
 
 func buildKubeOvnAppRelease(
@@ -484,6 +549,7 @@ func buildKubeOvnAppRelease(
 	podCIDR string,
 	serviceCIDR string,
 	joinCIDR string,
+	chartPullSecret string,
 	imagePullSecrets []interface{},
 ) *unstructured.Unstructured {
 	host := cluster.Spec.ControlPlaneEndpoint.Host
@@ -574,6 +640,9 @@ func buildKubeOvnAppRelease(
 				},
 			},
 		},
+	}
+	if chartPullSecret != "" {
+		_ = unstructured.SetNestedField(appRelease.Object, chartPullSecret, "spec", "source", "chartPullSecret")
 	}
 	if len(imagePullSecrets) > 0 {
 		_ = unstructured.SetNestedSlice(appRelease.Object, imagePullSecrets, "spec", "values", "global", "registry", "imagePullSecrets")
