@@ -17,9 +17,13 @@ limitations under the License.
 package ovn
 
 import (
+	"context"
 	"testing"
 
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 const nbStatus = `88e1
@@ -113,6 +117,47 @@ func TestFindMatchingRaftMemberIP(t *testing.T) {
 			g.Expect(got).To(Equal(tt.want))
 		})
 	}
+}
+
+func TestSelectPodsExcludesCandidateHostIPs(t *testing.T) {
+	g := NewWithT(t)
+	clientset := fake.NewSimpleClientset(
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ovn-central-deleting-node",
+				Namespace: CentralNamespace,
+				Labels:    map[string]string{"app": "ovn-central"},
+			},
+			Status: corev1.PodStatus{
+				Phase:  corev1.PodRunning,
+				HostIP: "192.168.137.39",
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:  "ovn-central",
+					Ready: true,
+				}},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ovn-central-healthy-node",
+				Namespace: CentralNamespace,
+				Labels:    map[string]string{"app": "ovn-central"},
+			},
+			Status: corev1.PodStatus{
+				Phase:  corev1.PodRunning,
+				HostIP: "192.168.142.106",
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:  "ovn-central",
+					Ready: true,
+				}},
+			},
+		},
+	)
+
+	targets, err := selectPods(context.Background(), clientset, CentralNamespace, CentralSelector, []string{"192.168.137.39"})
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(targets).To(Equal([]podExecTarget{{podName: "ovn-central-healthy-node", containerName: "ovn-central"}}))
 }
 
 func TestServerIDForMemberIP(t *testing.T) {

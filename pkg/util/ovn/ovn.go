@@ -22,6 +22,7 @@ package ovn
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -106,12 +107,17 @@ func execInPod(ctx context.Context, conf *rest.Config, ns, pod, container string
 	return stderr.String(), nil
 }
 
-// selectPod returns a running, ready pod matching selector in ns whose HostIP
+type podExecTarget struct {
+	podName       string
+	containerName string
+}
+
+// selectPods returns running, ready pods matching selector in ns whose HostIP
 // is not in excludeHostIPs. It returns an error when no such pod exists.
-func selectPod(ctx context.Context, clientset kubernetes.Interface, ns, selector string, excludeHostIPs []string) (podName, containerName string, err error) {
+func selectPods(ctx context.Context, clientset kubernetes.Interface, ns, selector string, excludeHostIPs []string) ([]podExecTarget, error) {
 	pods, err := clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 
 	excluded := make(map[string]struct{}, len(excludeHostIPs))
@@ -119,6 +125,7 @@ func selectPod(ctx context.Context, clientset kubernetes.Interface, ns, selector
 		excluded[ip] = struct{}{}
 	}
 
+	targets := make([]podExecTarget, 0, len(pods.Items))
 	for _, pod := range pods.Items {
 		if _, skip := excluded[pod.Status.HostIP]; skip {
 			continue
@@ -128,11 +135,15 @@ func selectPod(ctx context.Context, clientset kubernetes.Interface, ns, selector
 		}
 		for _, c := range pod.Status.ContainerStatuses {
 			if c.Ready {
-				return pod.Name, c.Name, nil
+				targets = append(targets, podExecTarget{podName: pod.Name, containerName: c.Name})
+				break
 			}
 		}
 	}
-	return "", "", fmt.Errorf("cannot find running pod with selector %q in namespace %q", selector, ns)
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("cannot find running pod with selector %q in namespace %q", selector, ns)
+	}
+	return targets, nil
 }
 
 func isKubeOvnAppReleaseDeployed(ctx context.Context, config *rest.Config) (bool, error) {
@@ -288,10 +299,22 @@ func clusterStatus(ctx context.Context, config *rest.Config, ns, podName, contai
 	return execInPod(ctx, config, ns, podName, containerName, "ovs-appctl", "-t", db.ctlPath, "cluster/status", db.dbName)
 }
 
-func kickRaftMemberFromPod(ctx context.Context, config *rest.Config, ns, podName, containerName, memberIP string) ([]string, error) {
+func clusterStatusFromAnyPod(ctx context.Context, config *rest.Config, ns string, targets []podExecTarget, db raftDB) (string, error) {
+	var errs []error
+	for _, target := range targets {
+		status, err := clusterStatus(ctx, config, ns, target.podName, target.containerName, db)
+		if err == nil {
+			return status, nil
+		}
+		errs = append(errs, fmt.Errorf("pod %s/%s: %w", ns, target.podName, err))
+	}
+	return "", errors.Join(errs...)
+}
+
+func kickRaftMemberFromPod(ctx context.Context, config *rest.Config, ns string, target podExecTarget, memberIP string) ([]string, error) {
 	kickedDBs := make([]string, 0, len(raftDBs))
 	for _, db := range raftDBs {
-		status, err := clusterStatus(ctx, config, ns, podName, containerName, db)
+		status, err := clusterStatus(ctx, config, ns, target.podName, target.containerName, db)
 		if err != nil {
 			return kickedDBs, fmt.Errorf("failed to query %s server id for %s: %w", db.dbName, memberIP, err)
 		}
@@ -302,12 +325,24 @@ func kickRaftMemberFromPod(ctx context.Context, config *rest.Config, ns, podName
 		if serverID == "" {
 			continue
 		}
-		if _, err := execInPod(ctx, config, ns, podName, containerName, "ovs-appctl", "-t", db.ctlPath, "cluster/kick", db.dbName, serverID); err != nil {
+		if _, err := execInPod(ctx, config, ns, target.podName, target.containerName, "ovs-appctl", "-t", db.ctlPath, "cluster/kick", db.dbName, serverID); err != nil {
 			return kickedDBs, fmt.Errorf("failed to kick %s server %s for %s: %w", db.dbName, serverID, memberIP, err)
 		}
 		kickedDBs = append(kickedDBs, db.dbName)
 	}
 	return kickedDBs, nil
+}
+
+func kickRaftMemberFromAnyPod(ctx context.Context, config *rest.Config, ns string, targets []podExecTarget, memberIP string) ([]string, error) {
+	var errs []error
+	for _, target := range targets {
+		kickedDBs, err := kickRaftMemberFromPod(ctx, config, ns, target, memberIP)
+		if err == nil {
+			return kickedDBs, nil
+		}
+		errs = append(errs, fmt.Errorf("pod %s/%s: %w", ns, target.podName, err))
+	}
+	return nil, errors.Join(errs...)
 }
 
 // KickRaftMemberFromCandidates resolves the single Machine-reported IP that is
@@ -324,14 +359,14 @@ func KickRaftMemberFromCandidates(ctx context.Context, clientset kubernetes.Inte
 		return "", nil, nil
 	}
 
-	statusPodName, statusContainerName, err := selectPod(ctx, clientset, ns, CentralSelector, nil)
+	statusTargets, err := selectPods(ctx, clientset, ns, CentralSelector, candidates)
 	if err != nil {
 		return "", nil, err
 	}
 
 	statuses := make([]string, 0, len(raftDBs))
 	for _, db := range raftDBs {
-		status, err := clusterStatus(ctx, config, ns, statusPodName, statusContainerName, db)
+		status, err := clusterStatusFromAnyPod(ctx, config, ns, statusTargets, db)
 		if err != nil {
 			return "", nil, fmt.Errorf("failed to query %s raft status: %w", db.dbName, err)
 		}
@@ -343,11 +378,11 @@ func KickRaftMemberFromCandidates(ctx context.Context, clientset kubernetes.Inte
 		return memberIP, nil, err
 	}
 
-	podName, containerName, err := selectPod(ctx, clientset, ns, CentralSelector, []string{memberIP})
+	kickTargets, err := selectPods(ctx, clientset, ns, CentralSelector, []string{memberIP})
 	if err != nil {
 		return memberIP, nil, err
 	}
-	kickedDBs, err := kickRaftMemberFromPod(ctx, config, ns, podName, containerName, memberIP)
+	kickedDBs, err := kickRaftMemberFromAnyPod(ctx, config, ns, kickTargets, memberIP)
 	if err != nil {
 		return memberIP, kickedDBs, err
 	}
@@ -364,11 +399,11 @@ func KickRaftMember(ctx context.Context, clientset kubernetes.Interface, config 
 	}
 	memberIP = memberIPs[0]
 
-	podName, containerName, err := selectPod(ctx, clientset, ns, CentralSelector, []string{memberIP})
+	targets, err := selectPods(ctx, clientset, ns, CentralSelector, []string{memberIP})
 	if err != nil {
 		return err
 	}
 
-	_, err = kickRaftMemberFromPod(ctx, config, ns, podName, containerName, memberIP)
+	_, err = kickRaftMemberFromAnyPod(ctx, config, ns, targets, memberIP)
 	return err
 }
