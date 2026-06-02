@@ -42,6 +42,14 @@ type VSphereMachineService interface {
 	GetHostInfo(ctx context.Context, machineCtx capvcontext.MachineContext) (string, error)
 }
 
+// PersistentDiskAttachment describes a vCenter VM attachment for a persistent disk backing.
+type PersistentDiskAttachment struct {
+	VolumePath string
+	VMName     string
+	VMRef      string
+	DiskKey    int32
+}
+
 // VirtualMachineService is a service for creating/updating/deleting virtual
 // machines on vSphere.
 type VirtualMachineService interface {
@@ -50,6 +58,9 @@ type VirtualMachineService interface {
 
 	// DestroyVM powers off and removes a VM from the inventory.
 	DestroyVM(ctx context.Context, vmCtx *capvcontext.VMContext) (reconcile.Result, infrav1.VirtualMachine, error)
+
+	// FindAttachedPersistentDisks returns persistent disk backings still attached to vCenter VMs in the resolved slot datacenter.
+	FindAttachedPersistentDisks(ctx context.Context, vmCtx *capvcontext.VMContext, datacenter string, disks []infrav1.PersistentDisk) ([]PersistentDiskAttachment, error)
 }
 
 // ControlPlaneEndpointService is a service for reconciling load balanced control plane endpoints.

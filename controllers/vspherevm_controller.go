@@ -455,31 +455,10 @@ func (r vmReconciler) reconcileDelete(ctx context.Context, vmCtx *capvcontext.VM
 	}
 
 	// AFTER PHYSICAL DELETION IS CONFIRMED: Release the machine config pool slot.
-	// The owner VSphereMachine may already be gone, so fall back to the owner ref and
-	// locate the pool by status assignment when necessary.
-	machineRef, err := util.GetOwnerVSphereMachineRef(vmCtx.VSphereVM.ObjectMeta)
-	if err != nil {
-		return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine owner reference for VSphereVM")
-	}
-	if machineRef != nil {
-		var poolRef *corev1.ObjectReference
-
-		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
-		if err != nil && !apierrors.IsNotFound(err) {
-			return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine for VSphereVM")
-		}
-		if machine != nil {
-			poolRef = machine.Spec.MachineConfigPoolRef
-		}
-		if poolRef == nil {
-			poolRef, err = services.FindMachineConfigPoolForMachine(ctx, r.Client, vmCtx.VSphereVM.Namespace, machineRef)
-			if err != nil {
-				return reconcile.Result{}, errors.Wrapf(err, "failed to find machine config pool for VSphereVM")
-			}
-		}
-		if err := services.ReleaseSlot(ctx, r.Client, poolRef, machineRef); err != nil {
-			return reconcile.Result{}, errors.Wrapf(err, "failed to release slot for VM")
-		}
+	// Before releasing, make sure persistent disks from the slot are not still attached
+	// to any visible vCenter VM. This prevents a replacement VM from reusing locked VMDKs.
+	if result, err := r.releaseMachineConfigPoolSlot(ctx, vmCtx); err != nil || !result.IsZero() {
+		return result, err
 	}
 
 	// Attempt to delete the node corresponding to the vsphere VM
@@ -498,6 +477,79 @@ func (r vmReconciler) reconcileDelete(ctx context.Context, vmCtx *capvcontext.VM
 	}
 
 	return reconcile.Result{}, nil
+}
+
+func (r vmReconciler) releaseMachineConfigPoolSlot(ctx context.Context, vmCtx *capvcontext.VMContext) (reconcile.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	machineRef, err := util.GetOwnerVSphereMachineRef(vmCtx.VSphereVM.ObjectMeta)
+	if err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine owner reference for VSphereVM")
+	}
+	if machineRef == nil {
+		return reconcile.Result{}, nil
+	}
+
+	var poolRef *corev1.ObjectReference
+	machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine for VSphereVM")
+	}
+	if machine != nil {
+		poolRef = machine.Spec.MachineConfigPoolRef
+	}
+	if poolRef == nil {
+		poolRef, err = services.FindMachineConfigPoolForMachine(ctx, r.Client, vmCtx.VSphereVM.Namespace, machineRef)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to find machine config pool for VSphereVM")
+		}
+	}
+	if poolRef != nil && poolRef.Namespace == "" {
+		poolRef.Namespace = vmCtx.VSphereVM.Namespace
+	}
+
+	var pool *infrav1.VSphereMachineConfigPool
+	if poolRef != nil {
+		pool = &infrav1.VSphereMachineConfigPool{}
+		if err := r.Client.Get(ctx, ctrlclient.ObjectKey{Namespace: poolRef.Namespace, Name: poolRef.Name}, pool); err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to get machine config pool for VSphereVM")
+		}
+	}
+
+	slot := vmCtx.MachineConfigSlot
+	if slot == nil && poolRef != nil {
+		slot, err = services.GetSlotForMachine(ctx, r.Client, poolRef, machineRef)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to get machine config pool slot for VSphereVM")
+		}
+	}
+	if slot != nil && len(slot.PersistentDisks) > 0 {
+		datacenter := services.ResolveMachineConfigPoolDatacenter(pool, slot)
+		attachments, err := r.VMService.FindAttachedPersistentDisks(ctx, vmCtx, datacenter, slot.PersistentDisks)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrap(err, "failed to check persistent disk attachments before releasing slot")
+		}
+		if len(attachments) > 0 {
+			log.Info("Waiting to release machine config pool slot because persistent disks are still attached", "attachments", formatPersistentDiskAttachments(attachments))
+			if r.Recorder != nil {
+				r.Recorder.Eventf(vmCtx.VSphereVM, corev1.EventTypeWarning, "PersistentDiskStillAttached", "Waiting to release machine config pool slot because persistent disks are still attached: %v", formatPersistentDiskAttachments(attachments))
+			}
+			return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	}
+
+	if err := services.ReleaseSlot(ctx, r.Client, poolRef, machineRef); err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to release slot for VM")
+	}
+	return reconcile.Result{}, nil
+}
+
+func formatPersistentDiskAttachments(attachments []services.PersistentDiskAttachment) []string {
+	formatted := make([]string, 0, len(attachments))
+	for i := range attachments {
+		formatted = append(formatted, fmt.Sprintf("%s attached to %s (%s) diskKey=%d", attachments[i].VolumePath, attachments[i].VMName, attachments[i].VMRef, attachments[i].DiskKey))
+	}
+	return formatted
 }
 
 // deleteNode attempts to find and best effort delete the node corresponding to the VM

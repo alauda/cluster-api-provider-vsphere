@@ -45,6 +45,7 @@ import (
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
 )
@@ -417,6 +418,26 @@ func (r machineConfigPoolReconciler) reclaimPhysicalResources(ctx context.Contex
 	for i := range slot.PersistentDisks {
 		pd := &slot.PersistentDisks[i]
 		if pd.VolumePath != "" {
+			attachments, err := govmomi.FindAttachedPersistentDisks(ctx, s, slotDatacenter, []infrav1.PersistentDisk{*pd})
+			if err != nil {
+				return false, 0, errors.Wrapf(err, "failed to check persistent disk attachments before reclaiming %s", pd.VolumePath)
+			}
+			if len(attachments) > 0 {
+				attachmentText := formatPersistentDiskAttachments(attachments)
+				log.Info("Waiting to reclaim persistent disk backing because it is still attached", "hostname", slot.Hostname, "disk", pd.Name, "path", pd.VolumePath, "attachments", attachmentText)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(pool, corev1.EventTypeWarning, "PersistentDiskStillAttached", "Waiting to reclaim persistent disk backing %s because it is still attached: %v", pd.VolumePath, attachmentText)
+				}
+				retryAfter := metav1.NewTime(time.Now().Add(30 * time.Second))
+				status.ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{
+					State:      infrav1.MachineConfigSlotReclaimStateFailed,
+					RetryAfter: &retryAfter,
+					LastError:  errors.Errorf("persistent disk is still attached: %v", attachmentText).Error(),
+					VolumePath: pd.VolumePath,
+				}
+				return false, time.Until(retryAfter.Time), nil
+			}
+
 			log.Info("Deleting persistent disk backing for released slot",
 				"hostname", slot.Hostname,
 				"disk", pd.Name,

@@ -25,6 +25,7 @@ import (
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 )
 
 type VMService struct {
@@ -39,4 +40,9 @@ func (v *VMService) ReconcileVM(_ context.Context, vmCtx *capvcontext.VMContext)
 func (v *VMService) DestroyVM(_ context.Context, vmCtx *capvcontext.VMContext) (reconcile.Result, infrav1.VirtualMachine, error) {
 	args := v.Called(vmCtx)
 	return args.Get(0).(reconcile.Result), args.Get(1).(infrav1.VirtualMachine), args.Error(2)
+}
+
+func (v *VMService) FindAttachedPersistentDisks(_ context.Context, vmCtx *capvcontext.VMContext, datacenter string, disks []infrav1.PersistentDisk) ([]services.PersistentDiskAttachment, error) {
+	args := v.Called(vmCtx, datacenter, disks)
+	return args.Get(0).([]services.PersistentDiskAttachment), args.Error(1)
 }

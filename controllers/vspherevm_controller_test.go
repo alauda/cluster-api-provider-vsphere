@@ -400,6 +400,213 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 	})
 }
 
+func TestVmReconciler_DeleteBlocksSlotReleaseWithAttachedPersistentDisks(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	model := simulator.VPX()
+	model.Host = 0
+	simr, err := vcsim.NewBuilder().WithModel(model).Build()
+	g.Expect(err).ToNot(HaveOccurred())
+	defer simr.Destroy()
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "valid-cluster", Namespace: "test"},
+		Spec:       clusterv1.ClusterSpec{InfrastructureRef: &corev1.ObjectReference{Name: "valid-vsphere-cluster"}},
+	}
+	vsphereCluster := &infrav1.VSphereCluster{ObjectMeta: metav1.ObjectMeta{Name: "valid-vsphere-cluster", Namespace: "test"}}
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo",
+			Namespace: "test",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: cluster.Name},
+		},
+	}
+	vsphereMachine := &infrav1.VSphereMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo-vm",
+			Namespace: "test",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "Machine",
+				Name:       machine.Name,
+			}},
+		},
+		Spec: infrav1.VSphereMachineSpec{
+			MachineConfigPoolRef: &corev1.ObjectReference{Name: "foo-pool", Namespace: "test"},
+		},
+	}
+	vsphereVM := &infrav1.VSphereVM{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "foo",
+			Namespace:         "test",
+			Finalizers:        []string{infrav1.VMFinalizer},
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			Labels:            map[string]string{clusterv1.ClusterNameLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: infrav1.GroupVersion.String(),
+				Kind:       "VSphereMachine",
+				Name:       vsphereMachine.Name,
+			}},
+		},
+		Spec: infrav1.VSphereVMSpec{VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{Server: simr.ServerURL().Host}},
+	}
+	pd := infrav1.PersistentDisk{Name: "var-lib-etcd", SizeGiB: 20, VolumePath: "[datastore] old-master/var-lib-etcd.vmdk"}
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo-pool", Namespace: "test"},
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: cluster.Name, Namespace: cluster.Namespace},
+			Datacenter: "DC0",
+			Configs: []infrav1.MachineConfigSlot{{
+				Hostname:        "master-01",
+				PersistentDisks: []infrav1.PersistentDisk{pd},
+			}},
+		},
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
+				Hostname: "master-01",
+				State:    infrav1.MachineConfigSlotStateInUse,
+				MachineRef: &corev1.ObjectReference{
+					Kind:      "VSphereMachine",
+					Namespace: vsphereMachine.Namespace,
+					Name:      vsphereMachine.Name,
+					UID:       vsphereMachine.UID,
+				},
+			}},
+		},
+	}
+	machine.Spec.InfrastructureRef = corev1.ObjectReference{APIVersion: infrav1.GroupVersion.String(), Kind: "VSphereMachine", Name: vsphereMachine.Name, Namespace: vsphereMachine.Namespace}
+
+	fakeVMSvc := new(fake_svc.VMService)
+	fakeVMSvc.On("DestroyVM", mock.Anything).Return(reconcile.Result{}, infrav1.VirtualMachine{Name: vsphereVM.Name, State: infrav1.VirtualMachineStateNotFound}, nil)
+	fakeVMSvc.On("FindAttachedPersistentDisks", mock.Anything, "DC0", mock.Anything).Return([]services.PersistentDiskAttachment{{VolumePath: pd.VolumePath, VMName: "orphan-vm", VMRef: "VirtualMachine:vm-1", DiskKey: 2000}}, nil)
+
+	controllerMgrContext := fake.NewControllerManagerContext(append(createMachineOwnerHierarchy(machine), machine, cluster, vsphereCluster, vsphereMachine, vsphereVM, pool)...)
+	password, _ := simr.ServerURL().User.Password()
+	controllerMgrContext.Password = password
+	controllerMgrContext.Username = simr.ServerURL().User.Username()
+	r := vmReconciler{
+		ControllerManagerContext: controllerMgrContext,
+		VMService:                fakeVMSvc,
+		clusterCache:             clustercache.NewFakeClusterCache(controllerMgrContext.Client, client.ObjectKeyFromObject(cluster)),
+	}
+
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+	g.Expect(err).ToNot(HaveOccurred())
+	result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+	updatedVM := &infrav1.VSphereVM{}
+	g.Expect(r.Client.Get(ctx, util.ObjectKey(vsphereVM), updatedVM)).NotTo(HaveOccurred())
+	g.Expect(updatedVM.Finalizers).To(ContainElement(infrav1.VMFinalizer))
+
+	updatedPool := &infrav1.VSphereMachineConfigPool{}
+	g.Expect(r.Client.Get(ctx, util.ObjectKey(pool), updatedPool)).NotTo(HaveOccurred())
+	g.Expect(updatedPool.Status.ConfigStatuses[0].State).To(Equal(infrav1.MachineConfigSlotStateInUse))
+}
+
+func TestVmReconciler_DeleteReleasesSlotWhenPersistentDisksDetached(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	model := simulator.VPX()
+	model.Host = 0
+	simr, err := vcsim.NewBuilder().WithModel(model).Build()
+	g.Expect(err).ToNot(HaveOccurred())
+	defer simr.Destroy()
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "valid-cluster", Namespace: "test"},
+		Spec:       clusterv1.ClusterSpec{InfrastructureRef: &corev1.ObjectReference{Name: "valid-vsphere-cluster"}},
+	}
+	vsphereCluster := &infrav1.VSphereCluster{ObjectMeta: metav1.ObjectMeta{Name: "valid-vsphere-cluster", Namespace: "test"}}
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo",
+			Namespace: "test",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: cluster.Name},
+		},
+	}
+	vsphereMachine := &infrav1.VSphereMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo-vm",
+			Namespace: "test",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "Machine",
+				Name:       machine.Name,
+			}},
+		},
+		Spec: infrav1.VSphereMachineSpec{
+			MachineConfigPoolRef: &corev1.ObjectReference{Name: "foo-pool", Namespace: "test"},
+		},
+	}
+	vsphereVM := &infrav1.VSphereVM{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "foo",
+			Namespace:         "test",
+			Finalizers:        []string{infrav1.VMFinalizer},
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			Labels:            map[string]string{clusterv1.ClusterNameLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: infrav1.GroupVersion.String(),
+				Kind:       "VSphereMachine",
+				Name:       vsphereMachine.Name,
+			}},
+		},
+		Spec: infrav1.VSphereVMSpec{VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{Server: simr.ServerURL().Host}},
+	}
+	pd := infrav1.PersistentDisk{Name: "var-lib-etcd", SizeGiB: 20, VolumePath: "[datastore] old-master/var-lib-etcd.vmdk"}
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo-pool", Namespace: "test"},
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: cluster.Name, Namespace: cluster.Namespace},
+			Datacenter: "DC0",
+			Configs: []infrav1.MachineConfigSlot{{
+				Hostname:        "master-01",
+				PersistentDisks: []infrav1.PersistentDisk{pd},
+			}},
+		},
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
+				Hostname: "master-01",
+				State:    infrav1.MachineConfigSlotStateInUse,
+				MachineRef: &corev1.ObjectReference{
+					Kind:      "VSphereMachine",
+					Namespace: vsphereMachine.Namespace,
+					Name:      vsphereMachine.Name,
+					UID:       vsphereMachine.UID,
+				},
+			}},
+		},
+	}
+	machine.Spec.InfrastructureRef = corev1.ObjectReference{APIVersion: infrav1.GroupVersion.String(), Kind: "VSphereMachine", Name: vsphereMachine.Name, Namespace: vsphereMachine.Namespace}
+
+	fakeVMSvc := new(fake_svc.VMService)
+	fakeVMSvc.On("DestroyVM", mock.Anything).Return(reconcile.Result{}, infrav1.VirtualMachine{Name: vsphereVM.Name, State: infrav1.VirtualMachineStateNotFound}, nil)
+	fakeVMSvc.On("FindAttachedPersistentDisks", mock.Anything, "DC0", mock.Anything).Return([]services.PersistentDiskAttachment{}, nil)
+
+	controllerMgrContext := fake.NewControllerManagerContext(append(createMachineOwnerHierarchy(machine), machine, cluster, vsphereCluster, vsphereMachine, vsphereVM, pool)...)
+	password, _ := simr.ServerURL().User.Password()
+	controllerMgrContext.Password = password
+	controllerMgrContext.Username = simr.ServerURL().User.Username()
+	r := vmReconciler{
+		ControllerManagerContext: controllerMgrContext,
+		VMService:                fakeVMSvc,
+		clusterCache:             clustercache.NewFakeClusterCache(controllerMgrContext.Client, client.ObjectKeyFromObject(cluster)),
+	}
+
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+	g.Expect(err).ToNot(HaveOccurred())
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	updatedPool := &infrav1.VSphereMachineConfigPool{}
+	g.Expect(r.Client.Get(ctx, util.ObjectKey(pool), updatedPool)).NotTo(HaveOccurred())
+	g.Expect(updatedPool.Status.ConfigStatuses[0].State).To(Equal(infrav1.MachineConfigSlotStateReleased))
+}
+
 func TestVmReconciler_WaitingForStaticIPAllocation(t *testing.T) {
 	tests := []struct {
 		name       string
