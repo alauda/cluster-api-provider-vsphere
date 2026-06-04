@@ -82,7 +82,13 @@ func AddVSphereDeploymentZoneControllerToManager(ctx context.Context, controller
 			),
 		).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
-		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheredeploymentzone", reconciler))
+		Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"vspheredeploymentzone",
+			func() client.Object { return &infrav1.VSphereDeploymentZone{} },
+			standby.ClusterNameFromLabel,
+			reconciler,
+		))
 }
 
 type vsphereDeploymentZoneReconciler struct {

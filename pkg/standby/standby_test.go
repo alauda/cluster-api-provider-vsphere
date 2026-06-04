@@ -24,7 +24,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -129,7 +131,7 @@ func TestWrapReconciler(t *testing.T) {
 			name:       "standby skips inner reconciler",
 			detector:   stubDetector{isStandby: true},
 			wantCalled: false,
-			wantResult: reconcile.Result{},
+			wantResult: reconcile.Result{RequeueAfter: RequeueAfter},
 		},
 		{
 			name:        "active calls inner reconciler",
@@ -163,6 +165,82 @@ func TestWrapReconciler(t *testing.T) {
 			})
 
 			got, err := wrapped.Reconcile(context.Background(), reconcile.Request{})
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Reconcile() error = %v, want %v", err, tt.wantErr)
+			}
+			if called != tt.wantCalled {
+				t.Fatalf("inner called = %v, want %v", called, tt.wantCalled)
+			}
+			if got != tt.wantResult {
+				t.Fatalf("Reconcile() result = %v, want %v", got, tt.wantResult)
+			}
+		})
+	}
+}
+
+func TestWrapClusterNamedReconciler(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	globalObject := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: metav1.NamespaceDefault,
+			Name:      "global",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: GlobalClusterName},
+		},
+	}
+	businessObject := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: metav1.NamespaceDefault,
+			Name:      "business",
+			Labels:    map[string]string{clusterv1.ClusterNameLabel: "business"},
+		},
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(globalObject, businessObject).Build()
+
+	tests := []struct {
+		name       string
+		detector   Detector
+		request    reconcile.Request
+		wantCalled bool
+		wantResult reconcile.Result
+		wantErr    error
+	}{
+		{
+			name:       "standby allows global cluster object",
+			detector:   stubDetector{isStandby: true},
+			request:    reconcile.Request{NamespacedName: types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "global"}},
+			wantCalled: true,
+		},
+		{
+			name:       "standby skips business cluster object",
+			detector:   stubDetector{isStandby: true},
+			request:    reconcile.Request{NamespacedName: types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "business"}},
+			wantCalled: false,
+			wantResult: reconcile.Result{RequeueAfter: RequeueAfter},
+		},
+		{
+			name:       "active calls inner reconciler",
+			detector:   stubDetector{},
+			request:    reconcile.Request{NamespacedName: types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "business"}},
+			wantCalled: true,
+		},
+		{
+			name:       "standby lets not found object reach inner reconciler",
+			detector:   stubDetector{isStandby: true},
+			request:    reconcile.Request{NamespacedName: types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "missing"}},
+			wantCalled: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			wrapped := WrapClusterNamedReconciler(tt.detector, reader, "test", func() client.Object { return &corev1.ConfigMap{} }, ClusterNameFromLabel, stubReconciler{called: &called})
+
+			got, err := wrapped.Reconcile(context.Background(), tt.request)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("Reconcile() error = %v, want %v", err, tt.wantErr)
 			}

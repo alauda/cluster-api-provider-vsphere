@@ -95,7 +95,13 @@ func AddClusterControllerToManager(ctx context.Context, controllerManagerCtx *ca
 			)
 		}
 
-		return builder.Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspherecluster", reconciler))
+		return builder.Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"vspherecluster",
+			func() client.Object { return &vmwarev1.VSphereCluster{} },
+			standby.ClusterNameFromLabel,
+			reconciler,
+		))
 	}
 
 	reconciler := &clusterReconciler{
@@ -167,7 +173,13 @@ func AddClusterControllerToManager(ctx context.Context, controllerManagerCtx *ca
 		).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
 		WithEventFilter(predicates.ResourceIsNotExternallyManaged(mgr.GetScheme(), predicateLog)).
-		Build(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspherecluster", reconciler))
+		Build(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"vspherecluster",
+			func() client.Object { return &infrav1.VSphereCluster{} },
+			standby.ClusterNameFromLabel,
+			reconciler,
+		))
 	if err != nil {
 		return err
 	}

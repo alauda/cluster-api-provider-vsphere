@@ -144,7 +144,13 @@ func AddMachineControllerToManager(ctx context.Context, controllerManagerContext
 			WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerContext.WatchFilterValue)).
 			// Watch any VirtualMachine resources owned by this VSphereMachine
 			Owns(&vmoprv1.VirtualMachine{}).
-			Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheremachine", r))
+			Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+				mgr.GetAPIReader(),
+				"vspheremachine",
+				func() client.Object { return &vmwarev1.VSphereMachine{} },
+				standby.ClusterNameFromLabel,
+				r,
+			))
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -186,7 +192,13 @@ func AddMachineControllerToManager(ctx context.Context, controllerManagerContext
 			ctrlbldr.WithPredicates(
 				predicates.ClusterPausedTransitionsOrInfrastructureReady(mgr.GetScheme(), predicateLog),
 			),
-		).Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheremachine", r))
+		).Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+		mgr.GetAPIReader(),
+		"vspheremachine",
+		func() client.Object { return &infrav1.VSphereMachine{} },
+		standby.ClusterNameFromLabel,
+		r,
+	))
 }
 
 type machineReconciler struct {

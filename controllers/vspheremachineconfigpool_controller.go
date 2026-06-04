@@ -76,7 +76,21 @@ func AddVSphereMachineConfigPoolControllerToManager(ctx context.Context, control
 		Watches(&infrav1.VSphereCluster{}, handler.EnqueueRequestsFromMapFunc(reconciler.vsphereClusterToMachineConfigPools)).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
-		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheremachineconfigpool", reconciler))
+		Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"vspheremachineconfigpool",
+			func() client.Object { return &infrav1.VSphereMachineConfigPool{} },
+			clusterNameFromMachineConfigPool,
+			reconciler,
+		))
+}
+
+func clusterNameFromMachineConfigPool(obj client.Object) string {
+	pool := obj.(*infrav1.VSphereMachineConfigPool)
+	if pool.Spec.ClusterRef.Name != "" {
+		return pool.Spec.ClusterRef.Name
+	}
+	return standby.ClusterNameFromLabel(obj)
 }
 
 // clusterToMachineConfigPools maps a Cluster to the VSphereMachineConfigPools that reference it.

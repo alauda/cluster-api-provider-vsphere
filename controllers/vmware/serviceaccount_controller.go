@@ -100,7 +100,13 @@ func AddServiceAccountProviderControllerToManager(ctx context.Context, controlle
 		).
 		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
 		WatchesRawSource(r.clusterCache.GetClusterSource("providerserviceaccount", clusterToSupervisorVSphereClusterFunc(r.Client))).
-		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "providerserviceaccount", r))
+		Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"providerserviceaccount",
+			func() client.Object { return &vmwarev1.VSphereCluster{} },
+			standby.ClusterNameFromLabel,
+			r,
+		))
 }
 
 // ServiceAccountReconciler reconciles changes to ProviderServiceAccounts.

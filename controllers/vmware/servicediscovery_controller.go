@@ -117,7 +117,13 @@ func AddServiceDiscoveryControllerToManager(ctx context.Context, controllerManag
 		).
 		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
 		WatchesRawSource(r.clusterCache.GetClusterSource("servicediscovery/vspherecluster", clusterToSupervisorVSphereClusterFunc(r.Client))).
-		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "servicediscovery/vspherecluster", r))
+		Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"servicediscovery/vspherecluster",
+			func() client.Object { return &vmwarev1.VSphereCluster{} },
+			standby.ClusterNameFromLabel,
+			r,
+		))
 }
 
 func clusterToSupervisorVSphereClusterFunc(ctrlclient client.Client) func(ctx context.Context, obj client.Object) []reconcile.Request {

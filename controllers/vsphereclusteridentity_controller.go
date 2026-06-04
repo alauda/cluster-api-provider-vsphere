@@ -65,7 +65,13 @@ func AddVsphereClusterIdentityControllerToManager(ctx context.Context, controlle
 		For(&infrav1.VSphereClusterIdentity{}).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerCtx.WatchFilterValue)).
-		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vsphereclusteridentity", reconciler))
+		Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"vsphereclusteridentity",
+			func() client.Object { return &infrav1.VSphereClusterIdentity{} },
+			standby.ClusterNameFromLabel,
+			reconciler,
+		))
 }
 
 type clusterIdentityReconciler struct {

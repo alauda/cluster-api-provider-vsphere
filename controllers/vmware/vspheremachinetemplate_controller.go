@@ -58,7 +58,13 @@ func AddVSphereMachineTemplateControllerToManager(ctx context.Context, controlle
 			handler.EnqueueRequestsFromMapFunc(r.enqueueVirtualMachineClassToVSphereMachineTemplateRequests),
 		).
 		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), predicateLog, controllerManagerContext.WatchFilterValue)).
-		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspheremachinetemplate", r))
+		Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"vspheremachinetemplate",
+			func() client.Object { return &vmwarev1.VSphereMachineTemplate{} },
+			standby.ClusterNameFromLabel,
+			r,
+		))
 }
 
 type vSphereMachineTemplateReconciler struct {

@@ -123,7 +123,13 @@ func AddVMControllerToManager(ctx context.Context, controllerManagerCtx *capvcon
 			handler.EnqueueRequestsFromMapFunc(r.ipAddressClaimToVSphereVM),
 		).
 		WatchesRawSource(r.clusterCache.GetClusterSource("vspherevm", r.clusterToVSphereVMs)).
-		Complete(standby.WrapWithConfigMapDetector(mgr.GetAPIReader(), "vspherevm", r))
+		Complete(standby.WrapClusterNamedReconcilerWithConfigMapDetector(
+			mgr.GetAPIReader(),
+			"vspherevm",
+			func() ctrlclient.Object { return &infrav1.VSphereVM{} },
+			standby.ClusterNameFromLabel,
+			r,
+		))
 }
 
 type vmReconciler struct {
