@@ -32,14 +32,13 @@ import (
 )
 
 const (
-	DefaultConfigMapNamespace = "cpaas-system"
-	ConfigMapName             = "etcd-sync"
-	DefaultRequeueAfter       = 30 * time.Second
-	GlobalClusterName         = "global"
+	ConfigMapName       = "etcd-sync"
+	DefaultRequeueAfter = 30 * time.Second
+	GlobalClusterName   = "global"
 )
 
 var (
-	ConfigMapNamespace = DefaultConfigMapNamespace
+	ConfigMapNamespace = "kube-public"
 	RequeueAfter       = DefaultRequeueAfter
 )
 
