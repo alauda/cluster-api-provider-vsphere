@@ -29,10 +29,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	kubernetesfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/kubeconfig"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -482,29 +486,56 @@ var _ = Describe("VIM based VSphere ClusterReconciler", func() {
 	})
 })
 
-func TestClusterReconciler_ControlPlaneReplicasAvailableForKubeOvnReconcile(t *testing.T) {
+func TestClusterReconciler_ControlPlaneNodesAvailableForKubeOvnReconcile(t *testing.T) {
 	tests := []struct {
-		name           string
-		desired        int32
-		statusReplicas int32
-		wantReady      bool
+		name          string
+		desired       int32
+		nodeRefs      int32
+		existingNodes int32
+		deletingNodes map[int32]bool
+		getNodeErr    error
+		wantReady     bool
 	}{
 		{
-			name:           "control plane replica count matches KCP replicas",
-			desired:        3,
-			statusReplicas: 3,
-			wantReady:      true,
+			name:          "all control plane Machines have existing Nodes",
+			desired:       3,
+			nodeRefs:      3,
+			existingNodes: 3,
+			wantReady:     true,
 		},
 		{
-			name:           "control plane replica count is lower than KCP replicas",
-			desired:        3,
-			statusReplicas: 2,
-			wantReady:      false,
+			name:          "some control plane Machines have not registered Nodes",
+			desired:       3,
+			nodeRefs:      2,
+			existingNodes: 2,
+			wantReady:     false,
+		},
+		{
+			name:          "some registered Nodes do not exist",
+			desired:       3,
+			nodeRefs:      3,
+			existingNodes: 2,
+			wantReady:     false,
+		},
+		{
+			name:          "some registered Nodes are deleting",
+			desired:       3,
+			nodeRefs:      3,
+			existingNodes: 3,
+			deletingNodes: map[int32]bool{2: true},
+			wantReady:     false,
+		},
+		{
+			name:          "workload cluster Nodes cannot be queried",
+			desired:       1,
+			nodeRefs:      1,
+			existingNodes: 1,
+			getNodeErr:    fmt.Errorf("workload cluster is not ready"),
+			wantReady:     false,
 		},
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
 			cluster := &clusterv1.Cluster{
@@ -530,15 +561,45 @@ func TestClusterReconciler_ControlPlaneReplicasAvailableForKubeOvnReconcile(t *t
 					Spec: controlplanev1.KubeadmControlPlaneSpec{
 						Replicas: ptr.To(tt.desired),
 					},
-					Status: controlplanev1.KubeadmControlPlaneStatus{
-						Replicas: tt.statusReplicas,
-					},
 				},
+			}
+			workloadObjects := make([]runtime.Object, 0, tt.existingNodes)
+			for i := int32(0); i < tt.desired; i++ {
+				machine := &clusterv1.Machine{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: cluster.Namespace,
+						Name:      fmt.Sprintf("test-control-plane-%d", i),
+						Labels: map[string]string{
+							clusterv1.ClusterNameLabel:         cluster.Name,
+							clusterv1.MachineControlPlaneLabel: "",
+						},
+					},
+				}
+				if i < tt.nodeRefs {
+					machine.Status.NodeRef = &corev1.ObjectReference{Name: machine.Name}
+				}
+				objects = append(objects, machine)
+
+				if i < tt.existingNodes {
+					node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}
+					if tt.deletingNodes[i] {
+						deletionTimestamp := metav1.Now()
+						node.DeletionTimestamp = &deletionTimestamp
+						node.Finalizers = []string{"test.finalizer"}
+					}
+					workloadObjects = append(workloadObjects, node)
+				}
 			}
 
 			controllerManagerContext := fake.NewControllerManagerContext(objects...)
+			workloadClient := kubernetesfake.NewSimpleClientset(workloadObjects...)
+			if tt.getNodeErr != nil {
+				workloadClient.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, tt.getNodeErr
+				})
+			}
 			r := clusterReconciler{Client: controllerManagerContext.Client}
-			ready, err := r.controlPlaneReplicasAvailableForKubeOvnReconcile(ctx, cluster)
+			ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, workloadClient)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(ready).To(Equal(tt.wantReady))
 		})
@@ -562,7 +623,7 @@ func TestBuildKubeOvnAppReleaseSetsPullSecrets(t *testing.T) {
 		"10.96.0.0/12",
 		"100.64.0.0/16",
 		"global-registry-auth",
-		[]interface{}{"global-registry-auth", "extra-registry-auth"},
+		[]any{"global-registry-auth", "extra-registry-auth"},
 	)
 
 	chartPullSecret, found, err := unstructured.NestedString(appRelease.Object, "spec", "source", "chartPullSecret")
@@ -573,10 +634,10 @@ func TestBuildKubeOvnAppReleaseSetsPullSecrets(t *testing.T) {
 	imagePullSecrets, found, err := unstructured.NestedSlice(appRelease.Object, "spec", "values", "global", "registry", "imagePullSecrets")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
-	g.Expect(imagePullSecrets).To(Equal([]interface{}{"global-registry-auth", "extra-registry-auth"}))
+	g.Expect(imagePullSecrets).To(Equal([]any{"global-registry-auth", "extra-registry-auth"}))
 }
 
-func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneReplicasMatch(t *testing.T) {
+func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneNodesRegister(t *testing.T) {
 	g := NewWithT(t)
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -604,18 +665,36 @@ func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneRe
 			},
 		},
 	}
-	controllerManagerContext := fake.NewControllerManagerContext(cluster, &controlplanev1.KubeadmControlPlane{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: cluster.Namespace,
-			Name:      cluster.Spec.ControlPlaneRef.Name,
+	objects := []client.Object{
+		cluster,
+		kubeconfig.GenerateSecret(cluster, kubeconfig.FromEnvTestConfig(testEnv.Config, cluster)),
+		&controlplanev1.KubeadmControlPlane{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      cluster.Spec.ControlPlaneRef.Name,
+			},
+			Spec: controlplanev1.KubeadmControlPlaneSpec{
+				Replicas: ptr.To[int32](3),
+			},
 		},
-		Spec: controlplanev1.KubeadmControlPlaneSpec{
-			Replicas: ptr.To[int32](3),
-		},
-		Status: controlplanev1.KubeadmControlPlaneStatus{
-			Replicas: 2,
-		},
-	})
+	}
+	for i := range 3 {
+		machine := &clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      fmt.Sprintf("test-control-plane-%d", i),
+				Labels: map[string]string{
+					clusterv1.ClusterNameLabel:         cluster.Name,
+					clusterv1.MachineControlPlaneLabel: "",
+				},
+			},
+		}
+		if i < 2 {
+			machine.Status.NodeRef = &corev1.ObjectReference{Name: machine.Name}
+		}
+		objects = append(objects, machine)
+	}
+	controllerManagerContext := fake.NewControllerManagerContext(objects...)
 	r := clusterReconciler{Client: controllerManagerContext.Client}
 
 	result, err := r.reconcileKubeOvnAppRelease(ctx, &capvcontext.ClusterContext{Cluster: cluster})

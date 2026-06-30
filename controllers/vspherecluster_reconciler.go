@@ -394,17 +394,18 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{}, fmt.Errorf("cluster network pod/service CIDR must be set before deploying kube-ovn")
 	}
 
-	ready, err := r.controlPlaneReplicasAvailableForKubeOvnReconcile(ctx, cluster)
+	clientset, restConfig, err := r.newRemoteClients(ctx, cluster)
+	if err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "Skipping kube-ovn AppRelease reconcile because workload cluster client is unavailable")
+		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, clientset)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 	if !ready {
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	clientset, restConfig, err := r.newRemoteClients(ctx, cluster)
-	if err != nil {
-		return reconcile.Result{}, err
 	}
 
 	chartPullSecret, imagePullSecrets, err := sentryPullSecrets(ctx, clientset)
@@ -438,7 +439,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	return reconcile.Result{}, nil
 }
 
-func (r *clusterReconciler) controlPlaneReplicasAvailableForKubeOvnReconcile(ctx context.Context, cluster *clusterv1.Cluster) (bool, error) {
+func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx context.Context, cluster *clusterv1.Cluster, workloadClient kubernetes.Interface) (bool, error) {
 	log := ctrl.LoggerFrom(ctx)
 	kcp, err := r.kubeadmControlPlaneForCluster(ctx, cluster)
 	if err != nil {
@@ -457,8 +458,39 @@ func (r *clusterReconciler) controlPlaneReplicasAvailableForKubeOvnReconcile(ctx
 	if kcp.Spec.Replicas != nil {
 		desiredReplicas = *kcp.Spec.Replicas
 	}
-	if kcp.Status.Replicas != desiredReplicas {
-		log.Info("Skipping kube-ovn AppRelease reconcile until control plane replica count matches KubeadmControlPlane", "controlPlaneReplicas", kcp.Status.Replicas, "desiredControlPlaneReplicas", desiredReplicas)
+
+	machines := &clusterv1.MachineList{}
+	if err := r.Client.List(ctx,
+		machines,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: cluster.Name},
+		client.HasLabels{clusterv1.MachineControlPlaneLabel},
+	); err != nil {
+		return false, pkgerrors.Wrap(err, "failed to list control plane Machines")
+	}
+
+	var controlPlaneNodes int32
+	for _, machine := range machines.Items {
+		if !machine.DeletionTimestamp.IsZero() || machine.Status.NodeRef == nil {
+			continue
+		}
+		node, err := workloadClient.CoreV1().Nodes().Get(ctx, machine.Status.NodeRef.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			log.Info("Skipping kube-ovn AppRelease reconcile because control plane Node does not exist", "Machine", klog.KObj(&machine), "Node", machine.Status.NodeRef.Name)
+			continue
+		}
+		if err != nil {
+			log.Error(err, "Skipping kube-ovn AppRelease reconcile because control plane Node cannot be queried", "Machine", klog.KObj(&machine), "Node", machine.Status.NodeRef.Name)
+			return false, nil
+		}
+		if !node.DeletionTimestamp.IsZero() {
+			log.Info("Skipping kube-ovn AppRelease reconcile because control plane Node is deleting", "Machine", klog.KObj(&machine), "Node", node.Name)
+			continue
+		}
+		controlPlaneNodes++
+	}
+	if controlPlaneNodes < desiredReplicas {
+		log.Info("Skipping kube-ovn AppRelease reconcile until all control plane Nodes exist and are not deleting", "controlPlaneNodes", controlPlaneNodes, "desiredControlPlaneReplicas", desiredReplicas)
 		return false, nil
 	}
 	return true, nil
