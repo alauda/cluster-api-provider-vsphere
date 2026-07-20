@@ -320,12 +320,25 @@ func (v *VimMachineService) reconcileNetwork(ctx context.Context, vimMachineCtx 
 	})
 	vimMachineCtx.VSphereMachine.Status.Addresses = machineAddresses
 
-	if len(vimMachineCtx.VSphereMachine.Status.Addresses) == 0 {
+	if !hasMachineIPAddress(vimMachineCtx.VSphereMachine.Status.Addresses) {
 		log.Info("Network cannot be reconciled: waiting for IP addresses")
 		return false, kerrors.NewAggregate(errs)
 	}
 
 	return true, nil
+}
+
+func hasMachineIPAddress(addresses []clusterv1.MachineAddress) bool {
+	for _, addr := range addresses {
+		if addr.Type != clusterv1.MachineInternalIP && addr.Type != clusterv1.MachineExternalIP {
+			continue
+		}
+		if strings.TrimSpace(addr.Address) == "" {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (v *VimMachineService) createOrPatchVSphereVM(ctx context.Context, vimMachineCtx *capvcontext.VIMMachineContext, vsphereVM *infrav1.VSphereVM) (*infrav1.VSphereVM, error) {

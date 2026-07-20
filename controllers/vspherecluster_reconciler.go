@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -79,6 +80,7 @@ var (
 type clusterReconciler struct {
 	ControllerManagerContext *capvcontext.ControllerManagerContext
 	Client                   client.Client
+	Recorder                 record.EventRecorder
 
 	vmService               services.VimMachineService
 	clusterModuleReconciler Reconciler
@@ -118,10 +120,6 @@ func (r *clusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereCluster); err != nil || isPaused || requeue {
-		return ctrl.Result{}, err
-	}
-
 	// Create the cluster context for this request.
 	clusterContext := &capvcontext.ClusterContext{
 		Cluster:        cluster,
@@ -140,6 +138,10 @@ func (r *clusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	// Handle deleted clusters
 	if !vsphereCluster.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, clusterContext)
+	}
+
+	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereCluster); err != nil || isPaused || requeue {
+		return ctrl.Result{}, err
 	}
 
 	if cluster == nil {
@@ -193,6 +195,7 @@ func (r *clusterReconciler) patch(ctx context.Context, clusterCtx *capvcontext.C
 			infrav1.VSphereClusterFailureDomainsReadyV1Beta2Condition,
 			infrav1.VSphereClusterVCenterAvailableV1Beta2Condition,
 			infrav1.VSphereClusterClusterModulesReadyV1Beta2Condition,
+			infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
 		}},
 	)
 }
@@ -368,6 +371,8 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {
 	cluster := clusterCtx.Cluster
 	if cluster == nil || cluster.Annotations["cpaas.io/network-type"] != "kube-ovn" {
+		conditions.Delete(clusterCtx.VSphereCluster, infrav1.KubeOvnAppReleaseReadyCondition)
+		v1beta2conditions.Delete(clusterCtx.VSphereCluster, infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition)
 		return reconcile.Result{}, nil
 	}
 	var err error
@@ -376,7 +381,9 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	joinCIDR := cluster.Annotations["cpaas.io/kube-ovn-join-cidr"]
 	registry := cluster.Annotations[registryAddressAnnotation]
 	if registry == "" {
-		return reconcile.Result{}, fmt.Errorf("cpaas.io/registry-address annotation is required to deploy kube-ovn")
+		msg := "cpaas.io/registry-address annotation is required to deploy kube-ovn"
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseInvalidConfigurationReason, clusterv1.ConditionSeverityError, msg)
+		return reconcile.Result{}, errors.New(msg)
 	}
 
 	if targetVersion == "" {
@@ -384,15 +391,21 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		modulePlugin.SetAPIVersion(modulePluginGVK.GroupVersion().String())
 		modulePlugin.SetKind(modulePluginGVK.Kind)
 		if err := r.Client.Get(ctx, client.ObjectKey{Name: "kube-ovn"}, modulePlugin); err != nil {
-			return reconcile.Result{}, pkgerrors.Wrap(err, "failed to get kube-ovn ModulePlugin")
+			msg := "failed to get kube-ovn ModulePlugin"
+			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseInvalidConfigurationReason, clusterv1.ConditionSeverityError, msg)
+			return reconcile.Result{}, pkgerrors.Wrap(err, msg)
 		}
 		var found bool
 		targetVersion, found, err = unstructured.NestedString(modulePlugin.Object, "status", "latestVersion")
 		if err != nil {
-			return reconcile.Result{}, pkgerrors.Wrap(err, "failed to read kube-ovn ModulePlugin status.latestVersion")
+			msg := "failed to read kube-ovn ModulePlugin status.latestVersion"
+			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseInvalidConfigurationReason, clusterv1.ConditionSeverityError, msg)
+			return reconcile.Result{}, pkgerrors.Wrap(err, msg)
 		}
 		if !found || targetVersion == "" {
-			return reconcile.Result{}, fmt.Errorf("kube-ovn module plugin latestVersion is empty")
+			msg := "kube-ovn module plugin latestVersion is empty"
+			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseInvalidConfigurationReason, clusterv1.ConditionSeverityError, msg)
+			return reconcile.Result{}, errors.New(msg)
 		}
 	}
 	chartName, err := kubeOvnChartNameForVersion(targetVersion)
@@ -403,12 +416,15 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	podCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, true)
 	serviceCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, false)
 	if podCIDR == "" || serviceCIDR == "" {
-		return reconcile.Result{}, fmt.Errorf("cluster network pod/service CIDR must be set before deploying kube-ovn")
+		msg := "cluster network pod/service CIDR must be set before deploying kube-ovn"
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseInvalidConfigurationReason, clusterv1.ConditionSeverityError, msg)
+		return reconcile.Result{}, errors.New(msg)
 	}
 
 	clientset, restConfig, err := r.newRemoteClients(ctx, cluster)
 	if err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "Skipping kube-ovn AppRelease reconcile because workload cluster client is unavailable")
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionUnknown, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, err.Error())
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
@@ -417,38 +433,201 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{}, err
 	}
 	if !ready {
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, "waiting for all control plane Nodes before reconciling kube-ovn AppRelease")
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	chartPullSecret, imagePullSecrets, err := sentryPullSecrets(ctx, clientset)
 	if err != nil && !apierrors.IsNotFound(err) {
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseNotReadyReason, clusterv1.ConditionSeverityWarning, err.Error())
 		return reconcile.Result{}, err
 	}
 
 	appRelease := buildKubeOvnAppRelease(cluster, registry, chartName, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets, controlPlaneNodes)
 	dc, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
-		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to create dynamic client for workload cluster")
+		msg := "failed to create dynamic client for workload cluster"
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionUnknown, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, msg)
+		return reconcile.Result{}, pkgerrors.Wrap(err, msg)
 	}
 
 	current, err := dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Get(ctx, appRelease.GetName(), metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		_, err = dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Create(ctx, appRelease, metav1.CreateOptions{})
-		return reconcile.Result{}, err
+		if err != nil {
+			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseNotReadyReason, clusterv1.ConditionSeverityWarning, err.Error())
+			return reconcile.Result{}, err
+		}
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, "created kube-ovn AppRelease, waiting for it to sync and become healthy")
+		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if err != nil {
-		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to get existing kube-ovn AppRelease")
+		msg := "failed to get existing kube-ovn AppRelease"
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionUnknown, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, msg)
+		return reconcile.Result{}, pkgerrors.Wrap(err, msg)
 	}
 
 	if !reflect.DeepEqual(current.Object["spec"], appRelease.Object["spec"]) {
 		current.Object["spec"] = appRelease.Object["spec"]
 		_, err = dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Update(ctx, current, metav1.UpdateOptions{})
 		if err != nil {
+			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseNotReadyReason, clusterv1.ConditionSeverityWarning, err.Error())
 			return reconcile.Result{}, pkgerrors.Wrap(err, "failed to update kube-ovn AppRelease")
 		}
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, "updated kube-ovn AppRelease, waiting for it to sync and become healthy")
+		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	return reconcile.Result{}, nil
+	readiness := kubeOvnAppReleaseReadiness(current)
+	if readiness.ready {
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionTrue, infrav1.KubeOvnAppReleaseReadyReason, clusterv1.ConditionSeverityInfo, "")
+		return reconcile.Result{}, nil
+	}
+	r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, readiness.reason, clusterv1.ConditionSeverityInfo, readiness.message)
+	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+type kubeOvnAppReleaseStatus struct {
+	ready   bool
+	reason  string
+	message string
+}
+
+func (r *clusterReconciler) setKubeOvnAppReleaseCondition(vsphereCluster *infrav1.VSphereCluster, status corev1.ConditionStatus, reason string, severity clusterv1.ConditionSeverity, message string) {
+	oldCondition := v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition)
+	var oldStatus metav1.ConditionStatus
+	var oldReason, oldMessage string
+	if oldCondition != nil {
+		oldStatus = oldCondition.Status
+		oldReason = oldCondition.Reason
+		oldMessage = oldCondition.Message
+	}
+
+	switch status {
+	case corev1.ConditionTrue:
+		conditions.MarkTrue(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition)
+	case corev1.ConditionUnknown:
+		conditions.MarkUnknown(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition, reason, "%s", message)
+	default:
+		conditions.MarkFalse(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition, reason, severity, "%s", message)
+	}
+
+	newCondition := metav1.Condition{
+		Type:    infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
+		Status:  metav1.ConditionStatus(status),
+		Reason:  reason,
+		Message: message,
+	}
+	v1beta2conditions.Set(vsphereCluster, newCondition)
+
+	if r.Recorder == nil || (oldCondition != nil && oldStatus == newCondition.Status && oldReason == newCondition.Reason && oldMessage == newCondition.Message) {
+		return
+	}
+	eventType := corev1.EventTypeNormal
+	if status == corev1.ConditionFalse && severity != clusterv1.ConditionSeverityInfo {
+		eventType = corev1.EventTypeWarning
+	}
+	if message == "" {
+		message = fmt.Sprintf("kube-ovn AppRelease condition is %s", reason)
+	}
+	r.Recorder.Event(vsphereCluster, eventType, reason, message)
+}
+
+func kubeOvnAppReleaseReadiness(appRelease *unstructured.Unstructured) kubeOvnAppReleaseStatus {
+	syncCondition, found, err := appReleaseCondition(appRelease, "Sync")
+	if err != nil {
+		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: err.Error()}
+	}
+	if !found {
+		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: "waiting for kube-ovn AppRelease Sync condition"}
+	}
+	healthCondition, found, err := appReleaseCondition(appRelease, "Health")
+	if err != nil {
+		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: err.Error()}
+	}
+	if !found {
+		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: "waiting for kube-ovn AppRelease Health condition"}
+	}
+
+	if stale, message := appReleaseConditionStale(appRelease, syncCondition, "Sync"); stale {
+		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: message}
+	}
+	if stale, message := appReleaseConditionStale(appRelease, healthCondition, "Health"); stale {
+		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: message}
+	}
+
+	if status := conditionString(syncCondition, "status"); status != string(corev1.ConditionTrue) {
+		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseNotReadyReason, message: appReleaseConditionMessage("Sync", syncCondition, status)}
+	}
+	if status := conditionString(healthCondition, "status"); status != string(corev1.ConditionTrue) {
+		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseNotReadyReason, message: appReleaseConditionMessage("Health", healthCondition, status)}
+	}
+
+	return kubeOvnAppReleaseStatus{ready: true, reason: infrav1.KubeOvnAppReleaseReadyReason}
+}
+
+func appReleaseCondition(appRelease *unstructured.Unstructured, conditionType string) (map[string]any, bool, error) {
+	conditionList, found, err := unstructured.NestedSlice(appRelease.Object, "status", "conditions")
+	if err != nil || !found {
+		return nil, false, err
+	}
+	for _, condition := range conditionList {
+		conditionMap, ok := condition.(map[string]any)
+		if !ok {
+			continue
+		}
+		if conditionString(conditionMap, "type") == conditionType {
+			return conditionMap, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func appReleaseConditionStale(appRelease *unstructured.Unstructured, condition map[string]any, conditionType string) (bool, string) {
+	generation := appRelease.GetGeneration()
+	observedGeneration, ok := conditionInt64(condition, "observedGeneration")
+	if !ok {
+		return true, fmt.Sprintf("waiting for kube-ovn AppRelease %s condition observedGeneration", conditionType)
+	}
+	if observedGeneration != generation {
+		return true, fmt.Sprintf("waiting for kube-ovn AppRelease %s condition to observe generation %d", conditionType, generation)
+	}
+	return false, ""
+}
+
+func appReleaseConditionMessage(conditionType string, condition map[string]any, status string) string {
+	reason := conditionString(condition, "reason")
+	message := conditionString(condition, "message")
+	if reason == "" && message == "" {
+		return fmt.Sprintf("kube-ovn AppRelease %s condition status is %s", conditionType, status)
+	}
+	if message == "" {
+		return fmt.Sprintf("kube-ovn AppRelease %s condition is %s", conditionType, reason)
+	}
+	if reason == "" {
+		return fmt.Sprintf("kube-ovn AppRelease %s condition: %s", conditionType, message)
+	}
+	return fmt.Sprintf("kube-ovn AppRelease %s condition is %s: %s", conditionType, reason, message)
+}
+
+func conditionString(condition map[string]any, field string) string {
+	value, _ := condition[field].(string)
+	return value
+}
+
+func conditionInt64(condition map[string]any, field string) (int64, bool) {
+	switch value := condition[field].(type) {
+	case int64:
+		return value, true
+	case int32:
+		return int64(value), true
+	case int:
+		return int64(value), true
+	case float64:
+		return int64(value), true
+	default:
+		return 0, false
+	}
 }
 
 func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx context.Context, cluster *clusterv1.Cluster, workloadClient kubernetes.Interface) ([]string, bool, error) {

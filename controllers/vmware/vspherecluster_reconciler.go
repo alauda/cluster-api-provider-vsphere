@@ -106,10 +106,6 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereCluster); err != nil || isPaused || requeue {
-		return ctrl.Result{}, err
-	}
-
 	// Build the cluster context.
 	clusterContext := &vmware.ClusterContext{
 		Cluster:        cluster,
@@ -128,6 +124,10 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	if !vsphereCluster.DeletionTimestamp.IsZero() {
 		r.reconcileDelete(clusterContext)
 		return ctrl.Result{}, nil
+	}
+
+	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereCluster); err != nil || isPaused || requeue {
+		return ctrl.Result{}, err
 	}
 
 	if cluster == nil {

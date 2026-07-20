@@ -265,10 +265,6 @@ func (r *machineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, machineContext.GetVSphereMachine()); err != nil || isPaused || requeue {
-		return ctrl.Result{}, err
-	}
-
 	machineContext.SetBaseMachineContext(&capvcontext.BaseMachineContext{
 		Cluster:     cluster,
 		Machine:     machine,
@@ -330,6 +326,10 @@ func (r *machineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 
 	if !machineContext.GetObjectMeta().DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, machineContext)
+	}
+
+	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, machineContext.GetVSphereMachine()); err != nil || isPaused || requeue {
+		return ctrl.Result{}, err
 	}
 
 	// Checking whether cluster is nil here as we still want to run reconcileDelete above even if cluster is not found.

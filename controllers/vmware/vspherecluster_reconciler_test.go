@@ -31,6 +31,7 @@ import (
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -96,6 +97,52 @@ var _ = Describe("Cluster Controller Tests", func() {
 			Expect(request).ShouldNot(BeNil())
 			Expect(request[0].Namespace).Should(Equal(cluster.Namespace))
 			Expect(request[0].Name).Should(Equal(cluster.Name))
+		})
+	})
+
+	Context("Test Reconcile deletion", func() {
+		It("should delete a paused VSphereCluster", func() {
+			pausedCluster := util.CreateCluster("paused-cluster")
+			pausedVSphereCluster := util.CreateVSphereCluster("paused-cluster")
+			pausedVSphereCluster.Annotations = map[string]string{clusterv1.PausedAnnotation: "true"}
+			pausedVSphereCluster.Finalizers = []string{vmwarev1.ClusterFinalizer, "test.finalizer"}
+
+			reconciler.Client = testEnv
+
+			Expect(testEnv.Create(ctx, pausedCluster)).To(Succeed())
+			pausedVSphereCluster.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "Cluster",
+				Name:       pausedCluster.Name,
+				UID:        pausedCluster.UID,
+			}}
+			Expect(testEnv.Create(ctx, pausedVSphereCluster)).To(Succeed())
+
+			key := client.ObjectKeyFromObject(pausedVSphereCluster)
+			defer func() {
+				actual := &vmwarev1.VSphereCluster{}
+				if err := testEnv.Get(ctx, key, actual); err == nil {
+					actual.Finalizers = nil
+					Expect(testEnv.Update(ctx, actual)).To(Succeed())
+				}
+				Expect(testEnv.Cleanup(ctx, pausedVSphereCluster, pausedCluster)).To(Succeed())
+			}()
+
+			Expect(testEnv.Delete(ctx, pausedVSphereCluster)).To(Succeed())
+			Eventually(func() bool {
+				actual := &vmwarev1.VSphereCluster{}
+				if err := testEnv.Get(ctx, key, actual); err != nil {
+					return false
+				}
+				return !actual.DeletionTimestamp.IsZero()
+			}).Should(BeTrue())
+
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			actual := &vmwarev1.VSphereCluster{}
+			Expect(testEnv.Get(ctx, key, actual)).To(Succeed())
+			Expect(actual.Finalizers).NotTo(ContainElement(vmwarev1.ClusterFinalizer))
 		})
 	})
 

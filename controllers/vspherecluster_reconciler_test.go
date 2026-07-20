@@ -32,10 +32,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	apirecord "k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -352,6 +354,33 @@ var _ = Describe("VIM based VSphere ClusterReconciler", func() {
 		}, timeout).Should(BeTrue())
 	})
 
+	It("should be able to delete a paused VSphereCluster", func() {
+		ctx := context.Background()
+
+		instance := &infrav1.VSphereCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{clusterv1.PausedAnnotation: "true"},
+				Finalizers:  []string{infrav1.ClusterFinalizer},
+				Name:        "paused-vsphere-test1",
+				Namespace:   "default",
+			},
+		}
+
+		Expect(testEnv.Create(ctx, instance)).To(Succeed())
+		key := client.ObjectKey{Namespace: instance.Namespace, Name: instance.Name}
+
+		By("deleting the paused VSphereCluster")
+		Eventually(func() bool {
+			err := testEnv.Delete(ctx, instance)
+			return err == nil
+		}, timeout).Should(BeTrue())
+
+		Eventually(func() bool {
+			err := testEnv.Get(ctx, key, instance)
+			return apierrors.IsNotFound(err)
+		}, timeout).Should(BeTrue())
+	})
+
 	Context("With Deployment Zones", func() {
 		var (
 			namespace   *corev1.Namespace
@@ -652,6 +681,89 @@ func TestBuildKubeOvnAppReleaseSetsControlPlaneNodes(t *testing.T) {
 	g.Expect(controlPlaneNodes).To(Equal([]any{"cp-0", "cp-1", "cp-2"}))
 }
 
+func TestKubeOvnAppReleaseReadiness(t *testing.T) {
+	condition := func(conditionType string, status corev1.ConditionStatus, observedGeneration int64, reason, message string) map[string]any {
+		return map[string]any{
+			"type":               conditionType,
+			"status":             string(status),
+			"observedGeneration": observedGeneration,
+			"reason":             reason,
+			"message":            message,
+		}
+	}
+	appRelease := func(generation int64, conditions []any) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"generation": generation},
+			"status":   map[string]any{"conditions": conditions},
+		}}
+	}
+
+	tests := []struct {
+		name        string
+		appRelease  *unstructured.Unstructured
+		wantReady   bool
+		wantReason  string
+		wantMessage string
+	}{
+		{
+			name:       "ready when Sync and Health are true for current generation",
+			appRelease: appRelease(2, []any{condition("Sync", corev1.ConditionTrue, 2, "Synced", ""), condition("Health", corev1.ConditionTrue, 2, "Ready", "")}),
+			wantReady:  true,
+			wantReason: infrav1.KubeOvnAppReleaseReadyReason,
+		},
+		{
+			name:        "waiting when Sync condition is missing",
+			appRelease:  appRelease(1, []any{condition("Health", corev1.ConditionTrue, 1, "Ready", "")}),
+			wantReason:  infrav1.KubeOvnAppReleaseReconcilingReason,
+			wantMessage: "waiting for kube-ovn AppRelease Sync condition",
+		},
+		{
+			name:        "waiting when observedGeneration is stale",
+			appRelease:  appRelease(2, []any{condition("Sync", corev1.ConditionTrue, 1, "Synced", ""), condition("Health", corev1.ConditionTrue, 2, "Ready", "")}),
+			wantReason:  infrav1.KubeOvnAppReleaseReconcilingReason,
+			wantMessage: "waiting for kube-ovn AppRelease Sync condition to observe generation 2",
+		},
+		{
+			name:        "not ready when Health is false",
+			appRelease:  appRelease(1, []any{condition("Sync", corev1.ConditionTrue, 1, "Synced", ""), condition("Health", corev1.ConditionFalse, 1, "Progressing", "waiting for pods")}),
+			wantReason:  infrav1.KubeOvnAppReleaseNotReadyReason,
+			wantMessage: "kube-ovn AppRelease Health condition is Progressing: waiting for pods",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got := kubeOvnAppReleaseReadiness(tt.appRelease)
+			g.Expect(got.ready).To(Equal(tt.wantReady))
+			g.Expect(got.reason).To(Equal(tt.wantReason))
+			if tt.wantMessage != "" {
+				g.Expect(got.message).To(Equal(tt.wantMessage))
+			}
+		})
+	}
+}
+
+func TestClusterReconciler_SetKubeOvnAppReleaseConditionEmitsEventsOnChanges(t *testing.T) {
+	g := NewWithT(t)
+	recorder := apirecord.NewFakeRecorder(10)
+	r := &clusterReconciler{Recorder: recorder}
+	vsphereCluster := &infrav1.VSphereCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-cluster"}}
+
+	r.setKubeOvnAppReleaseCondition(vsphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseNotReadyReason, clusterv1.ConditionSeverityWarning, "waiting for pods")
+	g.Expect(<-recorder.Events).To(ContainSubstring(infrav1.KubeOvnAppReleaseNotReadyReason))
+
+	r.setKubeOvnAppReleaseCondition(vsphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseNotReadyReason, clusterv1.ConditionSeverityWarning, "waiting for pods")
+	select {
+	case event := <-recorder.Events:
+		t.Fatalf("expected no duplicate event, got %q", event)
+	default:
+	}
+
+	r.setKubeOvnAppReleaseCondition(vsphereCluster, corev1.ConditionTrue, infrav1.KubeOvnAppReleaseReadyReason, clusterv1.ConditionSeverityInfo, "")
+	g.Expect(<-recorder.Events).To(ContainSubstring(infrav1.KubeOvnAppReleaseReadyReason))
+}
+
 func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneNodesRegister(t *testing.T) {
 	g := NewWithT(t)
 	cluster := &clusterv1.Cluster{
@@ -711,10 +823,20 @@ func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneNo
 	}
 	controllerManagerContext := fake.NewControllerManagerContext(objects...)
 	r := clusterReconciler{Client: controllerManagerContext.Client}
+	vsphereCluster := &infrav1.VSphereCluster{
+		ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: cluster.Name},
+		Status:     infrav1.VSphereClusterStatus{Ready: true},
+	}
 
-	result, err := r.reconcileKubeOvnAppRelease(ctx, &capvcontext.ClusterContext{Cluster: cluster})
+	result, err := r.reconcileKubeOvnAppRelease(ctx, &capvcontext.ClusterContext{Cluster: cluster, VSphereCluster: vsphereCluster})
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+	g.Expect(vsphereCluster.Status.Ready).To(BeTrue())
+	g.Expect(conditions.Get(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition).Reason).To(Equal(infrav1.KubeOvnAppReleaseReconcilingReason))
+	condition := v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition)
+	g.Expect(condition).NotTo(BeNil())
+	g.Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(condition.Reason).To(Equal(infrav1.KubeOvnAppReleaseReconcilingReason))
 }
 
 func TestClusterReconciler_ReconcileDeploymentZones(t *testing.T) {

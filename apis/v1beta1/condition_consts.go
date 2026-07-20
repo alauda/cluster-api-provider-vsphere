@@ -38,6 +38,22 @@ const (
 	// FailureDomainsExhaustedByMachineConfigPoolReason (Severity=Warning) documents that all failure domains
 	// were excluded because their datacenters have no available machine config pool slots.
 	FailureDomainsExhaustedByMachineConfigPoolReason = "FailureDomainsExhaustedByMachineConfigPool"
+
+	// KubeOvnAppReleaseReadyCondition documents kube-ovn AppRelease readiness.
+	// It does not gate VSphereCluster.Status.Ready.
+	KubeOvnAppReleaseReadyCondition clusterv1.ConditionType = "KubeOvnAppReleaseReady"
+
+	// KubeOvnAppReleaseReadyReason documents that the kube-ovn AppRelease is synced and healthy.
+	KubeOvnAppReleaseReadyReason = "AppReleaseReady"
+
+	// KubeOvnAppReleaseReconcilingReason documents that the kube-ovn AppRelease is being created, updated, or waiting for status.
+	KubeOvnAppReleaseReconcilingReason = "AppReleaseReconciling"
+
+	// KubeOvnAppReleaseNotReadyReason documents that the kube-ovn AppRelease is observed but not ready.
+	KubeOvnAppReleaseNotReadyReason = "AppReleaseNotReady"
+
+	// KubeOvnAppReleaseInvalidConfigurationReason documents invalid kube-ovn AppRelease input configuration.
+	KubeOvnAppReleaseInvalidConfigurationReason = "InvalidKubeOvnConfiguration"
 )
 
 // Conditions and condition Reasons for the VSphereMachine and the VSphereVM object.

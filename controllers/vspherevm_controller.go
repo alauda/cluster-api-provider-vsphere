@@ -173,10 +173,6 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereVM); err != nil || isPaused || requeue {
-		return ctrl.Result{}, err
-	}
-
 	originalTaskRef := vsphereVM.Status.TaskRef
 	// Always issue a patch when exiting this function so changes to the
 	// resource are patched back to the API server, even on early returns.
@@ -264,6 +260,12 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 			reterr = kerrors.NewAggregate([]error{reterr, err})
 		}
 	}()
+
+	if vsphereVM.DeletionTimestamp.IsZero() {
+		if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereVM); err != nil || isPaused || requeue {
+			return ctrl.Result{}, err
+		}
+	}
 
 	authSession, err := r.retrieveVcenterSession(ctx, vsphereVM)
 	if err != nil {

@@ -996,6 +996,24 @@ func Test_VimMachineService_reconcileNetwork(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(ok).To(BeTrue())
 	})
+	t.Run("returns false when VSphereVM has no IP addresses", func(t *testing.T) {
+		g := NewWithT(t)
+		vsphereVM := getVSphereVM(hostAddr, corev1.ConditionTrue, nil, networkStatus)
+		controllerManagerContext := fake.NewControllerManagerContext(vsphereVM)
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.Machine.SetName(fakeLongClusterName)
+		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		ok, err := vimMachineService.reconcileNetwork(ctx, machineCtx, vsphereVM)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(ok).To(BeFalse())
+		g.Expect(machineCtx.VSphereMachine.Status.Addresses).To(ContainElement(clusterv1.MachineAddress{
+			Type:    clusterv1.MachineInternalDNS,
+			Address: vsphereVM.Name,
+		}))
+		g.Expect(hasMachineIPAddress(machineCtx.VSphereMachine.Status.Addresses)).To(BeFalse())
+	})
 }
 
 func Test_VimMachineService_ReconcileNormal(t *testing.T) {
@@ -1048,6 +1066,23 @@ func Test_VimMachineService_ReconcileNormal(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(requeue).To(BeFalse())
 		g.Expect(machineCtx.VSphereMachine.Status.Ready).To(BeTrue())
+	})
+	t.Run("requeues when VSphereVM is ready but has no IP addresses", func(t *testing.T) {
+		g := NewWithT(t)
+		vsphereVM := getVSphereVM(hostAddr, corev1.ConditionTrue, nil, networkStatus)
+		vsphereVM.Spec.BiosUUID = biosUUID
+		controllerManagerContext := fake.NewControllerManagerContext(vsphereVM)
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.Machine.SetName(fakeLongClusterName)
+		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		requeue, err := vimMachineService.ReconcileNormal(ctx, machineCtx)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(requeue).To(BeTrue())
+		g.Expect(machineCtx.VSphereMachine.Status.Ready).To(BeFalse())
+		g.Expect(conditions.Get(machineCtx.VSphereMachine, infrav1.VMProvisionedCondition).Reason).To(Equal(infrav1.WaitingForNetworkAddressesReason))
+		g.Expect(hasMachineIPAddress(machineCtx.VSphereMachine.Status.Addresses)).To(BeFalse())
 	})
 	t.Run("creates the VSphereVM when no resource found", func(t *testing.T) {
 		g := NewWithT(t)
