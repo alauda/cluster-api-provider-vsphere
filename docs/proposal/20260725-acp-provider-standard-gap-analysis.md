@@ -12,13 +12,15 @@
 
 ## 一、结论
 
-CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题（pause/deletion 顺序、地址 ready、kube-ovn 状态、槽位复用）已修复，交付产物已在交付仓库具备。剩余差距集中在三块（推进顺序见第四章）：
+CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题（pause/deletion 顺序、地址 ready、kube-ovn 状态、槽位复用）已修复，交付产物已在交付仓库具备。剩余差距集中在五块（推进顺序见第四章）：
 
-1. **ConfigPool 补齐**（P1-1/2/3/7）：缺容量计数器，Pool 级 condition 不全，webhook 校验覆盖少，槽位缺非持久化数据盘声明。
+1. **MachineConfigPool 补齐**（P1-1/2/3/7）：缺容量计数器，Pool 级 condition 不全，webhook 校验覆盖少，槽位缺非持久化数据盘声明。
 2. **ACP 文档与默认固定 IP 模板**（P1-4/5）：capabilities 等四件套缺失，默认模板仍走 DHCP。
-3. **交付仓库质量**（P1-6）：CRD 同步机制待确认，values.yaml 含明文凭据，缺 render 校验。
+3. **交付仓库质量**（P1-6）：values.yaml 含明文凭据。
+4. **容灾支持**（P1-8，非规范项）：无 encryption-provider 配置注入，主备集群无法复用同一加密密钥。
+5. **开机语义**（P1-9，非规范项）：VM 被 controller 每轮强制开机，管理员无法手动停机维护。
 
-这三块直接对应规范的「质量门禁」与「最小验收清单」。此外，规范有 7 条条款因 CAPV 的 fork 属性不适用或需裁剪，见第五章。
+前三块直接对应规范的「质量门禁」与「最小验收清单」；第四、五块是与 DCS 对齐但规范未点名的能力（容灾密钥复用、开机语义）。
 
 ---
 
@@ -34,20 +36,21 @@ CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题
 | 4 | 槽位释放安全（盘未卸载不释放） | 释放前检查已挂载持久盘并 requeue（`vspherevm_controller.go:490-549`）；异步 reclaim 有 `MachineConfigSlotReclaimStatus` 落盘 | ✅ | — |
 | 5 | providerID 格式稳定 | `vsphere://<BIOS-UUID>`，写入 spec 保证幂等 | ✅ | — |
 | 6 | 交付产物 chart/module-plugin/.build | 交付仓库已具备（CRD ×10、manager+CPI 双镜像），与 DCS/HCS 同构 | ✅ | — |
-| 7 | ConfigPool status 计数器 total/available/allocated | 仅 per-slot `configStatuses`，无计数器与 printcolumn | 🟡 | P1-1 |
-| 8 | Pool 级 conditions + v1beta2 | Pool 仅 `ClusterRefReady`；槽位分配信号在 Machine 侧；无 v1beta2 | 🟡 | P1-2 |
-| 9 | ConfigPool validation（唯一性、immutable、finalizer 阻删等） | webhook 仅校验 hostname 格式与 clusterRef（`internal/webhooks/vspheremachineconfigpool.go`） | 🟡 | P1-3 |
-| 10 | 持久盘 observed state 落 status | `volumePath/diskUUID` 回填到 spec（`vspheremachineconfigpool_types.go:148-155`），无 `PersistentDiskStatus` | 🟡 | P2-1 |
-| 11 | 固定 IP 为默认交付路径 | 默认模板 `dhcp4: true`，无 `machineConfigPoolRef` | 🟡 | P1-5 |
-| 12 | 固定 IP 升级默认 `maxSurge: 0` | KCP/MD webhook 查 pool 共享，但不强制 `maxSurge: 0` | 🟡 | P2-4 |
-| 13 | 控制面 LB/VIP 由 ClusterReconciler 管理 | `VSphereClusterSpec` 无 `controlPlaneLoadBalancer`，VIP 由模板 kube-vip 承担 | ⏸ | P2-2 |
-| 14 | bootstrap 状态可诊断 | 仅通用 `VMProvisioned` + `WaitingForBootstrapData`，无独立 `BootstrapReady` | 🟡 | P2-3 |
-| 15 | 交付质量（CRD 同步、凭据、render 校验） | CRD 为提交副本；`values.yaml` 含明文凭据；无 render/lint | 🟡 | P1-6 |
-| 16 | ACP 文档 capabilities/usage/known-issues/testing | 源码与交付仓库均缺（交付仓库仅 `integration-prerequisites.md`） | ❌ | P1-4 |
-| 17 | README 说明 fork 基线与兼容矩阵 | 仍为上游 README，无 baseline/patch 范围/版本矩阵 | 🟡 | P1-4 |
-| 18 | spec 不承载 observed state | controller 回写 `spec.clusterModules.moduleUUID`（`clustermodule_reconciler.go:166`），为上游既有设计 | 🟡 | P2-5 |
-| 19 | `XxxClusterSpec` 建模 `networkType` 等字段 | 未建模；kube-ovn 适用性靠 CAPI Cluster annotation `cpaas.io/network-type` 判断（`vspherecluster_reconciler.go:365`） | 🟡 | P1-4（文档化） |
-| 20 | 数据盘区分 ephemeral/persistent 两类 | Pool 槽位仅有 `persistentDisks`；非持久盘只有上游模板级 `dataDisks`（仅 attach，无格式化挂载，模板内同构），槽位级无法声明 | 🟡 | P1-7 |
+| 7 | MachineConfigPool status 计数器 total/available/allocated | 仅 per-slot `configStatuses`，无计数器与 printcolumn | 🟡 | P1-1 |
+| 8 | Pool 级 conditions + v1beta2 | Pool 仅 `ClusterRefReady`/`VCenterAvailable`；槽位分配信号在 Machine 侧；无 v1beta2 | 🟡 | P1-2 |
+| 9 | MachineConfigPool validation（唯一性、immutable、finalizer 阻删等） | webhook 仅校验 hostname 格式、clusterRef 与 network 必填（`internal/webhooks/vspheremachineconfigpool.go`）；finalizer 阻删已在 controller 实现 | 🟡 | P1-3 |
+| 10 | ACP 文档 capabilities/usage/known-issues/testing | 源码与交付仓库均缺（交付仓库仅 `integration-prerequisites.md`） | ❌ | P1-4 |
+| 11 | README 说明 fork 基线与兼容矩阵 | 仍为上游 README，无 baseline/patch 范围/版本矩阵 | 🟡 | P1-4 |
+| 12 | `XxxClusterSpec` 建模 `networkType` 等字段 | 未建模；kube-ovn 适用性靠 CAPI Cluster annotation `cpaas.io/network-type` 判断（`vspherecluster_reconciler.go:365`） | 🟡 | P1-4（文档化） |
+| 13 | 固定 IP 为默认交付路径 | 默认模板 `dhcp4: true`，无 `machineConfigPoolRef` | 🟡 | P1-5 |
+| 14 | 交付质量（凭据只引用 Secret，不落明文） | `values.yaml` 提交了真实形态凭据（server/username/password） | 🟡 | P1-6 |
+| 15 | 数据盘区分 ephemeral/persistent 两类 | Pool 槽位仅有 `persistentDisks`；非持久盘只有上游模板级 `dataDisks`（仅 attach，无格式化挂载，模板内同构），槽位级无法声明 | 🟡 | P1-7 |
+| 16 | 容灾主备复用同一 encryption-provider 配置（非规范项，DCS 已支持） | `VSphereClusterSpec` 无 `encryptionProviderConfigRef`；CAPV 全程不涉及 encryption-provider 配置注入，主备集群各自随机生成加密密钥 | ❌ | P1-8 |
+| 17 | VM 开机仅在创建时执行一次，允许管理员手动停机维护（非规范项，DCS 已支持） | `reconcilePowerState` 每轮 reconcile 无条件对 `PoweredOff` 的 VM 强制开机（`service.go:438`，`ReconcileVM` 于 `service.go:225` 调用）；管理员手动停机维护会被 controller 重新开机 | 🟡 | P1-9 |
+| 18 | 持久盘 observed state 落 status | `volumePath/diskUUID` 回填到 spec（`vspheremachineconfigpool_types.go:148-155`），无 `PersistentDiskStatus` | 🟡 | P2-1 |
+| 19 | 控制面 LB/VIP 由 ClusterReconciler 管理 | `VSphereClusterSpec` 无 `controlPlaneLoadBalancer`，VIP 由模板 kube-vip 承担 | ⏸ | P2-2 |
+| 20 | bootstrap 状态可诊断 | 仅 secret 未产出场景有准确 reason（`WaitingForBootstrapData`）；secret 读取失败/内容缺失/写入 VM guestinfo 失败均落 `CloningFailed`，与真实 clone 失败不可区分 | 🟡 | P2-3 |
+| 21 | 固定 IP 升级默认 `maxSurge: 0` | KCP/MD webhook 只校验 pool 独占引用，不校验升级策略；池满时 `maxSurge≥1` 的升级会卡住 | 🟡 | P2-4 |
 
 ---
 
@@ -55,7 +58,7 @@ CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题
 
 P1 = 验收/上架必需；P2 = 随产品节奏推进。
 
-### P1-1　ConfigPool status 计数器 + printcolumn（#7）
+### P1-1　MachineConfigPool status 计数器 + printcolumn（#7）
 
 - **设计**：status 增加 `Total/Available/Allocated int32`，每次 reconcile 由 `configStatuses` 汇总；加 printcolumn。
 - **参考**：HCS `HCSMachineConfigPoolStatus.{TotalCount,AvailableCount}` 及其 printcolumn。
@@ -63,71 +66,121 @@ P1 = 验收/上架必需；P2 = 随产品节奏推进。
 
 ### P1-2　Pool 级 conditions + v1beta2（#8）
 
-- **设计**：新增规范建议的 Pool 级 condition（`Ready/MembersValid/MembersUnique/SlotAvailable/PersistentDisksReady`），并补 v1beta2 conditions 字段与 getter/setter（对齐本仓库 Cluster/Machine 已有做法）。
-- **参考**：DCS/HCS 在 `api/v1beta1/conditions*.go` 集中定义 condition，reason 用 UpperCamelCase。
-- **验收**：重复 hostname/IP、无可用槽位、盘未就绪、引用的网络不存在（见第五章 N6）等场景有对应 condition。
+- **设计**：新增下表 Pool 级 condition，并补 v1beta2 conditions 字段与 getter/setter（对齐本仓库 Cluster/Machine 已有做法）。要点：
+  - 校验函数与 P1-3 webhook 共用；`SlotAvailable` 与 P1-1 计数器同源汇总。
+  - `MembersValid`/`MembersUnique` 为 False 时仅非法槽位跳过分配，不整池阻塞。
+  - 规范名单中的 `ReclaimReady` 并入 `PersistentDisksReady`：reclaim 进度已按槽位落在 `configStatuses[].reclaimStatus`，Pool 级一个盘条件足够。
+- **参考**：DCS/HCS 的 Pool 均无 condition（成员校验靠 webhook 拒绝写入），本项无先例可抄；仅 reason 的 UpperCamelCase 命名风格参照两者 Cluster 级 condition（`VpcReady`/`LoadBalancerReady` 等）。
+- **验收**：Pool status 可观测到以下 condition（v1beta1 与 v1beta2 双写；已有 `ClusterRefReady`/`VCenterAvailable` 保留）：
 
-### P1-3　ConfigPool validation 补齐（#9）
+  | Condition | True 含义 | 典型 False reason |
+  |---|---|---|
+  | `Ready` | 健康类条件（`MembersValid`/`MembersUnique`/`PersistentDisksReady`/`ClusterRefReady`/`VCenterAvailable`）的 summary；不含 `SlotAvailable` | 继承首个 False 子条件的 reason |
+  | `MembersValid` | 所有槽位字段合法、引用网络存在（存在性在 reconcile 期校验） | `InvalidMemberConfig`、`NetworkNotFound` |
+  | `MembersUnique` | hostname/primary IP 池内及同集群跨池唯一 | `DuplicateHostname`、`DuplicateIPAddress` |
+  | `SlotAvailable` | 至少 1 个 Available 槽位。容量信号，不参与 `Ready` 聚合——满分配是固定 IP 池的预期状态 | `AllSlotsInUse`、`WaitingForReclaim` |
+  | `PersistentDisksReady` | 无持久盘处于 reclaim 失败或挂载残留状态 | `ReclaimFailed`、`DiskStillAttached` |
 
-- **设计**：基础约束用 CRD marker（`configs` MinItems=1、`sizeGiB` minimum、`unitNumber` 范围）；跨字段/跨资源约束用 webhook（hostname/primary IP/IPv6 唯一，数据盘（持久与非持久，见 P1-7）name/unitNumber 唯一且排除 7，已分配槽位关键字段 immutable，跨 pool 重复检查，删除时有 allocated slot 或未清理盘则 finalizer 阻止）。网络名称只做格式校验，存在性在 reconcile 期校验（见第五章 N6）。
-- **验收**：create/update/delete validation 单测齐全。
+### P1-3　MachineConfigPool validation 补齐（#9）
 
-### P1-4　ACP 文档四件套 + README fork 基线（#16、#17、#19）
+- **现状**：webhook 已有 clusterRef 校验（含 consumerRef 已设时 immutable）、hostname 格式、network 必填；删除阻断已由 controller finalizer 实现（有 InUse 槽位时报错阻塞，盘 reclaim 完成后才移除 finalizer），不是缺口。缺：CRD 数值约束、唯一性、已分配槽位 immutable、跨池检查。
+- **设计**：
+  1. CRD marker：`configs` MinItems=1；`sizeGiB` Minimum=1；`unitNumber` Minimum=0、Maximum=15，排除 7 用 CEL（`+kubebuilder:validation:XValidation:rule="self != 7"`），不进 webhook。
+  2. 池内唯一与字段合法（webhook）：hostname、primary IP/IPv6、数据盘（持久与非持久，见 P1-7）name/unitNumber/mountPath 唯一；写法参照 DCS `validateStatic`（`dcsiphostnamepool_webhook.go`，`field.Duplicate` 错误信息带首个冲突方位置）。
+  3. immutable（webhook）：由 old 对象 `status.configStatuses` 判定已分配（InUse/Released）槽位，禁止修改其 hostname/IP/盘 size/unitNumber、禁止删除该槽位条目；参照 DCS `indexPool` 的 old/new 索引对比。
+  4. 跨池唯一（webhook 注入 client）：同 namespace 同 clusterRef 的池间 hostname/IP 重复检查；并发写入存在竞态，由 P1-2 `MembersUnique` condition 兜底。
+  5. 校验函数放公共包，webhook 与 reconciler（P1-2）共用，避免逻辑漂移。网络名称只做格式校验，存在性在 reconcile 期校验。
+  6. 可选增强：`ValidateDelete` fail-fast（当场拒绝删除有已分配槽位的池，而非删除后卡在 deleting）；DCS/HCS 均未做，非规范差距。
+- **验收**：create/update/delete validation 单测齐全；`make manifests` 后 CRD 含新 marker 并同步交付仓库 chart。
+
+### P1-4　ACP 文档四件套 + README fork 基线（#10、#11、#12）
 
 - **放置**（需 owner 确认）：capabilities/usage/known-issues/testing 放交付仓库（跟随交付版本）；fork 基线、patch 范围、兼容矩阵放源码仓库 README 或 `docs/development.md`；两仓交叉引用。
 - **设计**：
   - `capabilities.md` 按 HCS 七段结构：基线、评估说明、提供能力、关键边界、主要缺口、由其他组件承接、代码存在但未验收路径。需写明：固定 IP 是默认主路径而 DHCP/IPAM 是 legacy、`maxSurge: 0` 升级策略、kube-ovn 依赖 annotation `cpaas.io/network-type` 的平台约定、supervisor 模式与历史 API 版本为未验收路径。
-  - `usage.md`：固定 IP 建集群（单控制面/HA/worker）、ConfigPool、持久盘、多网卡、删除与 reclaim。
+  - `usage.md`：固定 IP 建集群（单控制面/HA/worker）、MachineConfigPool、持久盘、多网卡、删除与 reclaim。
   - `known-issues.md`：按 HCS `KI-xxx-NNN` 格式。
   - `testing/`：测试计划、报告模板、正式版本报告。
 - **验收**：四件套齐全；capabilities 与代码、测试报告一致；能力标注 supported/experimental/legacy/non-goal。
 
-### P1-5　默认固定 IP 模板（#11）
+### P1-5　默认固定 IP 模板（#13）
 
 - **设计**：ACP 默认模板改为 `VSphereMachineConfigPool` + `machineConfigPoolRef` + KCP/MD `maxSurge: 0`；DHCP/IPAM 模板保留并在 capabilities 标注 legacy。
 - **验收**：默认创建路径走固定 IP/hostname 槽位；样例与 CRD 一致。
 
-### P1-6　交付仓库质量补强（#6、#15）
+### P1-6　交付仓库去明文凭据（#6、#14）
 
-chart 已具备，本项为质量补强：
+chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据（`cloudProviderVSphere.config` 的 server/username/password）。改为占位符或安装时注入，凭据只引用 Secret。
 
-1. **CRD 同步**：确认 `chart/templates/crds/` 由源码 `make manifests` 同步；否则加同步脚本或 CI diff 校验。
-2. **凭据**：`values.yaml` 中的明文密码/server/username 改为占位符或安装时注入。
-3. **命名/版本**：确认 `appReleases[0].name` 与模块名不一致、`Chart.yaml.version: v0.0.0` 是流水线占位而非漏配。
-4. **校验**：补 `helm lint`/render 的 CI 或本地脚本。
+- **验收**：values 无明文凭据。
 
-- **验收**：CRD 与源码无 diff；values 无明文凭据；lint/render 通过。
+### P1-7　Pool 槽位非持久化数据盘（#15）
 
-### P1-7　Pool 槽位非持久化数据盘（#20）
-
-- **现状**：非持久盘只能通过上游模板级 `dataDisks` 表达（`apis/v1beta1/types.go:205-210`）：仅 name/sizeGiB/provisioningMode，只 attach 不格式化挂载，且模板内所有节点同构。槽位级差异化的非持久盘（每节点不同大小/挂载点、随 VM 删除重建）无法声明。DCS/HCS 的 pool 槽位同样只有持久盘。
-- **设计**：Pool 槽位 `configs[]` 增加非持久盘声明（如 `ephemeralDisks`，字段对齐 `PersistentDisk` 的 sizeGiB/datastore/unitNumber/mountPath/fsFormat，但无 reclaim/保留语义）；创建 VM 时随 clone attach，复用持久盘现有的格式化/挂载管线；删除 VM 时随 VM 清理，不进入槽位释放门禁。与模板级 `dataDisks` 的分工写入 capabilities：模板级用于同构 attach-only 盘，槽位级用于差异化且需挂载的盘。
+- **现状**：Pool 槽位无法声明非持久盘（DCS/HCS 同样如此）。上游仅有模板级 `dataDisks`（`apis/v1beta1/types.go:205-210`），但只 attach 不格式化挂载、模板内所有节点同构，表达不了每节点不同大小/挂载点、随 VM 删除重建的盘。
+- **设计**：Pool 槽位 `configs[]` 增加非持久盘声明（如 `ephemeralDisks`，字段对齐 `PersistentDisk` 的 sizeGiB/datastore/unitNumber/mountPath/fsFormat，但无 reclaim/保留语义）。上游模板级 `dataDisks` 保持不动，分工写入 capabilities：模板级用于同构 attach-only 盘，槽位级用于差异化且需格式化挂载的盘。
+  - **生命周期**：随 clone 创建（同 `createDataDisks` 路径），随 VM 销毁一并删除；不进入槽位释放门禁与 reclaim。
+  - **定位**：按 unitNumber 寻址（`/dev/disk/by-path/…-scsi-0:0:<unitNumber>:0`）。不能沿用持久盘的 diskUUID 键——guestinfo bootstrap 数据在 createVM 时一次性写入，彼时盘尚未创建、无 UUID 可用。
+  - **格式化**：幂等模式（`blkid` 探测，空盘才 `mkfs`，参照 DCS `pkg/ignition/clc/clc.go` 的 ignition 模板）。新 VM 的 ephemeral 盘必为空盘，自然全新格式化；同一 VM 重启不重刷。
+  - **挂载**：`mkfs` 时打 label，fstab 以 `LABEL=` 挂载（参照 HCS `hcsmachine_userdata.go` 对临时盘的处理），不受设备名漂移影响。
+  - **管线**：复用持久盘现有脚本框架、systemd unit 与 cloud-init 注入（`pkg/util/machines.go`），盘表区分持久/非持久两类。
 - **验收**：槽位声明的非持久盘随 VM 创建/删除；升级重建后按声明重建空盘；unitNumber 与持久盘不冲突（validation 并入 P1-3）。
 
-### P2-1　持久盘 observed state 迁到 status（#10）
+### P1-8　容灾 encryptionProviderConfigRef（#16）
+
+- **背景**：容灾主备切换时，备集群从主集群恢复 etcd 数据；若两侧 kube-apiserver 的 encryption-provider 加密密钥不同，备集群无法解密已加密的 Secret 等资源。需让主备复用同一份 `encryption-provider.conf`。
+- **现状**：CAPV 源码无任何 encryption 相关处理，加密密钥由各集群 bootstrap 各自生成，主备互不相同。
+- **DCS 做法（参考）**：`DCSClusterSpec.EncryptionProviderConfigRef *corev1.LocalObjectReference` 引用一个含 `encryption-provider.conf` 键的 Secret；设值时 controller 用它替代随机生成，并在控制面节点 bootstrap 时注入 `/etc/kubernetes/encryption-provider.conf`。`resolveEncryptionProviderConf` 仅对控制面 Machine 生效（`internal/controller/dcsmachine_vm.go:81`）：未设值时首个控制面节点新生成、后续节点从已有 apiserver 读取。
+- **CAPV 落点差异（需 owner 确认）**：CAPV 走 kubeadm bootstrap（CABPK），投递路径与 DCS 的自渲染 ignition 不同——可不新增 `VSphereClusterSpec` 字段，直接由 `KubeadmControlPlane` 的 `files` + `clusterConfiguration.apiServer`（extraArgs `--encryption-provider-config`、extraVolumes）把引用 Secret 的内容写入控制面节点；是否仍在 `VSphereClusterSpec` 建模 `encryptionProviderConfigRef` 由 provider 统一注入（与 DCS 对齐），需 owner 在「复用 kubeadm 既有能力」与「provider 统一建模」间取舍。
+- **验收**：主备两集群 kube-apiserver 使用同一 encryption-provider 配置；备集群可解密从主集群恢复的加密资源。
+
+### P1-9　VM 开机仅在创建时执行一次（#17，非规范项）
+
+- **背景**：管理员需要能手动停机某台节点做维护（如硬件排障、离线操作），停机期间 controller 不应把它重新拉起。共识是：provider 只负责把 VM「创建后开一次机」，之后的开关机由管理员掌控。
+- **现状**：`reconcilePowerState`（`pkg/services/govmomi/service.go:438`）在 `ReconcileVM` 每轮 reconcile 被无条件调用（`service.go:225`），凡发现 VM 处于 `PoweredOff` 即强制开机。VSphereVM 会周期性 reconcile，因此管理员手动停机的 VM 会被 controller 重新开机，无法维护。
+- **DCS 做法（参考）**：仅在 `createVm` 时随创建开机（autoBoot / 平台 start-on-create，`internal/controller/dcsmachine_vm.go:49-78`）；之后 reconcile 遇到已存在且 `Stopped` 的 VM，只把 Machine 标记 NotReady 并 requeue（`dcsmachine_controller.go:227-230`），不强制重开，如实反映停机状态。
+- **设计**：门闩放在 `VSphereVM`（每台 infra machine 自己的对象），用一个新 condition 固化「已完成首次开机」——放 Cluster 级会导致第一台开机后新增节点被判定「已开机」而永不开机，扩容坏掉。
+  - 新增 `InitialPowerOnCompleted` condition（v1beta1 与 v1beta2 两组常量，加 `condition_consts.go`）。
+  - `reconcilePowerState`（`pkg/services/govmomi/service.go:438`）改为先看该 condition：未置且 `PoweredOff` → 照常开机（现有逻辑）；首次观测到 `PoweredOn` 时置为 True。
+  - condition 已 True 后再遇 `PoweredOff`，不再强制开机，如实反映 NotReady 并 requeue，由管理员决定何时开机。
+  - 经既有 `SetMirror` 链（`pkg/services/vimmachine.go:118-121`）镜像到 `VSphereMachine`，用户在 Machine 侧可见。
+  - 区分两条路径：删除走 `DestroyVM` 照常关机销毁；升级重建的是新 `VSphereVM`，condition 未置，首次开机不受影响。
+- **边界**：控制面/worker 一致适用；condition 为单向门闩，只置真不复位（VM 重启不影响判定）；非规范项，规范未点名，但已达成共识。
+- **验收**：新建 Machine 时 VM 正常开机并 Ready；之后管理员手动停机，controller 不再自动重开，Machine 状态如实反映停机；删除与升级重建路径不受影响。
+
+### P2-1　持久盘 observed state 迁到 status（#18）
 
 - **设计**：新增 `status.persistentDiskStatus`（绑定 hostname/slot，含 volumePath/diskUUID、phase、owner machine、attached VM、lastError 等），controller 不再回写 spec；现有 `MachineConfigSlotReclaimStatus` 并入其 phase 子状态。
 - **参考**：DCS/HCS 的 `PersistentDiskStatus` 均已在 status，字段结构可参照。
-- **验收**：spec 只含用户声明字段；升级不误删盘；attach/detach/reclaim 单测。
+- **存量迁移**：分两个 release——先加 status 字段并保留 spec 旧字段，controller 每轮幂等 backfill（status 缺记录时用 spec 值播种），下一版本再从 CRD 删除 spec 字段。不可同版本删除，否则 pruning 会在 backfill 前裁掉 `volumePath/diskUUID`。兜底：数据在 `.vmdk` 上，指针可按 unitNumber 从 vCenter 重发现。
+- **验收**：spec 只含用户声明字段；存量对象 backfill 后 status 完整；attach/detach/reclaim 单测。
 
-### P2-2　govmomi 控制面 LB/VIP（#13）——⏸ 暂缓
+### P2-2　govmomi 控制面 LB/VIP（#19）——⏸ 暂缓
 
 自建 VIP 后续平台级统一改造，本项不单独推进，待统一方案评审。现状留档：`VSphereClusterSpec` 只有 `controlPlaneEndpoint`；govmomi 模式 VIP 由模板中的 kube-vip static pod 承担；supervisor 模式已有 `LoadBalancerReady`。
 
-### P2-3　BootstrapReady condition（#14）
+### P2-3　BootstrapReady condition（#20）
 
-- **设计**：新增 `BootstrapReady` condition，用不同 reason 区分 secret 缺失、内容缺失、读取失败、投递失败。规范的投递 hash 要求对 CAPV 大部分不适用（见第五章 N5），checksum 仅作可选诊断信息。
-- **验收**：用户能区分 bootstrap 未就绪、VM 未创建完、投递失败。
+- **背景**：CAPV 交付 bootstrap 数据的方式是——clone 虚拟机时把 CABPK 生成的 cloud-init 用户数据写进 VM 的 guestinfo 属性（`guestinfo.userdata` 等），VM 首次开机由 cloud-init 从 guestinfo 读取执行。下文「写入 guestinfo 失败」即这一步失败。
+- **现状**：bootstrap 异常不会丢，但 reason 错位。四类失败场景中仅「CAPI 未产出 secret」有准确 reason，其余三类均落 `CloningFailed`，与真实 clone 失败不可区分，真实原因只在 message 里（v1beta2 侧更粗，后三类统一为 `NotProvisioned`）。
+- **设计**：新增 `BootstrapReady` condition（v1beta1 与 v1beta2 两组常量，加 `condition_consts.go`），在各场景的错误出口设值，reason 与场景一一对应：
 
-### P2-4　升级 `maxSurge: 0` 约束（#12）
+  | 场景 | 现状 reason | 改后 reason | 检测位置 |
+  |---|---|---|---|
+  | CAPI 未产出 secret | `WaitingForBootstrapData`（准确） | 沿用现名 | `vspheremachine_controller.go:557` |
+  | secret 读取失败 | `CloningFailed`（实际发生在 clone 前） | `BootstrapSecretGetFailed` | `getBootstrapData`（`service.go:135`） |
+  | secret `value` 键缺失 | 同上 | `BootstrapSecretContentInvalid` | 同上 |
+  | 写入 guestinfo 失败 | `CloningFailed`（与真 clone 失败同出口） | `BootstrapDeliveryFailed` | clone 出口按错误类型分流（`service.go:152`） |
 
-- **设计**：infra template 引用 `machineConfigPoolRef` 时，KCP/MD webhook 默认要求 `maxSurge: 0`；允许 surge 时 precheck 需确认有足够空闲槽位。位置：`internal/webhooks/{kubeadmcontrolplane,machinedeployment}.go`。
-- **验收**：未扩容 ConfigPool 时无法绕过固定 IP 约束；webhook 单测。
+  - **落点**：condition 定义在 `VSphereVM`（后三类的检测点，`BootstrapRef` 在其 spec 上），经既有 `SetMirror` 链（`vimmachine.go:118-121`）镜像到 `VSphereMachine`；「未产出」场景发生在 VSphereVM 创建前，直接落 `VSphereMachine`。用户统一在 `VSphereMachine` 上查看。
+  - **Ready 汇总**：两侧 `Ready` summary 名单（`vspherevm_controller.go:200-217`、`vspheremachine_controller.go:295-303`）加入 `BootstrapReady`；v1beta2 侧列入 `IgnoreTypesIfMissing`（bootstrap 就绪后条件可清除）。
+  - **边界**：guestinfo 写入不是独立步骤，bootstrap 数据作为 clone 请求的参数一次性提交，因此写入失败只能在 clone 出口按错误类型区分，精确性有限。规范的投递 hash 要求对 CAPV 大部分不适用，checksum 仅作可选诊断信息。
+- **验收**：四类场景在 `VSphereMachine` 上有可区分的 reason；bootstrap 类失败不再落入 `CloningFailed`。
 
-### P2-5　`spec.clusterModules` observed state（#18）
+### P2-4　升级 `maxSurge: 0` 约束（#21）
 
-- **设计**：属上游既有设计（见第五章 N3），短期在 capabilities 标注为上游兼容例外、字段由 controller 管理；中长期跟随上游演进评估迁移。
-- **验收**：文档明确该字段由 controller 管理，用户不应手改。
+- **现状**：KCP/MD webhook 已校验 pool 的独占引用（引用的池存在、未被其他 KCP/MD 占用），但不校验升级策略。固定 IP 场景下这是缺口：`maxSurge≥1` 的滚动升级先建新机再删旧机，新机需要额外空闲槽位拿固定 IP，池满时升级会卡在等 IP。
+- **设计**：infra template 引用 `machineConfigPoolRef` 时，KCP/MD webhook 默认要求 `maxSurge: 0`（先删后建，复用刚释放的槽位）；允许 surge 时 precheck 需确认有足够空闲槽位。位置：`internal/webhooks/{kubeadmcontrolplane,machinedeployment}.go`。
+- **验收**：未扩容 MachineConfigPool 时无法绕过固定 IP 约束；webhook 单测。
 
 ---
 
@@ -137,80 +190,36 @@ chart 已具备，本项为质量补强：
 
 | Issue | 主题 | 仓库 | 优先级 | 依赖 | 规模 |
 |:---:|---|:---:|:---:|---|:---:|
-| A | ConfigPool status 计数器 + printcolumn | [源] | P1 | — | 小 |
+| A | MachineConfigPool status 计数器 + printcolumn | [源] | P1 | — | 小 |
 | B | Pool 级 conditions + v1beta2 | [源] | P1 | — | 中 |
-| C | ConfigPool validation | [源] | P1 | — | 中 |
+| C | MachineConfigPool validation | [源] | P1 | — | 中 |
 | D | ACP 文档四件套 + README fork 基线 | [交]+[源] | P1 | — | 中 |
 | E | 默认固定 IP 模板 | [源] | P1 | 可与 J 合并 | 小 |
-| F | 交付质量补强 | [交] | P1 | — | 小 |
+| F | 交付仓库去明文凭据 | [交] | P1 | — | 小 |
 | G | 持久盘 observed state 迁 status | [源] | P2 | — | 中 |
 | H | govmomi LB/VIP | [源] | ⏸ 暂缓 | 自建 VIP 统一改造 | 大 |
 | I | BootstrapReady condition | [源] | P2 | — | 小 |
 | J | maxSurge: 0 约束 + precheck | [源] | P2 | E | 小 |
-| K | clusterModules 文档化/迁移评估 | [源] | P2 | D | 小 |
-| L | Pool 槽位非持久化数据盘 | [源] | P1 | C 可并 | 中 |
+| K | Pool 槽位非持久化数据盘 | [源] | P1 | C 可并 | 中 |
+| L | 容灾 encryptionProviderConfigRef | [源] | P1 | — | 小 |
+| M | VM 开机仅在创建时执行一次 | [源] | P1 | — | 小 |
 
-**推进顺序**：A/B/C/L → D/F → E/J → G/I → K。
+**推进顺序**：A/B/C/K/L/M → D/F → E/J → G/I。
 
 **通用完成标准**：`make manifests`/`make generate` 无 diff；`go test ./...` 通过；新增/变更有单测；capabilities 与代码一致；CRD 变更同步交付仓库 chart。
 
 ---
 
-## 五、规范条款对 CAPV 的不适用项
-
-本章回答：规范（草案 v0.1）中哪些条款对 CAPV 不适用或需要裁剪，及其原因。根因是同一个：**规范以从零新建 provider 为默认视角，而 CAPV 是上游 fork**——上游的 CRD 字段、API group、目录结构不是本仓库可自由重设的，强行对齐会带来 rebase 冲突和 conversion 负担。规范在「仓库结构-允许例外」中已认可这一例外，本章将其落到具体条款。
-
-| # | 规范条款 | 适用性 | 替代做法 |
-|:---:|---|:---:|---|
-| N1 | 交付产物与源码同仓 | 不适用 | 交付仓库承接，两仓交叉引用 |
-| N2 | `XxxClusterSpec` 建模 `networkType`、`encryptionProviderConfigRef` | 不适用 | 平台约定 annotation + capabilities 文档化 |
-| N3 | spec/status 分离追溯到上游既有字段 | 不适用（追溯） | capabilities 标注上游兼容例外 |
-| N4 | 单一 API group、仅 v1beta1 | 不适用 | supervisor group 与历史版本标注未验收 |
-| N5 | bootstrap 投递 hash 防重复写入 | 大部分不适用 | 只补 `BootstrapReady` condition |
-| N6 | ConfigPool 校验「subnet 引用合法」 | 部分不适用 | webhook 格式校验 + reconcile 期 condition |
-| N7 | 「不透传 IaaS 全量参数」追溯执行 | 不适用（追溯） | capabilities 分层标注能力状态 |
-
-LB/VIP 相关条款（「LoadBalancer/VIP 生命周期」章节）不在本章讨论范围，理由见文首前提 2。
-
-### N1　交付产物与源码同仓
-
-规范要求 `chart/`、`.build/`、`docs/` 与源码同仓。本仓库为维持 rebase 能力保留上游目录结构，交付产物在交付仓库维护。规范「允许例外」明确支持这种形态：「如果基于上游 CAPV 这类大型 provider，可保留上游目录，但必须补齐 ACP 交付和能力说明文档」。例外豁免的是目录形态，不豁免产物本身——文档（P1-4）与交付质量（P1-6）义务保留。
-
-### N2　`XxxClusterSpec` 建模 `networkType`、`encryptionProviderConfigRef`
-
-`VSphereClusterSpec` 是上游 CRD，fork 新增 spec 字段需长期 carry patch 并维护 conversion，且无法回流上游。kube-ovn 适用性判断已有实现路径——CAPI Cluster 的 annotation `cpaas.io/network-type`，属于规范 kube-ovn 章节允许的「平台约定资源」输入；`encryptionProviderConfigRef` 面向灾备，vSphere 当前无该产品场景，按规范「无场景不建模」的原则不应新增。annotation 约定需写入 capabilities（P1-4）；未来灾备覆盖 vSphere 时再按规范流程建模。
-
-### N3　spec/status 分离追溯到上游既有字段
-
-`spec.clusterModules.moduleUUID` 由 controller 回写，不符合「spec=期望、status=observed」，但这是上游既有设计：单方面迁移到 status 需要改上游 CRD、做 conversion、处理存量对象，并在之后每次 rebase 时与上游冲突，成本大于收益。豁免仅限上游既有字段——Alauda 自有的持久盘回填字段仍适用规范（P2-1 成立）。处理方式见 P2-5。
-
-### N4　单一 API group、仅 v1beta1
-
-CAPV 上游自带第二 group `vmware.infrastructure.cluster.x-k8s.io`（supervisor 模式）和历史版本 `v1alpha3`/`v1alpha4` 及 conversion webhook。ACP 不使用 supervisor 模式，但删除这些 API 会使 fork 大幅偏离上游，而保留它们对 ACP 无影响（不部署对应 controller 即可）。规范要求的「第二组 API 必须说明原因」由 capabilities 承接：标注为「代码存在但未正式验收路径」（P1-4）。
-
-### N5　bootstrap 投递 hash 防重复写入
-
-该条款针对可重复推送的投递机制（如 Elemental plan）：controller 每次 reconcile 都可能重新投递，需要 hash 避免重复写入。CAPV 的 bootstrap userdata 走 guestinfo，仅在 createVM 时一次性写入（`pkg/services/govmomi/service.go:135-150`），且 CAPI 合同规定 bootstrap data 对单个 Machine 不可变，变更靠重建 Machine——不存在重复写入路径。条款中「secret 缺失等待并写 condition、投递失败写 condition」的部分仍适用，落点 P2-3。
-
-### N6　ConfigPool 校验「subnet 引用合法」
-
-DCS/HCS 的 subnet 是平台侧可查询的资源对象，webhook 可校验引用存在性；vSphere 的网络是 port group 名称字符串，没有 subnet 资源，校验存在性需在 admission webhook 中同步调 vCenter——既拖慢 admission，又在 vCenter 不可达时阻塞所有 ConfigPool 写操作。裁剪为：webhook 只做格式校验（P1-3），存在性在 reconcile 期校验并以 condition 暴露（P1-2）。
-
-### N7　「不透传 IaaS 全量参数」追溯执行
-
-上游 CAPV 的 API 已暴露超出 ACP 场景的参数（`CloneMode`、`CustomVMXKeys`、`PciDevices`、`hardwareVersion` 等，见 `apis/v1beta1/types.go`）。这些是上游既有 API surface，删除会破坏 CRD 兼容性。该条款对 fork 只能前瞻性适用（Alauda 新增字段遵守）。替代机制即规范自身给出的 capabilities 分层：验收过的标 supported，上游存在但未验收的如实标注，明确不做的标 non-goal（P1-4）。评审时「上游字段多」本身不应记为缺陷。
-
----
-
-## 六、附录：代码位置与参考
+## 五、附录：代码位置与参考
 
 **源码仓库关键位置**
 
 | 主题 | 位置 |
 |---|---|
-| ConfigPool 类型/status/webhook | `apis/v1beta1/vspheremachineconfigpool_types.go`、`internal/webhooks/vspheremachineconfigpool.go` |
+| MachineConfigPool 类型/status/webhook | `apis/v1beta1/vspheremachineconfigpool_types.go`、`internal/webhooks/vspheremachineconfigpool.go` |
 | Cluster/Machine 类型与 conditions | `apis/v1beta1/{vspherecluster,vspheremachine}_types.go`、`condition_consts.go` |
 | 地址 ready | `pkg/services/vimmachine.go:279-343` |
+| VM 开机 reconcile | `pkg/services/govmomi/service.go:225`（调用）、`:438`（`reconcilePowerState`） |
 | pause/deletion 顺序 | `controllers/vspherecluster_reconciler.go:137-143`、`vspheremachine_controller.go:327-333`、`vspherevm_controller.go:264-426`、`vmware/vspherecluster_reconciler.go:124-131` |
 | kube-ovn AppRelease | `controllers/vspherecluster_reconciler.go:363-476` |
 | 槽位复用/持久盘检查 | `controllers/vspherevm_controller.go:490-549` |
