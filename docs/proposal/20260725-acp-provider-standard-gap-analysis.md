@@ -47,6 +47,7 @@ CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题
 | 17 | README 说明 fork 基线与兼容矩阵 | 仍为上游 README，无 baseline/patch 范围/版本矩阵 | 🟡 | P1-4 |
 | 18 | spec 不承载 observed state | controller 回写 `spec.clusterModules.moduleUUID`（`clustermodule_reconciler.go:166`），为上游既有设计 | 🟡 | P2-5 |
 | 19 | `XxxClusterSpec` 建模 `networkType` 等字段 | 未建模；kube-ovn 适用性靠 CAPI Cluster annotation `cpaas.io/network-type` 判断（`vspherecluster_reconciler.go:365`） | 🟡 | P1-4（文档化） |
+| 20 | 数据盘区分 ephemeral/persistent 两类 | Pool 槽位仅有 `persistentDisks`；非持久盘只有上游模板级 `dataDisks`（仅 attach，无格式化挂载，模板内同构），槽位级无法声明 | 🟡 | P2-6 |
 
 ---
 
@@ -122,6 +123,12 @@ chart 已具备，本项为质量补强：
 - **设计**：属上游既有设计（见第五章 N3），短期在 capabilities 标注为上游兼容例外、字段由 controller 管理；中长期跟随上游演进评估迁移。
 - **验收**：文档明确该字段由 controller 管理，用户不应手改。
 
+### P2-6　Pool 槽位非持久化数据盘（#20）
+
+- **现状**：非持久盘只能通过上游模板级 `dataDisks` 表达（`apis/v1beta1/types.go:205-210`）：仅 name/sizeGiB/provisioningMode，只 attach 不格式化挂载，且模板内所有节点同构。槽位级差异化的非持久盘（每节点不同大小/挂载点、随 VM 删除重建）无法声明。DCS/HCS 的 pool 槽位同样只有持久盘。
+- **设计**：Pool 槽位 `configs[]` 增加非持久盘声明（如 `ephemeralDisks`，字段对齐 `PersistentDisk` 的 sizeGiB/datastore/unitNumber/mountPath/fsFormat，但无 reclaim/保留语义）；创建 VM 时随 clone attach，复用持久盘现有的格式化/挂载管线；删除 VM 时随 VM 清理，不进入槽位释放门禁。与模板级 `dataDisks` 的分工写入 capabilities：模板级用于同构 attach-only 盘，槽位级用于差异化且需挂载的盘。
+- **验收**：槽位声明的非持久盘随 VM 创建/删除；升级重建后按声明重建空盘；unitNumber 与持久盘不冲突（validation 并入 P1-3）。
+
 ---
 
 ## 四、落地路线图
@@ -141,8 +148,9 @@ chart 已具备，本项为质量补强：
 | I | BootstrapReady condition | [源] | P2 | — | 小 |
 | J | maxSurge: 0 约束 + precheck | [源] | P2 | E | 小 |
 | K | clusterModules 文档化/迁移评估 | [源] | P2 | D | 小 |
+| L | Pool 槽位非持久化数据盘 | [源] | P2 | C 可并 | 中 |
 
-**推进顺序**：A/B/C → D/F → E/J → G/I → K。
+**推进顺序**：A/B/C → D/F → E/J → G/I/L → K。
 
 **通用完成标准**：`make manifests`/`make generate` 无 diff；`go test ./...` 通过；新增/变更有单测；capabilities 与代码一致；CRD 变更同步交付仓库 chart。
 
