@@ -12,9 +12,9 @@
 
 ## 一、结论
 
-CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题（pause/deletion 顺序、地址 ready、kube-ovn 状态、槽位复用）已修复，交付产物已在交付仓库具备。剩余差距集中在三块，也是建议的推进顺序：
+CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题（pause/deletion 顺序、地址 ready、kube-ovn 状态、槽位复用）已修复，交付产物已在交付仓库具备。剩余差距集中在三块（推进顺序见第四章）：
 
-1. **ConfigPool 的 status/conditions/validation**（P1-1/2/3）：缺容量计数器，Pool 级 condition 不全，webhook 校验覆盖少。
+1. **ConfigPool 补齐**（P1-1/2/3/7）：缺容量计数器，Pool 级 condition 不全，webhook 校验覆盖少，槽位缺非持久化数据盘声明。
 2. **ACP 文档与默认固定 IP 模板**（P1-4/5）：capabilities 等四件套缺失，默认模板仍走 DHCP。
 3. **交付仓库质量**（P1-6）：CRD 同步机制待确认，values.yaml 含明文凭据，缺 render 校验。
 
@@ -47,7 +47,7 @@ CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题
 | 17 | README 说明 fork 基线与兼容矩阵 | 仍为上游 README，无 baseline/patch 范围/版本矩阵 | 🟡 | P1-4 |
 | 18 | spec 不承载 observed state | controller 回写 `spec.clusterModules.moduleUUID`（`clustermodule_reconciler.go:166`），为上游既有设计 | 🟡 | P2-5 |
 | 19 | `XxxClusterSpec` 建模 `networkType` 等字段 | 未建模；kube-ovn 适用性靠 CAPI Cluster annotation `cpaas.io/network-type` 判断（`vspherecluster_reconciler.go:365`） | 🟡 | P1-4（文档化） |
-| 20 | 数据盘区分 ephemeral/persistent 两类 | Pool 槽位仅有 `persistentDisks`；非持久盘只有上游模板级 `dataDisks`（仅 attach，无格式化挂载，模板内同构），槽位级无法声明 | 🟡 | P2-6 |
+| 20 | 数据盘区分 ephemeral/persistent 两类 | Pool 槽位仅有 `persistentDisks`；非持久盘只有上游模板级 `dataDisks`（仅 attach，无格式化挂载，模板内同构），槽位级无法声明 | 🟡 | P1-7 |
 
 ---
 
@@ -65,11 +65,11 @@ P1 = 验收/上架必需；P2 = 随产品节奏推进。
 
 - **设计**：新增规范建议的 Pool 级 condition（`Ready/MembersValid/MembersUnique/SlotAvailable/PersistentDisksReady`），并补 v1beta2 conditions 字段与 getter/setter（对齐本仓库 Cluster/Machine 已有做法）。
 - **参考**：DCS/HCS 在 `api/v1beta1/conditions*.go` 集中定义 condition，reason 用 UpperCamelCase。
-- **验收**：重复 hostname/IP、无可用槽位、盘未就绪等场景有对应 condition。
+- **验收**：重复 hostname/IP、无可用槽位、盘未就绪、引用的网络不存在（见第五章 N6）等场景有对应 condition。
 
 ### P1-3　ConfigPool validation 补齐（#9）
 
-- **设计**：基础约束用 CRD marker（`configs` MinItems=1、`sizeGiB` minimum、`unitNumber` 范围）；跨字段/跨资源约束用 webhook（hostname/primary IP/IPv6 唯一，持久盘 name/unitNumber 唯一且排除 7，已分配槽位关键字段 immutable，跨 pool 重复检查，删除时有 allocated slot 或未清理盘则 finalizer 阻止）。网络名称只做格式校验，存在性在 reconcile 期校验（见第五章 N6）。
+- **设计**：基础约束用 CRD marker（`configs` MinItems=1、`sizeGiB` minimum、`unitNumber` 范围）；跨字段/跨资源约束用 webhook（hostname/primary IP/IPv6 唯一，数据盘（持久与非持久，见 P1-7）name/unitNumber 唯一且排除 7，已分配槽位关键字段 immutable，跨 pool 重复检查，删除时有 allocated slot 或未清理盘则 finalizer 阻止）。网络名称只做格式校验，存在性在 reconcile 期校验（见第五章 N6）。
 - **验收**：create/update/delete validation 单测齐全。
 
 ### P1-4　ACP 文档四件套 + README fork 基线（#16、#17、#19）
@@ -98,6 +98,12 @@ chart 已具备，本项为质量补强：
 
 - **验收**：CRD 与源码无 diff；values 无明文凭据；lint/render 通过。
 
+### P1-7　Pool 槽位非持久化数据盘（#20）
+
+- **现状**：非持久盘只能通过上游模板级 `dataDisks` 表达（`apis/v1beta1/types.go:205-210`）：仅 name/sizeGiB/provisioningMode，只 attach 不格式化挂载，且模板内所有节点同构。槽位级差异化的非持久盘（每节点不同大小/挂载点、随 VM 删除重建）无法声明。DCS/HCS 的 pool 槽位同样只有持久盘。
+- **设计**：Pool 槽位 `configs[]` 增加非持久盘声明（如 `ephemeralDisks`，字段对齐 `PersistentDisk` 的 sizeGiB/datastore/unitNumber/mountPath/fsFormat，但无 reclaim/保留语义）；创建 VM 时随 clone attach，复用持久盘现有的格式化/挂载管线；删除 VM 时随 VM 清理，不进入槽位释放门禁。与模板级 `dataDisks` 的分工写入 capabilities：模板级用于同构 attach-only 盘，槽位级用于差异化且需挂载的盘。
+- **验收**：槽位声明的非持久盘随 VM 创建/删除；升级重建后按声明重建空盘；unitNumber 与持久盘不冲突（validation 并入 P1-3）。
+
 ### P2-1　持久盘 observed state 迁到 status（#10）
 
 - **设计**：新增 `status.persistentDiskStatus`（绑定 hostname/slot，含 volumePath/diskUUID、phase、owner machine、attached VM、lastError 等），controller 不再回写 spec；现有 `MachineConfigSlotReclaimStatus` 并入其 phase 子状态。
@@ -123,12 +129,6 @@ chart 已具备，本项为质量补强：
 - **设计**：属上游既有设计（见第五章 N3），短期在 capabilities 标注为上游兼容例外、字段由 controller 管理；中长期跟随上游演进评估迁移。
 - **验收**：文档明确该字段由 controller 管理，用户不应手改。
 
-### P2-6　Pool 槽位非持久化数据盘（#20）
-
-- **现状**：非持久盘只能通过上游模板级 `dataDisks` 表达（`apis/v1beta1/types.go:205-210`）：仅 name/sizeGiB/provisioningMode，只 attach 不格式化挂载，且模板内所有节点同构。槽位级差异化的非持久盘（每节点不同大小/挂载点、随 VM 删除重建）无法声明。DCS/HCS 的 pool 槽位同样只有持久盘。
-- **设计**：Pool 槽位 `configs[]` 增加非持久盘声明（如 `ephemeralDisks`，字段对齐 `PersistentDisk` 的 sizeGiB/datastore/unitNumber/mountPath/fsFormat，但无 reclaim/保留语义）；创建 VM 时随 clone attach，复用持久盘现有的格式化/挂载管线；删除 VM 时随 VM 清理，不进入槽位释放门禁。与模板级 `dataDisks` 的分工写入 capabilities：模板级用于同构 attach-only 盘，槽位级用于差异化且需挂载的盘。
-- **验收**：槽位声明的非持久盘随 VM 创建/删除；升级重建后按声明重建空盘；unitNumber 与持久盘不冲突（validation 并入 P1-3）。
-
 ---
 
 ## 四、落地路线图
@@ -148,9 +148,9 @@ chart 已具备，本项为质量补强：
 | I | BootstrapReady condition | [源] | P2 | — | 小 |
 | J | maxSurge: 0 约束 + precheck | [源] | P2 | E | 小 |
 | K | clusterModules 文档化/迁移评估 | [源] | P2 | D | 小 |
-| L | Pool 槽位非持久化数据盘 | [源] | P2 | C 可并 | 中 |
+| L | Pool 槽位非持久化数据盘 | [源] | P1 | C 可并 | 中 |
 
-**推进顺序**：A/B/C → D/F → E/J → G/I/L → K。
+**推进顺序**：A/B/C/L → D/F → E/J → G/I → K。
 
 **通用完成标准**：`make manifests`/`make generate` 无 diff；`go test ./...` 通过；新增/变更有单测；capabilities 与代码一致；CRD 变更同步交付仓库 chart。
 
