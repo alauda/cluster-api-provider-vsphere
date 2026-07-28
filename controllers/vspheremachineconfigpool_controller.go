@@ -610,47 +610,18 @@ func (r machineConfigPoolReconciler) crossPoolConflicts(ctx context.Context, poo
 		return false, false, ""
 	}
 
-	ownHostnames, ownIPs := poolHostnamesAndIPs(pool)
-	for i := range others.Items {
-		other := &others.Items[i]
-		if other.Name == pool.Name || other.Spec.ClusterRef.Name != pool.Spec.ClusterRef.Name {
-			continue
+	// Hostname collisions take precedence over IP for the condition reason.
+	conflicts := services.CrossPoolUniquenessConflicts(pool, others.Items)
+	for _, c := range conflicts {
+		if c.Field == "hostname" {
+			return true, dupIP, "hostname " + c.Value + " also used by pool " + c.OtherPool
 		}
-		otherHostnames, otherIPs := poolHostnamesAndIPs(other)
-		for h := range otherHostnames {
-			if _, ok := ownHostnames[h]; ok {
-				return true, dupIP, "hostname " + h + " also used by pool " + other.Name
-			}
-		}
-		for ip := range otherIPs {
-			if _, ok := ownIPs[ip]; ok {
-				dupIP = true
-				msg = "primary IP " + ip + " also used by pool " + other.Name
-			}
-		}
+	}
+	for _, c := range conflicts {
+		dupIP = true
+		msg = "primary IP " + c.Value + " also used by pool " + c.OtherPool
 	}
 	return dupHostname, dupIP, msg
-}
-
-// poolHostnamesAndIPs returns the set of hostnames and primary IP/IPv6 addresses declared by a pool.
-func poolHostnamesAndIPs(pool *infrav1.VSphereMachineConfigPool) (hostnames map[string]struct{}, ips map[string]struct{}) {
-	hostnames = map[string]struct{}{}
-	ips = map[string]struct{}{}
-	for i := range pool.Spec.Configs {
-		slot := &pool.Spec.Configs[i]
-		if slot.Hostname != "" {
-			hostnames[slot.Hostname] = struct{}{}
-		}
-		if slot.Network != nil {
-			if slot.Network.Primary.IP != "" {
-				ips[slot.Network.Primary.IP] = struct{}{}
-			}
-			if slot.Network.Primary.IPv6 != "" {
-				ips[slot.Network.Primary.IPv6] = struct{}{}
-			}
-		}
-	}
-	return hostnames, ips
 }
 
 // setPoolReadySummary computes the pool's Ready condition (v1beta1 and v1beta2)

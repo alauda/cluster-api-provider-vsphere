@@ -163,6 +163,7 @@ type PersistentDisk struct {
 	// Name is the disk name.
 	Name string `json:"name"`
 	// SizeGiB is the disk size.
+	// +kubebuilder:validation:Minimum=1
 	SizeGiB int32 `json:"sizeGiB"`
 	// Datastore is the vSphere datastore name.
 	// +optional
@@ -174,6 +175,9 @@ type PersistentDisk struct {
 	// UnitNumber is the SCSI unit number for the disk (0-15, excluding 7).
 	// This ensures consistent disk ordering across VM recreations.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=15
+	// +kubebuilder:validation:XValidation:rule="self != 7",message="unit number 7 is reserved for the SCSI controller"
 	UnitNumber *int32 `json:"unitNumber,omitempty"`
 
 	// MountPath is the mount path inside the VM guest OS (e.g., "/var/lib/etcd").

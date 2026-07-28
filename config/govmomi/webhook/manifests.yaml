@@ -175,6 +175,7 @@ webhooks:
     operations:
     - CREATE
     - UPDATE
+    - DELETE
     resources:
     - vspheremachineconfigpools
   sideEffects: None

@@ -923,6 +923,137 @@ func TestValidateSlotFields(t *testing.T) {
 	})
 }
 
+func TestCrossPoolUniquenessConflicts(t *testing.T) {
+	poolWith := func(name, clusterName string, slots ...infrav1.MachineConfigSlot) infrav1.VSphereMachineConfigPool {
+		return infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: clusterName},
+				Configs:    slots,
+			},
+		}
+	}
+	slot := func(host, ip string) infrav1.MachineConfigSlot {
+		s := infrav1.MachineConfigSlot{Hostname: host}
+		if ip != "" {
+			s.Network = &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{IP: ip}}
+		}
+		return s
+	}
+
+	t.Run("no clusterRef yields no conflicts", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := poolWith("p1", "", slot("h1", "10.0.0.1"))
+		other := poolWith("p2", "", slot("h1", "10.0.0.1"))
+		g.Expect(CrossPoolUniquenessConflicts(&pool, []infrav1.VSphereMachineConfigPool{other})).To(BeEmpty())
+	})
+
+	t.Run("hostname and IP collide within the same cluster", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := poolWith("p1", "cluster-a", slot("h1", "10.0.0.1"), slot("h2", "10.0.0.2"))
+		other := poolWith("p2", "cluster-a", slot("h1", "10.0.0.9"), slot("hx", "10.0.0.2"))
+		conflicts := CrossPoolUniquenessConflicts(&pool, []infrav1.VSphereMachineConfigPool{other})
+		g.Expect(conflicts).To(HaveLen(2))
+		g.Expect(conflicts[0]).To(Equal(CrossPoolConflict{ConfigIndex: 0, Field: "hostname", Value: "h1", OtherPool: "p2"}))
+		g.Expect(conflicts[1]).To(Equal(CrossPoolConflict{ConfigIndex: 1, Field: "ip", Value: "10.0.0.2", OtherPool: "p2"}))
+	})
+
+	t.Run("different cluster or namespace does not conflict", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := poolWith("p1", "cluster-a", slot("h1", "10.0.0.1"))
+		otherCluster := poolWith("p2", "cluster-b", slot("h1", "10.0.0.1"))
+		otherNs := poolWith("p3", "cluster-a", slot("h1", "10.0.0.1"))
+		otherNs.Namespace = "elsewhere"
+		g.Expect(CrossPoolUniquenessConflicts(&pool, []infrav1.VSphereMachineConfigPool{otherCluster, otherNs})).To(BeEmpty())
+	})
+
+	t.Run("the pool does not conflict with itself", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := poolWith("p1", "cluster-a", slot("h1", "10.0.0.1"))
+		g.Expect(CrossPoolUniquenessConflicts(&pool, []infrav1.VSphereMachineConfigPool{pool})).To(BeEmpty())
+	})
+}
+
+func TestValidateAllocatedSlotsImmutable(t *testing.T) {
+	int32Ptr := func(v int32) *int32 { return &v }
+	allocatedPool := func() *infrav1.VSphereMachineConfigPool {
+		return &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "h1",
+					Network:  &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{IP: "10.0.0.1", IPv6: "fd00::1"}},
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "etcd", SizeGiB: 20, UnitNumber: int32Ptr(1), MountPath: "/var/lib/etcd"},
+					},
+				}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "h1", State: infrav1.MachineConfigSlotStateInUse},
+				},
+			},
+		}
+	}
+
+	t.Run("no allocated slots means no immutability errors", func(t *testing.T) {
+		g := NewWithT(t)
+		oldPool := allocatedPool()
+		oldPool.Status.ConfigStatuses[0].State = infrav1.MachineConfigSlotStateAvailable
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Configs[0].Network.Primary.IP = "10.0.0.99"
+		g.Expect(ValidateAllocatedSlotsImmutable(oldPool, newPool)).To(BeEmpty())
+	})
+
+	t.Run("unchanged allocated slot passes", func(t *testing.T) {
+		g := NewWithT(t)
+		oldPool := allocatedPool()
+		g.Expect(ValidateAllocatedSlotsImmutable(oldPool, oldPool.DeepCopy())).To(BeEmpty())
+	})
+
+	t.Run("rejects removing an allocated slot", func(t *testing.T) {
+		g := NewWithT(t)
+		oldPool := allocatedPool()
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Configs = nil
+		errs := ValidateAllocatedSlotsImmutable(oldPool, newPool)
+		g.Expect(errs).To(HaveLen(1))
+		g.Expect(errs[0].Detail).To(ContainSubstring("cannot remove allocated slot"))
+	})
+
+	t.Run("rejects changing IP, disk size, mountPath and unit number", func(t *testing.T) {
+		g := NewWithT(t)
+		oldPool := allocatedPool()
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Configs[0].Network.Primary.IP = "10.0.0.2"
+		newPool.Spec.Configs[0].PersistentDisks[0].SizeGiB = 40
+		newPool.Spec.Configs[0].PersistentDisks[0].MountPath = "/other"
+		newPool.Spec.Configs[0].PersistentDisks[0].UnitNumber = int32Ptr(3)
+		errs := ValidateAllocatedSlotsImmutable(oldPool, newPool)
+		g.Expect(errs).To(HaveLen(4))
+	})
+
+	t.Run("rejects removing an allocated disk", func(t *testing.T) {
+		g := NewWithT(t)
+		oldPool := allocatedPool()
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Configs[0].PersistentDisks = nil
+		errs := ValidateAllocatedSlotsImmutable(oldPool, newPool)
+		g.Expect(errs).To(HaveLen(1))
+		g.Expect(errs[0].Detail).To(ContainSubstring("cannot remove persistent disk"))
+	})
+
+	t.Run("allows nil to value unitNumber backfill and adding a disk", func(t *testing.T) {
+		g := NewWithT(t)
+		oldPool := allocatedPool()
+		oldPool.Spec.Configs[0].PersistentDisks[0].UnitNumber = nil
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Configs[0].PersistentDisks[0].UnitNumber = int32Ptr(2)
+		newPool.Spec.Configs[0].PersistentDisks = append(newPool.Spec.Configs[0].PersistentDisks,
+			infrav1.PersistentDisk{Name: "data", SizeGiB: 30, UnitNumber: int32Ptr(4)})
+		g.Expect(ValidateAllocatedSlotsImmutable(oldPool, newPool)).To(BeEmpty())
+	})
+}
+
 func TestValidateHostnameUniqueness(t *testing.T) {
 	g := NewWithT(t)
 	pool := &infrav1.VSphereMachineConfigPool{

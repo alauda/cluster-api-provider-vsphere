@@ -18,6 +18,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -150,6 +151,190 @@ func ValidateIPUniqueness(pool *infrav1.VSphereMachineConfigPool) field.ErrorLis
 			} else {
 				seen[entry.val] = struct{}{}
 			}
+		}
+	}
+	return allErrs
+}
+
+// CrossPoolConflict is a single hostname or primary IP/IPv6 collision between a
+// target pool and another pool bound to the same Cluster in the same namespace.
+type CrossPoolConflict struct {
+	// ConfigIndex is the index into the target pool's spec.configs of the
+	// colliding slot.
+	ConfigIndex int
+	// Field is one of "hostname", "ip", "ipv6".
+	Field string
+	// Value is the colliding hostname or address.
+	Value string
+	// OtherPool is the name of the pool that also declares Value.
+	OtherPool string
+}
+
+// CrossPoolUniquenessConflicts returns hostname and primary IP/IPv6 collisions
+// between pool and every other pool in others that is bound to the same Cluster
+// (same spec.clusterRef.name) in the same namespace. It is shared by the P1-3
+// validating webhook (hard admission gate) and the P1-2 MembersUnique condition
+// (best-effort backstop for admission races). Pools are matched by clusterRef so
+// unrelated pools sharing a namespace do not conflict; the target pool is skipped
+// by name. Results are ordered by the target pool's config index for stable
+// output.
+func CrossPoolUniquenessConflicts(pool *infrav1.VSphereMachineConfigPool, others []infrav1.VSphereMachineConfigPool) []CrossPoolConflict {
+	if pool == nil || pool.Spec.ClusterRef.Name == "" {
+		return nil
+	}
+
+	otherHostnames := map[string]string{}
+	otherIPs := map[string]string{}
+	for i := range others {
+		o := &others[i]
+		if o.Name == pool.Name || o.Namespace != pool.Namespace || o.Spec.ClusterRef.Name != pool.Spec.ClusterRef.Name {
+			continue
+		}
+		for j := range o.Spec.Configs {
+			slot := &o.Spec.Configs[j]
+			if slot.Hostname != "" {
+				if _, ok := otherHostnames[slot.Hostname]; !ok {
+					otherHostnames[slot.Hostname] = o.Name
+				}
+			}
+			if slot.Network == nil {
+				continue
+			}
+			for _, ip := range []string{slot.Network.Primary.IP, slot.Network.Primary.IPv6} {
+				if ip == "" {
+					continue
+				}
+				if _, ok := otherIPs[ip]; !ok {
+					otherIPs[ip] = o.Name
+				}
+			}
+		}
+	}
+
+	var conflicts []CrossPoolConflict
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
+		if slot.Hostname != "" {
+			if other, ok := otherHostnames[slot.Hostname]; ok {
+				conflicts = append(conflicts, CrossPoolConflict{ConfigIndex: i, Field: "hostname", Value: slot.Hostname, OtherPool: other})
+			}
+		}
+		if slot.Network == nil {
+			continue
+		}
+		for _, entry := range []struct{ field, val string }{
+			{"ip", slot.Network.Primary.IP},
+			{"ipv6", slot.Network.Primary.IPv6},
+		} {
+			if entry.val == "" {
+				continue
+			}
+			if other, ok := otherIPs[entry.val]; ok {
+				conflicts = append(conflicts, CrossPoolConflict{ConfigIndex: i, Field: entry.field, Value: entry.val, OtherPool: other})
+			}
+		}
+	}
+	return conflicts
+}
+
+// ValidateAllocatedSlotsImmutable forbids destructive edits to slots that are
+// already allocated (InUse or Released) in oldPool's status. Called by the P1-3
+// webhook on update. Allocated slots are matched by hostname (the slot identity).
+// For each allocated slot it forbids: removing the slot entry, changing its
+// primary IP/IPv6, removing an existing persistent disk, and changing an existing
+// disk's sizeGiB, mountPath, or a already-set unitNumber (disks matched by name).
+//
+// Adding disks to an allocated slot is allowed (decision: does not take effect
+// until VM recreation, harmless). unitNumber is only rejected on a
+// concrete→different-concrete change: a nil→value transition is how the
+// controller records the assigned SCSI slot (see ApplyDiskBackfill), and a
+// value→nil clear self-heals because the reconciler re-derives it — blocking
+// either would deadlock the controller's own spec writes.
+func ValidateAllocatedSlotsImmutable(oldPool, newPool *infrav1.VSphereMachineConfigPool) field.ErrorList {
+	var allErrs field.ErrorList
+	if oldPool == nil || newPool == nil {
+		return allErrs
+	}
+
+	allocated := map[string]struct{}{}
+	for i := range oldPool.Status.ConfigStatuses {
+		s := &oldPool.Status.ConfigStatuses[i]
+		if s.State == infrav1.MachineConfigSlotStateInUse || s.State == infrav1.MachineConfigSlotStateReleased {
+			allocated[s.Hostname] = struct{}{}
+		}
+	}
+	if len(allocated) == 0 {
+		return allErrs
+	}
+
+	newSlots := map[string]int{}
+	for i := range newPool.Spec.Configs {
+		newSlots[newPool.Spec.Configs[i].Hostname] = i
+	}
+
+	base := field.NewPath("spec", "configs")
+	// Iterate old spec in declaration order for deterministic error ordering.
+	for i := range oldPool.Spec.Configs {
+		oldSlot := &oldPool.Spec.Configs[i]
+		if _, ok := allocated[oldSlot.Hostname]; !ok {
+			continue
+		}
+		newIdx, ok := newSlots[oldSlot.Hostname]
+		if !ok {
+			allErrs = append(allErrs, field.Forbidden(base, fmt.Sprintf("cannot remove allocated slot %q (InUse/Released)", oldSlot.Hostname)))
+			continue
+		}
+		allErrs = append(allErrs, validateSlotImmutable(base.Index(newIdx), oldSlot, &newPool.Spec.Configs[newIdx])...)
+	}
+	return allErrs
+}
+
+func slotPrimaryIPs(slot *infrav1.MachineConfigSlot) (ip, ipv6 string) {
+	if slot == nil || slot.Network == nil {
+		return "", ""
+	}
+	return slot.Network.Primary.IP, slot.Network.Primary.IPv6
+}
+
+func validateSlotImmutable(slotPath *field.Path, oldSlot, newSlot *infrav1.MachineConfigSlot) field.ErrorList {
+	var allErrs field.ErrorList
+	hostname := oldSlot.Hostname
+
+	oldIP, oldIPv6 := slotPrimaryIPs(oldSlot)
+	newIP, newIPv6 := slotPrimaryIPs(newSlot)
+	if oldIP != newIP {
+		allErrs = append(allErrs, field.Forbidden(slotPath.Child("network", "primary", "ip"),
+			fmt.Sprintf("primary IP is immutable for allocated slot %q: %q → %q", hostname, oldIP, newIP)))
+	}
+	if oldIPv6 != newIPv6 {
+		allErrs = append(allErrs, field.Forbidden(slotPath.Child("network", "primary", "ipv6"),
+			fmt.Sprintf("primary IPv6 is immutable for allocated slot %q: %q → %q", hostname, oldIPv6, newIPv6)))
+	}
+
+	newDisks := map[string]*infrav1.PersistentDisk{}
+	for j := range newSlot.PersistentDisks {
+		newDisks[newSlot.PersistentDisks[j].Name] = &newSlot.PersistentDisks[j]
+	}
+	diskBase := slotPath.Child("persistentDisks")
+	for j := range oldSlot.PersistentDisks {
+		oldDisk := &oldSlot.PersistentDisks[j]
+		newDisk, ok := newDisks[oldDisk.Name]
+		if !ok {
+			allErrs = append(allErrs, field.Forbidden(diskBase,
+				fmt.Sprintf("cannot remove persistent disk %q from allocated slot %q", oldDisk.Name, hostname)))
+			continue
+		}
+		if oldDisk.SizeGiB != newDisk.SizeGiB {
+			allErrs = append(allErrs, field.Forbidden(diskBase.Child("sizeGiB"),
+				fmt.Sprintf("sizeGiB is immutable for disk %q on allocated slot %q: %d → %d", oldDisk.Name, hostname, oldDisk.SizeGiB, newDisk.SizeGiB)))
+		}
+		if oldDisk.MountPath != newDisk.MountPath {
+			allErrs = append(allErrs, field.Forbidden(diskBase.Child("mountPath"),
+				fmt.Sprintf("mountPath is immutable for disk %q on allocated slot %q: %q → %q", oldDisk.Name, hostname, oldDisk.MountPath, newDisk.MountPath)))
+		}
+		if oldDisk.UnitNumber != nil && newDisk.UnitNumber != nil && *oldDisk.UnitNumber != *newDisk.UnitNumber {
+			allErrs = append(allErrs, field.Forbidden(diskBase.Child("unitNumber"),
+				fmt.Sprintf("unitNumber is immutable once set for disk %q on allocated slot %q: %d → %d", oldDisk.Name, hostname, *oldDisk.UnitNumber, *newDisk.UnitNumber)))
 		}
 	}
 	return allErrs

@@ -235,6 +235,7 @@ spec:
                           sizeGiB:
                             description: SizeGiB is the disk size.
                             format: int32
+                            minimum: 1
                             type: integer
                           storagePolicy:
                             description: StoragePolicy is the vSphere storage policy
@@ -245,7 +246,12 @@ spec:
                               UnitNumber is the SCSI unit number for the disk (0-15, excluding 7).
                               This ensures consistent disk ordering across VM recreations.
                             format: int32
+                            maximum: 15
+                            minimum: 0
                             type: integer
+                            x-kubernetes-validations:
+                            - message: unit number 7 is reserved for the SCSI controller
+                              rule: self != 7
                           volumePath:
                             description: |-
                               VolumePath is backfilled by the controller after the disk is created.
