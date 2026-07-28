@@ -135,6 +135,8 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - crd.nsx.vmware.com

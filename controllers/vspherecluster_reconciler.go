@@ -276,6 +276,12 @@ func (r *clusterReconciler) reconcileDelete(ctx context.Context, clusterCtx *cap
 func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
+	// Configure CoreDNS before the infrastructure cluster becomes Ready so
+	// kubeadm uses the selected repository during initial bootstrap.
+	if err := r.reconcileKubeadmControlPlaneSystemComponents(ctx, clusterCtx); err != nil {
+		return reconcile.Result{}, err
+	}
+
 	// Reconcile failure domains.
 	ok, err := r.reconcileDeploymentZones(ctx, clusterCtx)
 	if err != nil {
@@ -354,7 +360,7 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 		return result, err
 	}
 
-	return reconcile.Result{}, nil
+	return r.reconcileWorkloadSystemComponentRepositories(ctx, clusterCtx)
 }
 
 func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {
@@ -366,7 +372,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 
 	targetVersion := cluster.Annotations["cpaas.io/kube-ovn-version"]
 	joinCIDR := cluster.Annotations["cpaas.io/kube-ovn-join-cidr"]
-	registry := cluster.Annotations["cpaas.io/registry-address"]
+	registry := cluster.Annotations[registryAddressAnnotation]
 	if registry == "" {
 		return reconcile.Result{}, fmt.Errorf("cpaas.io/registry-address annotation is required to deploy kube-ovn")
 	}
@@ -386,6 +392,10 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		if !found || targetVersion == "" {
 			return reconcile.Result{}, fmt.Errorf("kube-ovn module plugin latestVersion is empty")
 		}
+	}
+	chartName, err := kubeOvnChartNameForVersion(targetVersion)
+	if err != nil {
+		return reconcile.Result{}, err
 	}
 
 	podCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, true)
@@ -413,7 +423,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{}, err
 	}
 
-	appRelease := buildKubeOvnAppRelease(cluster, registry, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets)
+	appRelease := buildKubeOvnAppRelease(cluster, registry, chartName, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets)
 	dc, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to create dynamic client for workload cluster")
@@ -498,7 +508,7 @@ func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx co
 
 func (r *clusterReconciler) kubeadmControlPlaneForCluster(ctx context.Context, cluster *clusterv1.Cluster) (*controlplanev1.KubeadmControlPlane, error) {
 	if cluster.Spec.ControlPlaneRef != nil {
-		if cluster.Spec.ControlPlaneRef.Kind != "KubeadmControlPlane" || cluster.Spec.ControlPlaneRef.APIVersion != controlplanev1.GroupVersion.String() {
+		if cluster.Spec.ControlPlaneRef.Kind != kubeadmControlPlaneKind || cluster.Spec.ControlPlaneRef.APIVersion != controlplanev1.GroupVersion.String() {
 			return nil, nil
 		}
 		namespace := cluster.Spec.ControlPlaneRef.Namespace
@@ -525,18 +535,31 @@ func (r *clusterReconciler) kubeadmControlPlaneForCluster(ctx context.Context, c
 	return &kcpList.Items[0], nil
 }
 
-func (r *clusterReconciler) newRemoteClients(ctx context.Context, cluster *clusterv1.Cluster) (kubernetes.Interface, *rest.Config, error) {
+// newRemoteRestConfig builds a hardened rest.Config for the workload cluster
+// from its kubeconfig secret. It is the single construction point for the
+// workload connection so callers that only need a client.Client do not also
+// build (and discard) a clientset.
+func (r *clusterReconciler) newRemoteRestConfig(ctx context.Context, cluster *clusterv1.Cluster) (*rest.Config, error) {
 	clusterKey := client.ObjectKey{Namespace: cluster.Namespace, Name: cluster.Name}
 	kubeconfig, err := kcfg.FromSecret(ctx, r.Client, clusterKey)
 	if err != nil {
-		return nil, nil, pkgerrors.Wrapf(err, "failed to retrieve kubeconfig secret for Cluster %q in namespace %q", cluster.Name, cluster.Namespace)
+		return nil, pkgerrors.Wrapf(err, "failed to retrieve kubeconfig secret for Cluster %q in namespace %q", cluster.Name, cluster.Namespace)
 	}
 
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
-		return nil, nil, pkgerrors.Wrapf(err, "failed to create rest config for Cluster %q in namespace %q", cluster.Name, cluster.Namespace)
+		return nil, pkgerrors.Wrapf(err, "failed to create rest config for Cluster %q in namespace %q", cluster.Name, cluster.Namespace)
 	}
 	restConfig.Timeout = 10 * time.Second
+
+	return restConfig, nil
+}
+
+func (r *clusterReconciler) newRemoteClients(ctx context.Context, cluster *clusterv1.Cluster) (kubernetes.Interface, *rest.Config, error) {
+	restConfig, err := r.newRemoteRestConfig(ctx, cluster)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
@@ -577,6 +600,7 @@ func sentryPullSecrets(ctx context.Context, clientset kubernetes.Interface) (str
 func buildKubeOvnAppRelease(
 	cluster *clusterv1.Cluster,
 	registry string,
+	chartName string,
 	targetVersion string,
 	podCIDR string,
 	serviceCIDR string,
@@ -584,6 +608,9 @@ func buildKubeOvnAppRelease(
 	chartPullSecret string,
 	imagePullSecrets []interface{},
 ) *unstructured.Unstructured {
+	if chartName == "" {
+		chartName = kubeOvnLegacyChartName
+	}
 	host := cluster.Spec.ControlPlaneEndpoint.Host
 	if host == "" {
 		host = cluster.Name
@@ -609,7 +636,7 @@ func buildKubeOvnAppRelease(
 					"repoURL": registry,
 					"charts": []interface{}{
 						map[string]interface{}{
-							"name":           "acp/chart-cpaas-kube-ovn",
+							"name":           chartName,
 							"releaseName":    "cpaas-kube-ovn",
 							"targetRevision": targetVersion,
 						},
