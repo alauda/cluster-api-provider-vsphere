@@ -276,6 +276,12 @@ func (r *clusterReconciler) reconcileDelete(ctx context.Context, clusterCtx *cap
 func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
+	// Configure CoreDNS before the infrastructure cluster becomes Ready so
+	// kubeadm uses the selected repository during initial bootstrap.
+	if err := r.reconcileKubeadmControlPlaneSystemComponents(ctx, clusterCtx); err != nil {
+		return reconcile.Result{}, err
+	}
+
 	// Reconcile failure domains.
 	ok, err := r.reconcileDeploymentZones(ctx, clusterCtx)
 	if err != nil {
@@ -354,7 +360,7 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 		return result, err
 	}
 
-	return reconcile.Result{}, nil
+	return r.reconcileWorkloadSystemComponentRepositories(ctx, clusterCtx)
 }
 
 func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {
@@ -387,6 +393,10 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 			return reconcile.Result{}, fmt.Errorf("kube-ovn module plugin latestVersion is empty")
 		}
 	}
+	chartName, err := kubeOvnChartNameForVersion(targetVersion)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 
 	podCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, true)
 	serviceCIDR := firstCIDRBlock(cluster.Spec.ClusterNetwork, false)
@@ -413,7 +423,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{}, err
 	}
 
-	appRelease := buildKubeOvnAppRelease(cluster, registry, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets)
+	appRelease := buildKubeOvnAppRelease(cluster, registry, chartName, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets)
 	dc, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to create dynamic client for workload cluster")
@@ -577,6 +587,7 @@ func sentryPullSecrets(ctx context.Context, clientset kubernetes.Interface) (str
 func buildKubeOvnAppRelease(
 	cluster *clusterv1.Cluster,
 	registry string,
+	chartName string,
 	targetVersion string,
 	podCIDR string,
 	serviceCIDR string,
@@ -584,6 +595,9 @@ func buildKubeOvnAppRelease(
 	chartPullSecret string,
 	imagePullSecrets []interface{},
 ) *unstructured.Unstructured {
+	if chartName == "" {
+		chartName = kubeOvnLegacyChartName
+	}
 	host := cluster.Spec.ControlPlaneEndpoint.Host
 	if host == "" {
 		host = cluster.Name
@@ -609,7 +623,7 @@ func buildKubeOvnAppRelease(
 					"repoURL": registry,
 					"charts": []interface{}{
 						map[string]interface{}{
-							"name":           "acp/chart-cpaas-kube-ovn",
+							"name":           chartName,
 							"releaseName":    "cpaas-kube-ovn",
 							"targetRevision": targetVersion,
 						},
