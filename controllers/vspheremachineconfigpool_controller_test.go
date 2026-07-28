@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -368,6 +369,242 @@ func TestMachineConfigPoolReconcileReleasedSlotWithoutReclaimableDiskBecomesAvai
 	g.Expect(updated.Status.ConfigStatuses[0].ReclaimStatus.TaskRef).To(BeEmpty())
 	g.Expect(updated.Status.ConfigStatuses[0].ReclaimStatus.VolumePath).To(BeEmpty())
 	g.Expect(updated.Status.ConfigStatuses[0].ReclaimStatus.RetryAfter).To(BeNil())
+}
+
+func TestUpdateSlotCounters(t *testing.T) {
+	g := NewWithT(t)
+
+	pool := &infrav1.VSphereMachineConfigPool{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			Configs: []infrav1.MachineConfigSlot{
+				{Hostname: "host-1"},
+				{Hostname: "host-2"},
+				{Hostname: "host-3"},
+				{Hostname: "host-4"},
+			},
+		},
+	}
+	statuses := []infrav1.MachineConfigSlotStatus{
+		{Hostname: "host-1", State: infrav1.MachineConfigSlotStateAvailable},
+		{Hostname: "host-2", State: infrav1.MachineConfigSlotStateInUse},
+		{Hostname: "host-3", State: infrav1.MachineConfigSlotStateInUse},
+		{Hostname: "host-4", State: infrav1.MachineConfigSlotStateReleased},
+	}
+
+	updateSlotCounters(pool, statuses)
+
+	// Total counts every declared slot; Available and Allocated count only
+	// their respective states; a Released slot counts toward neither.
+	g.Expect(pool.Status.Total).To(Equal(int32(4)))
+	g.Expect(pool.Status.Available).To(Equal(int32(1)))
+	g.Expect(pool.Status.Allocated).To(Equal(int32(2)))
+}
+
+func TestReconcilePoolHealthConditions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+
+	newReconciler := func(objs ...client.Object) machineConfigPoolReconciler {
+		return machineConfigPoolReconciler{
+			Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build(),
+		}
+	}
+
+	t.Run("healthy pool with a free slot", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "c1"},
+				Configs: []infrav1.MachineConfigSlot{
+					{Hostname: "host-1"},
+					{Hostname: "host-2"},
+				},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-1", State: infrav1.MachineConfigSlotStateInUse},
+					{Hostname: "host-2", State: infrav1.MachineConfigSlotStateAvailable},
+				},
+			},
+		}
+		updateSlotCounters(pool, pool.Status.ConfigStatuses)
+		r := newReconciler(pool)
+		r.reconcilePoolHealthConditions(context.Background(), pool)
+
+		g.Expect(conditions.IsTrue(pool, infrav1.MachineConfigPoolMembersValidCondition)).To(BeTrue())
+		g.Expect(conditions.IsTrue(pool, infrav1.MachineConfigPoolMembersUniqueCondition)).To(BeTrue())
+		g.Expect(conditions.IsTrue(pool, infrav1.MachineConfigPoolSlotAvailableCondition)).To(BeTrue())
+		g.Expect(conditions.IsTrue(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition)).To(BeTrue())
+		// v1beta2 mirror is written too.
+		g.Expect(v1beta2conditions.Get(pool, infrav1.VSphereMachineConfigPoolMembersValidV1Beta2Condition).Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	t.Run("duplicate hostname flags MembersUnique with DuplicateHostname", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "c1"},
+				Configs: []infrav1.MachineConfigSlot{
+					{Hostname: "dup"},
+					{Hostname: "dup"},
+				},
+			},
+		}
+		updateSlotCounters(pool, pool.Status.ConfigStatuses)
+		r := newReconciler(pool)
+		r.reconcilePoolHealthConditions(context.Background(), pool)
+
+		g.Expect(conditions.IsFalse(pool, infrav1.MachineConfigPoolMembersUniqueCondition)).To(BeTrue())
+		g.Expect(conditions.GetReason(pool, infrav1.MachineConfigPoolMembersUniqueCondition)).To(Equal(infrav1.MachineConfigPoolDuplicateHostnameReason))
+	})
+
+	t.Run("full pool with a released slot flags SlotAvailable WaitingForReclaim", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "c1"},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-1", State: infrav1.MachineConfigSlotStateReleased},
+				},
+			},
+		}
+		updateSlotCounters(pool, pool.Status.ConfigStatuses)
+		r := newReconciler(pool)
+		r.reconcilePoolHealthConditions(context.Background(), pool)
+
+		g.Expect(conditions.IsFalse(pool, infrav1.MachineConfigPoolSlotAvailableCondition)).To(BeTrue())
+		g.Expect(conditions.GetReason(pool, infrav1.MachineConfigPoolSlotAvailableCondition)).To(Equal(infrav1.MachineConfigPoolWaitingForReclaimReason))
+	})
+
+	t.Run("failed reclaim flags PersistentDisksReady", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "c1"},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
+					Hostname: "host-1",
+					State:    infrav1.MachineConfigSlotStateReleased,
+					ReclaimStatus: &infrav1.MachineConfigSlotReclaimStatus{
+						State:     infrav1.MachineConfigSlotReclaimStateFailed,
+						LastError: "persistent disk is still attached: vm-1",
+					},
+				}},
+			},
+		}
+		updateSlotCounters(pool, pool.Status.ConfigStatuses)
+		r := newReconciler(pool)
+		r.reconcilePoolHealthConditions(context.Background(), pool)
+
+		g.Expect(conditions.IsFalse(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition)).To(BeTrue())
+		g.Expect(conditions.GetReason(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition)).To(Equal(infrav1.MachineConfigPoolDiskStillAttachedReason))
+	})
+
+	t.Run("in-use slot with unprovisioned disk flags PersistentDisksReady DisksProvisioning", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "c1"},
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname:        "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{{Name: "data", SizeGiB: 10}},
+				}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-1", State: infrav1.MachineConfigSlotStateInUse},
+				},
+			},
+		}
+		updateSlotCounters(pool, pool.Status.ConfigStatuses)
+		r := newReconciler(pool)
+		r.reconcilePoolHealthConditions(context.Background(), pool)
+
+		g.Expect(conditions.IsFalse(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition)).To(BeTrue())
+		g.Expect(conditions.GetReason(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition)).To(Equal(infrav1.MachineConfigPoolDisksProvisioningReason))
+	})
+
+	t.Run("in-use slot with provisioned disk keeps PersistentDisksReady true", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "c1"},
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname:        "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{{Name: "data", SizeGiB: 10, VolumePath: "[ds] host-1/data.vmdk"}},
+				}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{
+					{Hostname: "host-1", State: infrav1.MachineConfigSlotStateInUse},
+				},
+			},
+		}
+		updateSlotCounters(pool, pool.Status.ConfigStatuses)
+		r := newReconciler(pool)
+		r.reconcilePoolHealthConditions(context.Background(), pool)
+
+		g.Expect(conditions.IsTrue(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition)).To(BeTrue())
+	})
+
+	t.Run("cross-pool hostname collision flags MembersUnique", func(t *testing.T) {
+		g := NewWithT(t)
+		other := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "c1"},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "shared"}},
+			},
+		}
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				ClusterRef: corev1.ObjectReference{Name: "c1"},
+				Configs:    []infrav1.MachineConfigSlot{{Hostname: "shared"}},
+			},
+		}
+		updateSlotCounters(pool, pool.Status.ConfigStatuses)
+		r := newReconciler(pool, other)
+		r.reconcilePoolHealthConditions(context.Background(), pool)
+
+		g.Expect(conditions.IsFalse(pool, infrav1.MachineConfigPoolMembersUniqueCondition)).To(BeTrue())
+		g.Expect(conditions.GetReason(pool, infrav1.MachineConfigPoolMembersUniqueCondition)).To(Equal(infrav1.MachineConfigPoolDuplicateHostnameReason))
+	})
+}
+
+func TestSetPoolReadySummary(t *testing.T) {
+	g := NewWithT(t)
+
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+	}
+	// All health conditions True, but SlotAvailable False — Ready must stay True
+	// because SlotAvailable is a capacity signal excluded from the summary.
+	conditions.MarkTrue(pool, infrav1.ClusterRefReadyCondition)
+	conditions.MarkTrue(pool, infrav1.VCenterAvailableCondition)
+	conditions.MarkTrue(pool, infrav1.MachineConfigPoolMembersValidCondition)
+	conditions.MarkTrue(pool, infrav1.MachineConfigPoolMembersUniqueCondition)
+	conditions.MarkTrue(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition)
+	conditions.MarkFalse(pool, infrav1.MachineConfigPoolSlotAvailableCondition, infrav1.MachineConfigPoolAllSlotsInUseReason, clusterv1.ConditionSeverityInfo, "full")
+
+	setPoolReadySummary(pool)
+	g.Expect(conditions.IsTrue(pool, clusterv1.ReadyCondition)).To(BeTrue())
+
+	// Flip a health condition False — Ready must become False.
+	conditions.MarkFalse(pool, infrav1.MachineConfigPoolMembersValidCondition, infrav1.MachineConfigPoolInvalidMemberConfigReason, clusterv1.ConditionSeverityWarning, "bad")
+	setPoolReadySummary(pool)
+	g.Expect(conditions.IsFalse(pool, clusterv1.ReadyCondition)).To(BeTrue())
 }
 
 func TestResolveSlotDatacenter(t *testing.T) {

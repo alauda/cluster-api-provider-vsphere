@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,6 +31,129 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	infrautil "sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
+
+const (
+	// diskMinUnitNumber and diskMaxUnitNumber bound a SCSI unit number; unit 7 is
+	// reserved for the SCSI controller and is excluded.
+	diskMinUnitNumber      = 0
+	diskMaxUnitNumber      = 15
+	diskReservedUnitNumber = 7
+)
+
+// ValidateSlotFields checks the structural validity of every slot's persistent
+// disk fields (unit number range, size, and intra-slot uniqueness of disk name,
+// unit number, and mount path). It is a pure function shared by the pool
+// reconciler (P1-2 MembersValid condition) and the validating webhook (P1-3) so
+// the two never drift. Hostname format is validated separately.
+func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList {
+	var allErrs field.ErrorList
+	if pool == nil {
+		return allErrs
+	}
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
+		diskPathBase := field.NewPath("spec", "configs").Index(i).Child("persistentDisks")
+
+		seenNames := map[string]struct{}{}
+		seenUnits := map[int32]struct{}{}
+		seenMounts := map[string]struct{}{}
+		for j := range slot.PersistentDisks {
+			pd := &slot.PersistentDisks[j]
+			diskPath := diskPathBase.Index(j)
+
+			if pd.Name == "" {
+				allErrs = append(allErrs, field.Required(diskPath.Child("name"), "must be set"))
+			} else if _, dup := seenNames[pd.Name]; dup {
+				allErrs = append(allErrs, field.Duplicate(diskPath.Child("name"), pd.Name))
+			} else {
+				seenNames[pd.Name] = struct{}{}
+			}
+
+			if pd.SizeGiB < 1 {
+				allErrs = append(allErrs, field.Invalid(diskPath.Child("sizeGiB"), pd.SizeGiB, "must be at least 1"))
+			}
+
+			if pd.UnitNumber != nil {
+				u := *pd.UnitNumber
+				switch {
+				case u < diskMinUnitNumber || u > diskMaxUnitNumber:
+					allErrs = append(allErrs, field.Invalid(diskPath.Child("unitNumber"), u, "must be between 0 and 15"))
+				case u == diskReservedUnitNumber:
+					allErrs = append(allErrs, field.Invalid(diskPath.Child("unitNumber"), u, "unit number 7 is reserved for the SCSI controller"))
+				default:
+					if _, dup := seenUnits[u]; dup {
+						allErrs = append(allErrs, field.Duplicate(diskPath.Child("unitNumber"), u))
+					} else {
+						seenUnits[u] = struct{}{}
+					}
+				}
+			}
+
+			if pd.MountPath != "" {
+				if _, dup := seenMounts[pd.MountPath]; dup {
+					allErrs = append(allErrs, field.Duplicate(diskPath.Child("mountPath"), pd.MountPath))
+				} else {
+					seenMounts[pd.MountPath] = struct{}{}
+				}
+			}
+		}
+	}
+	return allErrs
+}
+
+// ValidateHostnameUniqueness reports duplicate hostnames within a single pool.
+// Shared by the P1-2 MembersUnique condition and the P1-3 webhook.
+func ValidateHostnameUniqueness(pool *infrav1.VSphereMachineConfigPool) field.ErrorList {
+	var allErrs field.ErrorList
+	if pool == nil {
+		return allErrs
+	}
+	seen := map[string]struct{}{}
+	for i := range pool.Spec.Configs {
+		hostname := pool.Spec.Configs[i].Hostname
+		if hostname == "" {
+			continue
+		}
+		path := field.NewPath("spec", "configs").Index(i).Child("hostname")
+		if _, dup := seen[hostname]; dup {
+			allErrs = append(allErrs, field.Duplicate(path, hostname))
+		} else {
+			seen[hostname] = struct{}{}
+		}
+	}
+	return allErrs
+}
+
+// ValidateIPUniqueness reports duplicate primary IPv4/IPv6 addresses within a
+// single pool. Shared by the P1-2 MembersUnique condition and the P1-3 webhook.
+func ValidateIPUniqueness(pool *infrav1.VSphereMachineConfigPool) field.ErrorList {
+	var allErrs field.ErrorList
+	if pool == nil {
+		return allErrs
+	}
+	seen := map[string]struct{}{}
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
+		if slot.Network == nil {
+			continue
+		}
+		primaryPath := field.NewPath("spec", "configs").Index(i).Child("network", "primary")
+		for _, entry := range []struct {
+			key string
+			val string
+		}{{"ip", slot.Network.Primary.IP}, {"ipv6", slot.Network.Primary.IPv6}} {
+			if entry.val == "" {
+				continue
+			}
+			if _, dup := seen[entry.val]; dup {
+				allErrs = append(allErrs, field.Duplicate(primaryPath.Child(entry.key), entry.val))
+			} else {
+				seen[entry.val] = struct{}{}
+			}
+		}
+	}
+	return allErrs
+}
 
 func ConsumerRefsEqual(a, b *corev1.ObjectReference) bool {
 	if a == nil || b == nil {

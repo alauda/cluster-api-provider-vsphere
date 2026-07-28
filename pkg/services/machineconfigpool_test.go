@@ -868,3 +868,88 @@ func TestObjectForConsumerRef(t *testing.T) {
 	unknown := ObjectForConsumerRef(&corev1.ObjectReference{Kind: "Pod"})
 	g.Expect(unknown).To(BeNil())
 }
+
+func TestValidateSlotFields(t *testing.T) {
+	int32Ptr := func(v int32) *int32 { return &v }
+
+	t.Run("valid pool has no errors", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "etcd", SizeGiB: 20, UnitNumber: int32Ptr(0), MountPath: "/var/lib/etcd"},
+						{Name: "data", SizeGiB: 50, UnitNumber: int32Ptr(1), MountPath: "/var/lib/data"},
+					},
+				}},
+			},
+		}
+		g.Expect(ValidateSlotFields(pool)).To(BeEmpty())
+	})
+
+	t.Run("flags bad size, reserved and out-of-range unit numbers", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "a", SizeGiB: 0, UnitNumber: int32Ptr(7)},
+						{Name: "b", SizeGiB: 10, UnitNumber: int32Ptr(16)},
+					},
+				}},
+			},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(3)) // sizeGiB<1, unit 7 reserved, unit 16 out of range
+	})
+
+	t.Run("flags intra-slot duplicate name unit and mountPath", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "dup", SizeGiB: 10, UnitNumber: int32Ptr(1), MountPath: "/data"},
+						{Name: "dup", SizeGiB: 10, UnitNumber: int32Ptr(1), MountPath: "/data"},
+					},
+				}},
+			},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(3)) // duplicate name, unitNumber, mountPath
+	})
+}
+
+func TestValidateHostnameUniqueness(t *testing.T) {
+	g := NewWithT(t)
+	pool := &infrav1.VSphereMachineConfigPool{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			Configs: []infrav1.MachineConfigSlot{
+				{Hostname: "host-1"},
+				{Hostname: "host-2"},
+				{Hostname: "host-1"},
+			},
+		},
+	}
+	errs := ValidateHostnameUniqueness(pool)
+	g.Expect(errs).To(HaveLen(1))
+	g.Expect(errs[0].Field).To(ContainSubstring("hostname"))
+}
+
+func TestValidateIPUniqueness(t *testing.T) {
+	g := NewWithT(t)
+	pool := &infrav1.VSphereMachineConfigPool{
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			Configs: []infrav1.MachineConfigSlot{
+				{Hostname: "host-1", Network: &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{IP: "10.0.0.1", IPv6: "fd00::1"}}},
+				{Hostname: "host-2", Network: &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{IP: "10.0.0.1"}}},
+				{Hostname: "host-3", Network: &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{IP: "10.0.0.3"}}},
+			},
+		},
+	}
+	errs := ValidateIPUniqueness(pool)
+	g.Expect(errs).To(HaveLen(1)) // 10.0.0.1 duplicated once
+}

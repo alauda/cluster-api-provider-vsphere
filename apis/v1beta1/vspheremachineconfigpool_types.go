@@ -22,6 +22,56 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 )
 
+// v1beta2 condition types and reasons for the VSphereMachineConfigPool object.
+// These mirror the v1beta1 pool conditions in condition_consts.go and are
+// dual-written by the pool reconciler.
+const (
+	// VSphereMachineConfigPoolReadyV1Beta2Condition is the summary of the pool's
+	// health conditions (MembersValid, MembersUnique, PersistentDisksReady,
+	// ClusterRefReady, VCenterAvailable). It excludes SlotAvailable.
+	VSphereMachineConfigPoolReadyV1Beta2Condition = clusterv1.ReadyV1Beta2Condition
+
+	// VSphereMachineConfigPoolReadyV1Beta2Reason surfaces when the pool readiness criteria are met.
+	VSphereMachineConfigPoolReadyV1Beta2Reason = clusterv1.ReadyV1Beta2Reason
+
+	// VSphereMachineConfigPoolNotReadyV1Beta2Reason surfaces when the pool readiness criteria are not met.
+	VSphereMachineConfigPoolNotReadyV1Beta2Reason = clusterv1.NotReadyV1Beta2Reason
+
+	// VSphereMachineConfigPoolReadyUnknownV1Beta2Reason surfaces when at least one pool readiness criterion is unknown.
+	VSphereMachineConfigPoolReadyUnknownV1Beta2Reason = clusterv1.ReadyUnknownV1Beta2Reason
+
+	// VSphereMachineConfigPoolClusterRefReadyV1Beta2Condition mirrors ClusterRefReadyCondition.
+	VSphereMachineConfigPoolClusterRefReadyV1Beta2Condition = "ClusterRefReady"
+
+	// VSphereMachineConfigPoolVCenterAvailableV1Beta2Condition mirrors VCenterAvailableCondition.
+	VSphereMachineConfigPoolVCenterAvailableV1Beta2Condition = "VCenterAvailable"
+
+	// VSphereMachineConfigPoolMembersValidV1Beta2Condition mirrors MachineConfigPoolMembersValidCondition.
+	VSphereMachineConfigPoolMembersValidV1Beta2Condition = "MembersValid"
+
+	// VSphereMachineConfigPoolMembersUniqueV1Beta2Condition mirrors MachineConfigPoolMembersUniqueCondition.
+	VSphereMachineConfigPoolMembersUniqueV1Beta2Condition = "MembersUnique"
+
+	// VSphereMachineConfigPoolSlotAvailableV1Beta2Condition mirrors MachineConfigPoolSlotAvailableCondition.
+	VSphereMachineConfigPoolSlotAvailableV1Beta2Condition = "SlotAvailable"
+
+	// VSphereMachineConfigPoolPersistentDisksReadyV1Beta2Condition mirrors MachineConfigPoolPersistentDisksReadyCondition.
+	VSphereMachineConfigPoolPersistentDisksReadyV1Beta2Condition = "PersistentDisksReady"
+
+	// VSphereMachineConfigPoolConditionSatisfiedV1Beta2Reason is the generic reason used
+	// for the True state of the pool's health sub-conditions (v1beta2 requires a
+	// reason on every condition, including True ones).
+	VSphereMachineConfigPoolConditionSatisfiedV1Beta2Reason = "Satisfied"
+
+	// VSphereMachineConfigPoolClusterRefNotReadyV1Beta2Reason surfaces when the referenced
+	// Cluster/VSphereCluster is not available.
+	VSphereMachineConfigPoolClusterRefNotReadyV1Beta2Reason = "ClusterRefNotReady"
+
+	// VSphereMachineConfigPoolVCenterUnavailableV1Beta2Reason surfaces when vCenter credentials
+	// cannot be resolved.
+	VSphereMachineConfigPoolVCenterUnavailableV1Beta2Reason = "VCenterUnavailable"
+)
+
 // VSphereMachineConfigPoolSpec defines the desired state of VSphereMachineConfigPool.
 type VSphereMachineConfigPoolSpec struct {
 	// ClusterRef references the CAPI Cluster (in the same namespace) whose
@@ -161,6 +211,20 @@ type VSphereMachineConfigPoolStatus struct {
 	// +optional
 	ConfigStatuses []MachineConfigSlotStatus `json:"configStatuses,omitempty"`
 
+	// Total is the total number of configuration slots defined in the pool.
+	// +optional
+	Total int32 `json:"total,omitempty"`
+
+	// Available is the number of slots currently free for allocation
+	// (slots in the Available state).
+	// +optional
+	Available int32 `json:"available,omitempty"`
+
+	// Allocated is the number of slots currently bound to a VSphereMachine
+	// (slots in the InUse state).
+	// +optional
+	Allocated int32 `json:"allocated,omitempty"`
+
 	// ConsumerRef is the workload controller (KubeadmControlPlane or MachineDeployment)
 	// currently bound to this pool. Set automatically by the controller when a machine
 	// allocates a slot. Cleared when the pool becomes fully reusable.
@@ -170,6 +234,25 @@ type VSphereMachineConfigPoolStatus struct {
 	// Conditions defines current state of the machine config pool.
 	// +optional
 	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+
+	// v1beta2 groups all the fields that will be added or modified in
+	// VSphereMachineConfigPool's status with the V1Beta2 version.
+	// +optional
+	V1Beta2 *VSphereMachineConfigPoolV1Beta2Status `json:"v1beta2,omitempty"`
+}
+
+// VSphereMachineConfigPoolV1Beta2Status groups all the fields that will be added or
+// modified in VSphereMachineConfigPoolStatus with the V1Beta2 version.
+// See https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more context.
+type VSphereMachineConfigPoolV1Beta2Status struct {
+	// conditions represents the observations of a VSphereMachineConfigPool's current state.
+	// Known condition types are Ready, MembersValid, MembersUnique, SlotAvailable,
+	// PersistentDisksReady, ClusterRefReady and VCenterAvailable.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +kubebuilder:validation:MaxItems=32
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // MachineConfigSlotState describes the allocation state of a slot.
@@ -249,6 +332,10 @@ type MachineConfigSlotReclaimStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:path=vspheremachineconfigpools,scope=Namespaced,categories=cluster-api
+// +kubebuilder:printcolumn:name="Total",type="integer",JSONPath=".status.total",description="Total configuration slots in the pool"
+// +kubebuilder:printcolumn:name="Available",type="integer",JSONPath=".status.available",description="Slots free for allocation"
+// +kubebuilder:printcolumn:name="Allocated",type="integer",JSONPath=".status.allocated",description="Slots bound to a machine"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation"
 
 // VSphereMachineConfigPool is the Schema for the vspheremachineconfigpools API.
 type VSphereMachineConfigPool struct {
@@ -267,6 +354,22 @@ func (r *VSphereMachineConfigPool) GetConditions() clusterv1.Conditions {
 // SetConditions sets the conditions on a VSphereMachineConfigPool.
 func (r *VSphereMachineConfigPool) SetConditions(conditions clusterv1.Conditions) {
 	r.Status.Conditions = conditions
+}
+
+// GetV1Beta2Conditions returns the set of v1beta2 conditions for this object.
+func (r *VSphereMachineConfigPool) GetV1Beta2Conditions() []metav1.Condition {
+	if r.Status.V1Beta2 == nil {
+		return nil
+	}
+	return r.Status.V1Beta2.Conditions
+}
+
+// SetV1Beta2Conditions sets the v1beta2 conditions for this object.
+func (r *VSphereMachineConfigPool) SetV1Beta2Conditions(conditions []metav1.Condition) {
+	if r.Status.V1Beta2 == nil {
+		r.Status.V1Beta2 = &VSphereMachineConfigPoolV1Beta2Status{}
+	}
+	r.Status.V1Beta2.Conditions = conditions
 }
 
 // +kubebuilder:object:root=true

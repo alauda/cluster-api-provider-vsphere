@@ -18,7 +18,9 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -31,6 +33,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	"sigs.k8s.io/cluster-api/util/finalizers"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -175,6 +178,11 @@ func (r machineConfigPoolReconciler) Reconcile(ctx context.Context, req reconcil
 // Both writers on this CRD (this controller and vimmachine.persistMachineConfigPoolChanges)
 // use Update, so the RV optimistic lock prevents silent overwrites.
 func (r machineConfigPoolReconciler) persistPool(ctx context.Context, pool, before *infrav1.VSphereMachineConfigPool) error {
+	// Always recompute the Ready summary from the health sub-conditions so it is
+	// consistent regardless of which reconcile path returned. SlotAvailable is a
+	// capacity signal and is deliberately excluded from Ready.
+	setPoolReadySummary(pool)
+
 	specDirty := !reflect.DeepEqual(pool.Spec, before.Spec) ||
 		!reflect.DeepEqual(pool.Finalizers, before.Finalizers)
 	if specDirty {
@@ -221,6 +229,7 @@ func (r machineConfigPoolReconciler) resolveVCenterParams(ctx context.Context, p
 		conditions.MarkFalse(pool, infrav1.ClusterRefReadyCondition,
 			infrav1.ClusterNotFoundReason, clusterv1.ConditionSeverityWarning,
 			"Cluster %s/%s not found: %v", clusterKey.Namespace, clusterKey.Name, err)
+		setPoolClusterRefReadyV1Beta2False(pool, fmt.Sprintf("Cluster %s/%s not found: %v", clusterKey.Namespace, clusterKey.Name, err))
 		return nil, errors.Wrapf(err, "failed to get Cluster %s/%s referenced by VSphereMachineConfigPool %s/%s",
 			clusterKey.Namespace, clusterKey.Name, pool.Namespace, pool.Name)
 	}
@@ -230,6 +239,7 @@ func (r machineConfigPoolReconciler) resolveVCenterParams(ctx context.Context, p
 		conditions.MarkFalse(pool, infrav1.ClusterRefReadyCondition,
 			infrav1.VSphereClusterNotFoundReason, clusterv1.ConditionSeverityWarning,
 			"Cluster %s/%s has nil InfrastructureRef", cluster.Namespace, cluster.Name)
+		setPoolClusterRefReadyV1Beta2False(pool, fmt.Sprintf("Cluster %s/%s has nil InfrastructureRef", cluster.Namespace, cluster.Name))
 		return nil, errors.Errorf("Cluster %s/%s has nil InfrastructureRef", cluster.Namespace, cluster.Name)
 	}
 	vsphereCluster := &infrav1.VSphereCluster{}
@@ -241,10 +251,16 @@ func (r machineConfigPoolReconciler) resolveVCenterParams(ctx context.Context, p
 		conditions.MarkFalse(pool, infrav1.ClusterRefReadyCondition,
 			infrav1.VSphereClusterNotFoundReason, clusterv1.ConditionSeverityWarning,
 			"VSphereCluster %s/%s not found: %v", vsphereClusterKey.Namespace, vsphereClusterKey.Name, err)
+		setPoolClusterRefReadyV1Beta2False(pool, fmt.Sprintf("VSphereCluster %s/%s not found: %v", vsphereClusterKey.Namespace, vsphereClusterKey.Name, err))
 		return nil, errors.Wrapf(err, "failed to get VSphereCluster %s/%s", vsphereClusterKey.Namespace, vsphereClusterKey.Name)
 	}
 
 	conditions.MarkTrue(pool, infrav1.ClusterRefReadyCondition)
+	v1beta2conditions.Set(pool, metav1.Condition{
+		Type:   infrav1.VSphereMachineConfigPoolClusterRefReadyV1Beta2Condition,
+		Status: metav1.ConditionTrue,
+		Reason: infrav1.VSphereMachineConfigPoolConditionSatisfiedV1Beta2Reason,
+	})
 
 	// Step 3: Resolve credentials
 	params := &vcenterParams{
@@ -260,6 +276,7 @@ func (r machineConfigPoolReconciler) resolveVCenterParams(ctx context.Context, p
 			conditions.MarkFalse(pool, infrav1.VCenterAvailableCondition,
 				infrav1.IdentityCredentialsUnavailableReason, clusterv1.ConditionSeverityWarning,
 				"Failed to resolve credentials from IdentityRef: %v", err)
+			setPoolVCenterAvailableV1Beta2False(pool, fmt.Sprintf("Failed to resolve credentials from IdentityRef: %v", err))
 			return nil, errors.Wrap(err, "failed to get credentials from IdentityRef")
 		}
 		params.username = creds.Username
@@ -268,14 +285,40 @@ func (r machineConfigPoolReconciler) resolveVCenterParams(ctx context.Context, p
 		conditions.MarkFalse(pool, infrav1.VCenterAvailableCondition,
 			infrav1.IdentityCredentialsUnavailableReason, clusterv1.ConditionSeverityWarning,
 			"VSphereCluster has no IdentityRef and controller manager credentials are not configured")
+		setPoolVCenterAvailableV1Beta2False(pool, "VSphereCluster has no IdentityRef and controller manager credentials are not configured")
 		return nil, errors.New("VSphereCluster has no IdentityRef and controller manager credentials are not configured")
 	} else {
 		log.V(4).Info("VSphereCluster has no IdentityRef, falling back to controller manager credentials")
 	}
 
 	conditions.MarkTrue(pool, infrav1.VCenterAvailableCondition)
+	v1beta2conditions.Set(pool, metav1.Condition{
+		Type:   infrav1.VSphereMachineConfigPoolVCenterAvailableV1Beta2Condition,
+		Status: metav1.ConditionTrue,
+		Reason: infrav1.VSphereMachineConfigPoolConditionSatisfiedV1Beta2Reason,
+	})
 
 	return params, nil
+}
+
+// setPoolClusterRefReadyV1Beta2False sets the v1beta2 ClusterRefReady condition False.
+func setPoolClusterRefReadyV1Beta2False(pool *infrav1.VSphereMachineConfigPool, msg string) {
+	v1beta2conditions.Set(pool, metav1.Condition{
+		Type:    infrav1.VSphereMachineConfigPoolClusterRefReadyV1Beta2Condition,
+		Status:  metav1.ConditionFalse,
+		Reason:  infrav1.VSphereMachineConfigPoolClusterRefNotReadyV1Beta2Reason,
+		Message: msg,
+	})
+}
+
+// setPoolVCenterAvailableV1Beta2False sets the v1beta2 VCenterAvailable condition False.
+func setPoolVCenterAvailableV1Beta2False(pool *infrav1.VSphereMachineConfigPool, msg string) {
+	v1beta2conditions.Set(pool, metav1.Condition{
+		Type:    infrav1.VSphereMachineConfigPoolVCenterAvailableV1Beta2Condition,
+		Status:  metav1.ConditionFalse,
+		Reason:  infrav1.VSphereMachineConfigPoolVCenterUnavailableV1Beta2Reason,
+		Message: msg,
+	})
 }
 
 func (r machineConfigPoolReconciler) reconcileNormal(ctx context.Context, pool *infrav1.VSphereMachineConfigPool) (reconcile.Result, error) {
@@ -387,7 +430,267 @@ func (r machineConfigPoolReconciler) reconcileNormal(ctx context.Context, pool *
 		pool.Status.ConfigStatuses = newStatuses
 	}
 
+	updateSlotCounters(pool, newStatuses)
+	r.reconcilePoolHealthConditions(ctx, pool)
+
 	return reconcile.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// updateSlotCounters recomputes the pool-level slot counters (Total/Available/Allocated)
+// from the per-slot statuses. Total is the number of declared slots; Available counts
+// slots free for allocation; Allocated counts slots bound to a machine. Released slots
+// (awaiting reclaim) count toward Total but neither Available nor Allocated.
+func updateSlotCounters(pool *infrav1.VSphereMachineConfigPool, statuses []infrav1.MachineConfigSlotStatus) {
+	var available, allocated int32
+	for i := range statuses {
+		switch statuses[i].State {
+		case infrav1.MachineConfigSlotStateAvailable:
+			available++
+		case infrav1.MachineConfigSlotStateInUse:
+			allocated++
+		}
+	}
+	pool.Status.Total = int32(len(pool.Spec.Configs))
+	pool.Status.Available = available
+	pool.Status.Allocated = allocated
+}
+
+// markPoolConditionTrue sets the given pool health condition True in both the
+// v1beta1 and v1beta2 condition sets.
+func markPoolConditionTrue(pool *infrav1.VSphereMachineConfigPool, v1b1 clusterv1.ConditionType, v1b2 string) {
+	conditions.MarkTrue(pool, v1b1)
+	v1beta2conditions.Set(pool, metav1.Condition{
+		Type:   v1b2,
+		Status: metav1.ConditionTrue,
+		Reason: infrav1.VSphereMachineConfigPoolConditionSatisfiedV1Beta2Reason,
+	})
+}
+
+// markPoolConditionFalse sets the given pool health condition False in both the
+// v1beta1 and v1beta2 condition sets.
+func markPoolConditionFalse(pool *infrav1.VSphereMachineConfigPool, v1b1 clusterv1.ConditionType, v1b2 string, v1b1Reason string, severity clusterv1.ConditionSeverity, v1b2Reason, msg string) {
+	conditions.MarkFalse(pool, v1b1, v1b1Reason, severity, "%s", msg)
+	v1beta2conditions.Set(pool, metav1.Condition{
+		Type:    v1b2,
+		Status:  metav1.ConditionFalse,
+		Reason:  v1b2Reason,
+		Message: msg,
+	})
+}
+
+// reconcilePoolHealthConditions computes and dual-writes the pool-level health
+// conditions (MembersValid, MembersUnique, SlotAvailable, PersistentDisksReady).
+// The Ready summary is computed separately in persistPool. SlotAvailable relies
+// on the counters set by updateSlotCounters, so it must run after them.
+func (r machineConfigPoolReconciler) reconcilePoolHealthConditions(ctx context.Context, pool *infrav1.VSphereMachineConfigPool) {
+	// MembersValid: per-slot structural field validity.
+	if fieldErrs := services.ValidateSlotFields(pool); len(fieldErrs) == 0 {
+		markPoolConditionTrue(pool, infrav1.MachineConfigPoolMembersValidCondition, infrav1.VSphereMachineConfigPoolMembersValidV1Beta2Condition)
+	} else {
+		markPoolConditionFalse(pool, infrav1.MachineConfigPoolMembersValidCondition, infrav1.VSphereMachineConfigPoolMembersValidV1Beta2Condition,
+			infrav1.MachineConfigPoolInvalidMemberConfigReason, clusterv1.ConditionSeverityWarning,
+			infrav1.MachineConfigPoolInvalidMemberConfigReason, fieldErrs.ToAggregate().Error())
+	}
+
+	// MembersUnique: hostname takes precedence over IP; within-pool and cross-pool
+	// (same clusterRef, same namespace) collisions both count.
+	hostnameErrs := services.ValidateHostnameUniqueness(pool)
+	ipErrs := services.ValidateIPUniqueness(pool)
+	dupHostname, dupIP, crossMsg := r.crossPoolConflicts(ctx, pool)
+	switch {
+	case len(hostnameErrs) > 0 || dupHostname:
+		msg := crossMsg
+		if len(hostnameErrs) > 0 {
+			msg = hostnameErrs.ToAggregate().Error()
+		}
+		markPoolConditionFalse(pool, infrav1.MachineConfigPoolMembersUniqueCondition, infrav1.VSphereMachineConfigPoolMembersUniqueV1Beta2Condition,
+			infrav1.MachineConfigPoolDuplicateHostnameReason, clusterv1.ConditionSeverityWarning,
+			infrav1.MachineConfigPoolDuplicateHostnameReason, msg)
+	case len(ipErrs) > 0 || dupIP:
+		msg := crossMsg
+		if len(ipErrs) > 0 {
+			msg = ipErrs.ToAggregate().Error()
+		}
+		markPoolConditionFalse(pool, infrav1.MachineConfigPoolMembersUniqueCondition, infrav1.VSphereMachineConfigPoolMembersUniqueV1Beta2Condition,
+			infrav1.MachineConfigPoolDuplicateIPAddressReason, clusterv1.ConditionSeverityWarning,
+			infrav1.MachineConfigPoolDuplicateIPAddressReason, msg)
+	default:
+		markPoolConditionTrue(pool, infrav1.MachineConfigPoolMembersUniqueCondition, infrav1.VSphereMachineConfigPoolMembersUniqueV1Beta2Condition)
+	}
+
+	// SlotAvailable: capacity signal (does not feed Ready).
+	if pool.Status.Available > 0 {
+		markPoolConditionTrue(pool, infrav1.MachineConfigPoolSlotAvailableCondition, infrav1.VSphereMachineConfigPoolSlotAvailableV1Beta2Condition)
+	} else {
+		reason := infrav1.MachineConfigPoolAllSlotsInUseReason
+		for i := range pool.Status.ConfigStatuses {
+			if pool.Status.ConfigStatuses[i].State == infrav1.MachineConfigSlotStateReleased {
+				reason = infrav1.MachineConfigPoolWaitingForReclaimReason
+				break
+			}
+		}
+		markPoolConditionFalse(pool, infrav1.MachineConfigPoolSlotAvailableCondition, infrav1.VSphereMachineConfigPoolSlotAvailableV1Beta2Condition,
+			reason, clusterv1.ConditionSeverityInfo, reason, "no slots are currently available for allocation")
+	}
+
+	// PersistentDisksReady: every persistent disk must be in a settled healthy
+	// state — idle on an available slot, or fully provisioned on an in-use slot.
+	// A failed reclaim is a hard failure; an in-use slot whose disks are not yet
+	// provisioned (VolumePath not backfilled) is still preparing and also counts
+	// as not ready. Slots reclaiming normally (not failed) do not pull this down.
+	var failedSlot *infrav1.MachineConfigSlotStatus
+	for i := range pool.Status.ConfigStatuses {
+		s := &pool.Status.ConfigStatuses[i]
+		if s.ReclaimStatus != nil && s.ReclaimStatus.State == infrav1.MachineConfigSlotReclaimStateFailed {
+			failedSlot = s
+			break
+		}
+	}
+	switch {
+	case failedSlot != nil:
+		reason := infrav1.MachineConfigPoolReclaimFailedReason
+		if strings.Contains(failedSlot.ReclaimStatus.LastError, "still attached") {
+			reason = infrav1.MachineConfigPoolDiskStillAttachedReason
+		}
+		msg := failedSlot.ReclaimStatus.LastError
+		if msg == "" {
+			msg = "persistent disk reclaim failed for slot " + failedSlot.Hostname
+		}
+		markPoolConditionFalse(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition, infrav1.VSphereMachineConfigPoolPersistentDisksReadyV1Beta2Condition,
+			reason, clusterv1.ConditionSeverityWarning, reason, msg)
+	default:
+		if host, disk, preparing := poolUnprovisionedInUseDisk(pool); preparing {
+			markPoolConditionFalse(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition, infrav1.VSphereMachineConfigPoolPersistentDisksReadyV1Beta2Condition,
+				infrav1.MachineConfigPoolDisksProvisioningReason, clusterv1.ConditionSeverityInfo,
+				infrav1.MachineConfigPoolDisksProvisioningReason,
+				fmt.Sprintf("persistent disk %q for in-use slot %s is still being provisioned", disk, host))
+		} else {
+			markPoolConditionTrue(pool, infrav1.MachineConfigPoolPersistentDisksReadyCondition, infrav1.VSphereMachineConfigPoolPersistentDisksReadyV1Beta2Condition)
+		}
+	}
+}
+
+// poolUnprovisionedInUseDisk returns the first in-use slot that still has a
+// persistent disk without a backfilled VolumePath (i.e. not yet created in
+// vCenter). Available and reclaiming slots are ignored — only in-use slots are
+// expected to have provisioned disks.
+func poolUnprovisionedInUseDisk(pool *infrav1.VSphereMachineConfigPool) (hostname, disk string, preparing bool) {
+	inUse := map[string]struct{}{}
+	for i := range pool.Status.ConfigStatuses {
+		if pool.Status.ConfigStatuses[i].State == infrav1.MachineConfigSlotStateInUse {
+			inUse[pool.Status.ConfigStatuses[i].Hostname] = struct{}{}
+		}
+	}
+	for i := range pool.Spec.Configs {
+		cfg := &pool.Spec.Configs[i]
+		if _, ok := inUse[cfg.Hostname]; !ok {
+			continue
+		}
+		for j := range cfg.PersistentDisks {
+			if cfg.PersistentDisks[j].VolumePath == "" {
+				return cfg.Hostname, cfg.PersistentDisks[j].Name, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// crossPoolConflicts reports whether this pool's hostnames or primary IPs collide
+// with any other pool bound to the same Cluster in the same namespace. Within-pool
+// duplicates are handled by the shared validators; this covers only cross-pool.
+func (r machineConfigPoolReconciler) crossPoolConflicts(ctx context.Context, pool *infrav1.VSphereMachineConfigPool) (dupHostname bool, dupIP bool, msg string) {
+	if pool.Spec.ClusterRef.Name == "" {
+		return false, false, ""
+	}
+	others := &infrav1.VSphereMachineConfigPoolList{}
+	if err := r.Client.List(ctx, others, client.InNamespace(pool.Namespace)); err != nil {
+		// Treat a listing failure as "no conflict observed" — MembersUnique is a
+		// best-effort backstop for the webhook, not a hard gate.
+		ctrl.LoggerFrom(ctx).Error(err, "failed to list pools for cross-pool uniqueness check")
+		return false, false, ""
+	}
+
+	ownHostnames, ownIPs := poolHostnamesAndIPs(pool)
+	for i := range others.Items {
+		other := &others.Items[i]
+		if other.Name == pool.Name || other.Spec.ClusterRef.Name != pool.Spec.ClusterRef.Name {
+			continue
+		}
+		otherHostnames, otherIPs := poolHostnamesAndIPs(other)
+		for h := range otherHostnames {
+			if _, ok := ownHostnames[h]; ok {
+				return true, dupIP, "hostname " + h + " also used by pool " + other.Name
+			}
+		}
+		for ip := range otherIPs {
+			if _, ok := ownIPs[ip]; ok {
+				dupIP = true
+				msg = "primary IP " + ip + " also used by pool " + other.Name
+			}
+		}
+	}
+	return dupHostname, dupIP, msg
+}
+
+// poolHostnamesAndIPs returns the set of hostnames and primary IP/IPv6 addresses declared by a pool.
+func poolHostnamesAndIPs(pool *infrav1.VSphereMachineConfigPool) (hostnames map[string]struct{}, ips map[string]struct{}) {
+	hostnames = map[string]struct{}{}
+	ips = map[string]struct{}{}
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
+		if slot.Hostname != "" {
+			hostnames[slot.Hostname] = struct{}{}
+		}
+		if slot.Network != nil {
+			if slot.Network.Primary.IP != "" {
+				ips[slot.Network.Primary.IP] = struct{}{}
+			}
+			if slot.Network.Primary.IPv6 != "" {
+				ips[slot.Network.Primary.IPv6] = struct{}{}
+			}
+		}
+	}
+	return hostnames, ips
+}
+
+// setPoolReadySummary computes the pool's Ready condition (v1beta1 and v1beta2)
+// from the health sub-conditions. SlotAvailable is excluded — a fully-allocated
+// fixed-IP pool is a healthy state.
+func setPoolReadySummary(pool *infrav1.VSphereMachineConfigPool) {
+	conditions.SetSummary(pool, conditions.WithConditions(
+		infrav1.ClusterRefReadyCondition,
+		infrav1.VCenterAvailableCondition,
+		infrav1.MachineConfigPoolMembersValidCondition,
+		infrav1.MachineConfigPoolMembersUniqueCondition,
+		infrav1.MachineConfigPoolPersistentDisksReadyCondition,
+	))
+
+	_ = v1beta2conditions.SetSummaryCondition(pool, pool, infrav1.VSphereMachineConfigPoolReadyV1Beta2Condition,
+		v1beta2conditions.ForConditionTypes{
+			infrav1.VSphereMachineConfigPoolClusterRefReadyV1Beta2Condition,
+			infrav1.VSphereMachineConfigPoolVCenterAvailableV1Beta2Condition,
+			infrav1.VSphereMachineConfigPoolMembersValidV1Beta2Condition,
+			infrav1.VSphereMachineConfigPoolMembersUniqueV1Beta2Condition,
+			infrav1.VSphereMachineConfigPoolPersistentDisksReadyV1Beta2Condition,
+		},
+		// These may not be set yet on an early return (before vCenter resolves or
+		// before the first health pass); ignore them rather than forcing Unknown.
+		v1beta2conditions.IgnoreTypesIfMissing{
+			infrav1.VSphereMachineConfigPoolVCenterAvailableV1Beta2Condition,
+			infrav1.VSphereMachineConfigPoolMembersValidV1Beta2Condition,
+			infrav1.VSphereMachineConfigPoolMembersUniqueV1Beta2Condition,
+			infrav1.VSphereMachineConfigPoolPersistentDisksReadyV1Beta2Condition,
+		},
+		v1beta2conditions.CustomMergeStrategy{
+			MergeStrategy: v1beta2conditions.DefaultMergeStrategy(
+				v1beta2conditions.ComputeReasonFunc(v1beta2conditions.GetDefaultComputeMergeReasonFunc(
+					infrav1.VSphereMachineConfigPoolNotReadyV1Beta2Reason,
+					infrav1.VSphereMachineConfigPoolReadyUnknownV1Beta2Reason,
+					infrav1.VSphereMachineConfigPoolReadyV1Beta2Reason,
+				)),
+			),
+		},
+	)
 }
 
 func (r machineConfigPoolReconciler) reconcileConsumerBinding(ctx context.Context, pool *infrav1.VSphereMachineConfigPool) {
@@ -704,6 +1007,7 @@ func (r machineConfigPoolReconciler) reconcileDelete(ctx context.Context, pool *
 	}
 
 	pool.Status.ConfigStatuses = newStatuses
+	updateSlotCounters(pool, newStatuses)
 
 	if len(blockingMachines) > 0 {
 		return reconcile.Result{}, errors.Errorf("blocking VSphereMachineConfigPool deletion: currently in use by VSphereMachines %v", blockingMachines)
