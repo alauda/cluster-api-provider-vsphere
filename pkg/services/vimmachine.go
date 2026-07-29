@@ -172,6 +172,10 @@ func (v *VimMachineService) ReconcileNormal(ctx context.Context, machineCtx capv
 		return false, err
 	}
 
+	// Mirror the VM's real-time power state onto the VSphereMachine so that a VM powered off out of band
+	// after its initial power-on surfaces the machine as not ready in v1beta2 as well.
+	reconcilePoweredOnCondition(vimMachineCtx.VSphereMachine, vm)
+
 	// Waits the VM's ready state.
 	if !vm.Status.Ready {
 		log.Info("Waiting for VSphereVM to become ready")
@@ -207,6 +211,21 @@ func (v *VimMachineService) ReconcileNormal(ctx context.Context, machineCtx capv
 
 	vimMachineCtx.VSphereMachine.Status.Ready = true
 	return false, nil
+}
+
+// reconcilePoweredOnCondition mirrors the VSphereVM's real-time PoweredOn condition onto the VSphereMachine
+// so the machine surfaces as not ready when the VM is powered off out of band after its initial power-on.
+//
+// v1beta1 is already covered by the VMProvisioned mirror, which copies the VSphereVM's Ready condition (and
+// Ready aggregates PoweredOn). Only the v1beta2 VirtualMachineProvisioned mirror tracks provisioning alone and
+// stays True while powered off, so PoweredOn is mirrored separately for v1beta2. It is mirrored only once the
+// VM reports it, so before the initial power-on the (missing) condition is ignored by the Ready summary.
+func reconcilePoweredOnCondition(machine *infrav1.VSphereMachine, vm *infrav1.VSphereVM) {
+	if v1beta2conditions.Get(vm, infrav1.VSphereVMPoweredOnV1Beta2Condition) == nil {
+		return
+	}
+	v1beta2conditions.SetMirrorCondition(vm, machine, infrav1.VSphereVMPoweredOnV1Beta2Condition,
+		v1beta2conditions.TargetConditionType(infrav1.VSphereMachinePoweredOnV1Beta2Condition))
 }
 
 // GetHostInfo returns the hostname or IP address of the infrastructure host for the VSphere VM.

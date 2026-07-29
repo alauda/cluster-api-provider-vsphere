@@ -131,6 +131,24 @@ const (
 	// NotFoundReason (Severity=Warning) documents the VSphereVM not having the PCI device attached during VM startup.
 	// This would indicate that the PCI devices were removed out of band by an external entity.
 	NotFoundReason = "NotFound"
+
+	// InitialPowerOnCompletedCondition is a one-way latch documenting that the VSphereVM has completed its
+	// initial power-on. Once the VM is first observed powered on it is set to True and never changes again.
+	// The controller uses it to decide whether to power on a VM found powered off: while unset the VM is
+	// powered on as part of provisioning; once set, a powered-off VM is treated as an out-of-band operator
+	// action (e.g. maintenance) and is not powered back on.
+	//
+	// NOTE: This condition is internal to VSphereVM and is not aggregated into the Ready condition.
+	InitialPowerOnCompletedCondition clusterv1.ConditionType = "InitialPowerOnCompleted"
+
+	// PoweredOnCondition reflects the real-time power state of the underlying VM. It is aggregated into the
+	// VSphereVM Ready condition; the owning VSphereMachine in turn mirrors the VSphereVM Ready condition, so a
+	// VM that was powered off out of band after its initial power-on surfaces as not ready on both objects.
+	PoweredOnCondition clusterv1.ConditionType = "PoweredOn"
+
+	// PoweredOffReason (Severity=Info) documents that the VM is powered off after its initial power-on
+	// completed, i.e. it was stopped out of band and the controller intentionally does not power it back on.
+	PoweredOffReason = "PoweredOff"
 )
 
 // Conditions and Reasons related to utilizing a VSphereIdentity to make connections to a VCenter.

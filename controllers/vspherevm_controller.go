@@ -202,6 +202,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 				infrav1.VCenterAvailableCondition,
 				infrav1.IPAddressClaimedCondition,
 				infrav1.VMProvisionedCondition,
+				infrav1.PoweredOnCondition,
 			),
 		)
 
@@ -210,10 +211,12 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
 				infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+				infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			},
 			v1beta2conditions.IgnoreTypesIfMissing{
 				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
 				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+				infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			},
 			// Using a custom merge strategy to override reasons applied during merge.
 			v1beta2conditions.CustomMergeStrategy{
@@ -236,6 +239,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 			infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
 			infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 			infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+			infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			infrav1.VSphereVMGuestSoftPowerOffSucceededV1Beta2Condition,
 			infrav1.VSphereVMPCIDevicesDetachedV1Beta2Condition,
 			clusterv1.PausedV1Beta2Condition,

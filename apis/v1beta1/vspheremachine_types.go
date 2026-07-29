@@ -104,6 +104,23 @@ const (
 	VSphereMachineVirtualMachineDeletingV1Beta2Reason = clusterv1.DeletingV1Beta2Reason
 )
 
+// Constants for the VSphereMachine's PoweredOn condition and reasons used in the v1Beta2 API version.
+const (
+	// VSphereMachinePoweredOnV1Beta2Condition mirrors the real-time power state of the VirtualMachine
+	// controlled by the VSphereMachine. It is aggregated into the VSphereMachine Ready condition, so a VM
+	// that was powered off out of band (e.g. by an administrator for maintenance) surfaces as not ready.
+	VSphereMachinePoweredOnV1Beta2Condition = "PoweredOn"
+
+	// VSphereMachinePoweredOnV1Beta2Reason documents that the VirtualMachine controlled by the VSphereMachine
+	// is powered on.
+	VSphereMachinePoweredOnV1Beta2Reason = "PoweredOn"
+
+	// VSphereMachinePoweredOffV1Beta2Reason documents that the VirtualMachine controlled by the VSphereMachine
+	// is powered off after its initial power-on completed, i.e. it was stopped out of band and the controller
+	// intentionally does not power it back on.
+	VSphereMachinePoweredOffV1Beta2Reason = "PoweredOff"
+)
+
 // VSphereMachineSpec defines the desired state of VSphereMachine.
 type VSphereMachineSpec struct {
 	VirtualMachineCloneSpec `json:",inline"`

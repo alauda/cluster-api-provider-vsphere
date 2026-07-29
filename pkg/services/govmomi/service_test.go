@@ -37,8 +37,11 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -386,6 +389,100 @@ func TestResolveNodeIdentityAllowsMissingNodeIP(t *testing.T) {
 		g.Expect(err).ToNot(HaveOccurred())
 		g.Expect(identity.Hostname).To(Equal("worker-02"))
 		g.Expect(identity.NodeIP).To(BeEmpty())
+	})
+}
+
+func TestReconcilePowerStateInitialPowerOnLatch(t *testing.T) {
+	newVSphereVM := func() *infrav1.VSphereVM {
+		return &infrav1.VSphereVM{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vspherevm1",
+				Namespace: "default",
+			},
+		}
+	}
+
+	t.Run("powered-on VM latches InitialPowerOnCompleted and reflects PoweredOn", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			finder := find.NewFinder(c)
+			vm, err := finder.VirtualMachine(ctx, "DC0_H0_VM0") // powered on by default
+			g.Expect(err).ToNot(HaveOccurred())
+
+			vmCtx := emptyVirtualMachineContext()
+			vmCtx.Obj = vm
+			vmCtx.VSphereVM = newVSphereVM()
+
+			ok, err := (&VMService{}).reconcilePowerState(ctx, vmCtx)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(ok).To(BeTrue())
+			g.Expect(conditions.IsTrue(vmCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)).To(BeTrue())
+			g.Expect(conditions.IsTrue(vmCtx.VSphereVM, infrav1.PoweredOnCondition)).To(BeTrue())
+			return nil
+		})
+	})
+
+	t.Run("once latched a powered-off VM is not powered back on and surfaces not ready", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			vm, err := getPoweredoffVM(ctx, c)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			vmCtx := emptyVirtualMachineContext()
+			vmCtx.Obj = vm
+			vmCtx.VSphereVM = newVSphereVM()
+			// Simulate a VM that has already completed its initial power-on and is now
+			// stopped out of band by an operator.
+			conditions.MarkTrue(vmCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)
+			vmCtx.VSphereVM.Status.Ready = true
+
+			ok, err := (&VMService{}).reconcilePowerState(ctx, vmCtx)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(ok).To(BeFalse())
+
+			// The controller must not power the VM back on.
+			powerState, err := vm.PowerState(ctx)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(powerState).To(Equal(types.VirtualMachinePowerStatePoweredOff))
+
+			// The powered-off state is reflected and drags Ready down.
+			g.Expect(conditions.IsFalse(vmCtx.VSphereVM, infrav1.PoweredOnCondition)).To(BeTrue())
+			g.Expect(conditions.GetReason(vmCtx.VSphereVM, infrav1.PoweredOnCondition)).To(Equal(infrav1.PoweredOffReason))
+			g.Expect(vmCtx.VSphereVM.Status.Ready).To(BeFalse())
+			// The latch itself is never cleared.
+			g.Expect(conditions.IsTrue(vmCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)).To(BeTrue())
+			return nil
+		})
+	})
+
+	t.Run("before the latch a powered-off VM is powered on as part of provisioning", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			vm, err := getPoweredoffVM(ctx, c)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			scheme := runtime.NewScheme()
+			g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+			vsphereVM := newVSphereVM()
+			cl := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(vsphereVM).WithStatusSubresource(vsphereVM).Build()
+			helper, err := patch.NewHelper(vsphereVM, cl)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			vmCtx := emptyVirtualMachineContext()
+			vmCtx.Obj = vm
+			vmCtx.VSphereVM = vsphereVM
+			vmCtx.PatchHelper = helper
+
+			ok, err := (&VMService{}).reconcilePowerState(ctx, vmCtx)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(ok).To(BeFalse())
+			// A power-on task was triggered and the latch is not set yet: it only latches
+			// once the VM is actually observed powered on.
+			g.Expect(vmCtx.VSphereVM.Status.TaskRef).ToNot(BeEmpty())
+			g.Expect(conditions.IsTrue(vmCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)).To(BeFalse())
+			return nil
+		})
 	})
 }
 

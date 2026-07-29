@@ -28,6 +28,7 @@ import (
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1386,4 +1387,54 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_reconcilePoweredOnCondition(t *testing.T) {
+	newVM := func(set func(*infrav1.VSphereVM)) *infrav1.VSphereVM {
+		vm := &infrav1.VSphereVM{ObjectMeta: metav1.ObjectMeta{Name: "vm", Namespace: "default"}}
+		if set != nil {
+			set(vm)
+		}
+		return vm
+	}
+
+	t.Run("VM has not reported PoweredOn yet: machine condition stays unset", func(t *testing.T) {
+		g := NewWithT(t)
+		machine := &infrav1.VSphereMachine{}
+		reconcilePoweredOnCondition(machine, newVM(nil))
+		g.Expect(v1beta2conditions.Get(machine, infrav1.VSphereMachinePoweredOnV1Beta2Condition)).To(BeNil())
+	})
+
+	t.Run("VM powered off out of band: machine mirrors PoweredOn=False", func(t *testing.T) {
+		g := NewWithT(t)
+		machine := &infrav1.VSphereMachine{}
+		vm := newVM(func(vm *infrav1.VSphereVM) {
+			v1beta2conditions.Set(vm, metav1.Condition{
+				Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+				Status: metav1.ConditionFalse,
+				Reason: infrav1.VSphereVMPoweredOffV1Beta2Reason,
+			})
+		})
+		reconcilePoweredOnCondition(machine, vm)
+		c := v1beta2conditions.Get(machine, infrav1.VSphereMachinePoweredOnV1Beta2Condition)
+		g.Expect(c).ToNot(BeNil())
+		g.Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(c.Reason).To(Equal(infrav1.VSphereVMPoweredOffV1Beta2Reason))
+	})
+
+	t.Run("VM powered on: machine mirrors PoweredOn=True", func(t *testing.T) {
+		g := NewWithT(t)
+		machine := &infrav1.VSphereMachine{}
+		vm := newVM(func(vm *infrav1.VSphereVM) {
+			v1beta2conditions.Set(vm, metav1.Condition{
+				Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+				Status: metav1.ConditionTrue,
+				Reason: infrav1.VSphereVMPoweredOnV1Beta2Reason,
+			})
+		})
+		reconcilePoweredOnCondition(machine, vm)
+		c := v1beta2conditions.Get(machine, infrav1.VSphereMachinePoweredOnV1Beta2Condition)
+		g.Expect(c).ToNot(BeNil())
+		g.Expect(c.Status).To(Equal(metav1.ConditionTrue))
+	})
 }

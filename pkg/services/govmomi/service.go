@@ -444,6 +444,21 @@ func (vms *VMService) reconcilePowerState(ctx context.Context, virtualMachineCtx
 	}
 	switch powerState {
 	case infrav1.VirtualMachinePowerStatePoweredOff:
+		// Once the VM has completed its initial power-on, a subsequent powered-off state is treated as an
+		// out-of-band operator action (e.g. stopping the node for maintenance). The controller must not
+		// power it back on; it only reflects the powered-off state and leaves the VM to the operator.
+		if conditions.IsTrue(virtualMachineCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition) {
+			log.Info("VM is powered off after initial power-on; leaving it powered off for out-of-band operation")
+			conditions.MarkFalse(virtualMachineCtx.VSphereVM, infrav1.PoweredOnCondition, infrav1.PoweredOffReason, clusterv1.ConditionSeverityInfo, "VM was powered off out of band after initial power-on")
+			v1beta2conditions.Set(virtualMachineCtx.VSphereVM, metav1.Condition{
+				Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+				Status: metav1.ConditionFalse,
+				Reason: infrav1.VSphereVMPoweredOffV1Beta2Reason,
+			})
+			virtualMachineCtx.VSphereVM.Status.Ready = false
+			return false, nil
+		}
+
 		log.Info("Powering on VM")
 		task, err := virtualMachineCtx.Obj.PowerOn(ctx)
 		if err != nil {
@@ -477,6 +492,16 @@ func (vms *VMService) reconcilePowerState(ctx context.Context, virtualMachineCtx
 		return false, nil
 	case infrav1.VirtualMachinePowerStatePoweredOn:
 		log.Info("VM is powered on")
+		// Latch the initial power-on: once set to True this condition never changes and gates whether a
+		// later powered-off VM is powered back on (it is not).
+		conditions.MarkTrue(virtualMachineCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)
+		// Reflect the real-time power state; this is aggregated into the Ready condition.
+		conditions.MarkTrue(virtualMachineCtx.VSphereVM, infrav1.PoweredOnCondition)
+		v1beta2conditions.Set(virtualMachineCtx.VSphereVM, metav1.Condition{
+			Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+			Status: metav1.ConditionTrue,
+			Reason: infrav1.VSphereVMPoweredOnV1Beta2Reason,
+		})
 		return true, nil
 	default:
 		return false, errors.Errorf("unexpected power state %q for vm %s", powerState, virtualMachineCtx)

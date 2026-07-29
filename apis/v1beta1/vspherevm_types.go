@@ -177,6 +177,23 @@ const (
 	VSphereVMPCIDevicesDetachedNotFoundV1Beta2Reason = "NotFound"
 )
 
+// VSphereVM's PoweredOn condition and corresponding reasons that will be used in v1Beta2 API version.
+const (
+	// VSphereVMPoweredOnV1Beta2Condition reflects the real-time power state of the VirtualMachine
+	// controlled by the VSphereVM. It is aggregated into the VSphereVM Ready condition, so a VM that
+	// was powered off out of band (e.g. by an administrator for maintenance) surfaces as not ready.
+	VSphereVMPoweredOnV1Beta2Condition string = "PoweredOn"
+
+	// VSphereVMPoweredOnV1Beta2Reason documents that the VirtualMachine controlled by the VSphereVM
+	// is powered on.
+	VSphereVMPoweredOnV1Beta2Reason = "PoweredOn"
+
+	// VSphereVMPoweredOffV1Beta2Reason documents that the VirtualMachine controlled by the VSphereVM
+	// is powered off after its initial power-on completed, i.e. it was stopped out of band and the
+	// controller intentionally does not power it back on.
+	VSphereVMPoweredOffV1Beta2Reason = "PoweredOff"
+)
+
 // VSphereVMSpec defines the desired state of VSphereVM.
 type VSphereVMSpec struct {
 	VirtualMachineCloneSpec `json:",inline"`
