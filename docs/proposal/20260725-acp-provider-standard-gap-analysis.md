@@ -125,13 +125,13 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
   - **管线**：复用持久盘现有脚本框架、systemd unit 与 cloud-init 注入（`pkg/util/machines.go`），盘表区分持久/非持久两类。
 - **验收**：槽位声明的非持久盘随 VM 创建/删除；升级重建后按声明重建空盘；unitNumber 与持久盘不冲突（validation 并入 P1-3）。
 
-### P1-8　容灾 encryptionProviderConfigRef（#16）
+### P1-8　容灾 encryption-config 复用（#16）
 
 - **背景**：容灾主备切换时，备集群从主集群恢复 etcd 数据；若两侧 kube-apiserver 的 encryption-provider 加密密钥不同，备集群无法解密已加密的 Secret 等资源。需让主备复用同一份 `encryption-provider.conf`。
 - **现状**：CAPV 源码无任何 encryption 相关处理，加密密钥由各集群 bootstrap 各自生成，主备互不相同。
 - **DCS 做法（参考）**：`DCSClusterSpec.EncryptionProviderConfigRef *corev1.LocalObjectReference` 引用一个含 `encryption-provider.conf` 键的 Secret；设值时 controller 用它替代随机生成，并在控制面节点 bootstrap 时注入 `/etc/kubernetes/encryption-provider.conf`。`resolveEncryptionProviderConf` 仅对控制面 Machine 生效（`internal/controller/dcsmachine_vm.go:81`）：未设值时首个控制面节点新生成、后续节点从已有 apiserver 读取。
-- **CAPV 落点差异（需 owner 确认）**：CAPV 走 kubeadm bootstrap（CABPK），投递路径与 DCS 的自渲染 ignition 不同——可不新增 `VSphereClusterSpec` 字段，直接由 `KubeadmControlPlane` 的 `files` + `clusterConfiguration.apiServer`（extraArgs `--encryption-provider-config`、extraVolumes）把引用 Secret 的内容写入控制面节点；是否仍在 `VSphereClusterSpec` 建模 `encryptionProviderConfigRef` 由 provider 统一注入（与 DCS 对齐），需 owner 在「复用 kubeadm 既有能力」与「provider 统一建模」间取舍。
-- **验收**：主备两集群 kube-apiserver 使用同一 encryption-provider 配置；备集群可解密从主集群恢复的加密资源。
+- **决定：不通过代码处理，改为 YAML 声明。** CAPV 走 kubeadm bootstrap（CABPK），投递路径与 DCS 的自渲染 ignition 不同。当前方案是：在主备两集群的 `KubeadmControlPlane` YAML 中直接声明相同的 encryption-config——由 `files` 写入 `encryption-provider.conf`，配合 `clusterConfiguration.apiServer` 的 extraArgs `--encryption-provider-config` 与 extraVolumes 挂载到控制面节点。**不新增 `VSphereClusterSpec.encryptionProviderConfigRef` 字段，也不在 controller 中做任何 encryption 相关处理**（不采用 DCS 的 provider 统一注入路线）。主备复用同一密钥由部署侧保证两份 YAML 声明一致来实现。
+- **验收**：主备两集群 `KubeadmControlPlane` YAML 声明同一份 encryption-provider 配置；两集群 kube-apiserver 使用相同密钥，备集群可解密从主集群恢复的加密资源。属部署约定，CAPV 代码不涉及，无需 provider 侧改动。
 
 ### P1-9　VM 开机仅在创建时执行一次（#17，非规范项）
 
