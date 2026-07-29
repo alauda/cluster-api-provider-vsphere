@@ -391,7 +391,10 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 				}
 				for i := range pool.Spec.Configs {
 					if pool.Spec.Configs[i].Hostname == hostname {
-						slot = &pool.Spec.Configs[i]
+						slotCopy := pool.Spec.Configs[i]
+						slotCopy.PersistentDisks = append([]infrav1.PersistentDisk(nil), pool.Spec.Configs[i].PersistentDisks...)
+						services.HydrateSlotFromStatus(pool, &slotCopy)
+						slot = &slotCopy
 						break
 					}
 				}
@@ -690,7 +693,7 @@ func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VM
 	if vmCtx.MachineConfigSlot != nil {
 		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
 		if err == nil && machine != nil && machine.Spec.MachineConfigPoolRef != nil {
-			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.MachineConfigPoolRef, vmCtx.MachineConfigSlot); err != nil {
+			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.MachineConfigPoolRef, vmCtx.MachineConfigSlot, machine.Name, string(machine.UID)); err != nil {
 				return reconcile.Result{}, errors.Wrapf(err, "failed to persist slot changes for vm %s", vmCtx.VSphereVM.Name)
 			}
 		}

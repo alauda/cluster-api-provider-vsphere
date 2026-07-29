@@ -149,10 +149,40 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 
 ### P2-1　持久盘 observed state 迁到 status（#18）
 
-- **设计**：新增 `status.persistentDiskStatus`（绑定 hostname/slot，含 volumePath/diskUUID、phase、owner machine、attached VM、lastError 等），controller 不再回写 spec；现有 `MachineConfigSlotReclaimStatus` 并入其 phase 子状态。
-- **参考**：DCS/HCS 的 `PersistentDiskStatus` 均已在 status，字段结构可参照。
-- **存量迁移**：分两个 release——先加 status 字段并保留 spec 旧字段，controller 每轮幂等 backfill（status 缺记录时用 spec 值播种），下一版本再从 CRD 删除 spec 字段。不可同版本删除，否则 pruning 会在 backfill 前裁掉 `volumePath/diskUUID`。兜底：数据在 `.vmdk` 上，指针可按 unitNumber 从 vCenter 重发现。
-- **验收**：spec 只含用户声明字段；存量对象 backfill 后 status 完整；attach/detach/reclaim 单测。
+**目标**：把三项纯观测态 `VolumePath`/`DiskUUID`/`UnitNumber`（回填值）从 spec（`configs[].persistentDisks[]`）迁到 pool status，controller 不再回写 spec；独立类型 `MachineConfigSlotReclaimStatus` 废弃，揉进新 per-disk 记录的 `Phase`。对齐 DCS/HCS 的 `status.persistentDiskStatus[]`。
+
+**新类型**（`apis/v1beta1/vspheremachineconfigpool_types.go`）：pool.Status 增 `PersistentDiskStatuses []PersistentDiskStatus`，按 (hostname, disk name) 唯一；配 `FindDiskStatus`/`UpsertDiskStatus`/`RemoveDiskStatus` helper（参照 HCS `hcsmachineconfigpool_helpers.go`，`LastTransitionTime` 仅在 phase 变更时刷新）。
+
+| 字段 | 说明 |
+|---|---|
+| `Hostname`、`Name` | key：所属 slot 与盘名（对齐 spec） |
+| `VolumePath`、`DiskUUID` | 观测：vmdk 路径与磁盘 UUID |
+| `UnitNumber *int32` | 观测/实际分配的 SCSI unit（spec 的 `UnitNumber` 保留为用户可选期望值，不再回填） |
+| `Phase` | `Creating`\|`Attached`\|`Available`\|`Reclaiming`\|`Reclaimed`\|`Error`；`Reclaimed` 为回收完成的终态墓碑（详见下「存量迁移」） |
+| `OwnerMachineUID`、`OwnerMachineName` | 占用盘的 `VSphereMachine`（取其 Name/UID，与 slot 的 `configStatuses[].machineRef` 同源，非 CAPI `Machine`）；跨机器删除保留，滚动升级时把盘认回重建的新机 |
+| `LastError`、`LastTransitionTime` | `Error` 时的错误与最近相变时间 |
+| `TaskRef`、`RetryAfter` | CAPV 特有：异步 reclaim vCenter task 的轮询与失败退避（DCS/HCS 同步调 SDK 无此需求） |
+
+**不引入 `attachedVM`**：CAPV 的 hostname 即 VM 名（也是 node 名），slot→hostname→VM 天然对应，加 `OwnerMachine`（即 `VSphereMachine`）已足；reclaim 前的挂载安全检查当场查 vCenter（`FindAttachedPersistentDisks`），不落盘。DCS `AttachedVmUrn`/HCS `AttachedServerID` 因其 VM 标识是不透明 URN 才需单存，CAPV 冗余。
+
+**改动缝合点**（内存 slot 的下游消费者 clone/guest-config 全不改）：
+1. **加载（overlay）**：新增纯函数 `HydrateSlotFromStatus(pool, slot)`（`pkg/services/machineconfigpool.go`），把 status 的 `VolumePath`/`DiskUUID`/`UnitNumber` 覆盖到从 spec 取出的内存 slot 副本；在 `AllocateSlot`/`allocateSlotOnce`、`GetSlotForMachine` 返回前及 `vspherevm_controller.go` 的 annotation 回退取 slot 处调用。规则：spec 显式声明的 `UnitNumber` 优先，未声明才用 status 上次观测值。仅为「clone 复用已有 vmdk（`clone.go:488`）」与「guest 挂载认盘（`util/machines.go`）」两处消费者服务。hydrate 不做持久化。
+2. **回填**：`persistMachineConfigPoolChanges`（`vimmachine.go`）、`persistMachineConfigSlotBackfill`（`govmomi/service.go`）、`PersistSlotChanges`/`ApplyDiskBackfill`（`machineconfigpool.go`）改写 `status.PersistentDiskStatuses`（走 `Status().Update`，Phase=`Attached`、记 OwnerMachine），不再写 spec。
+3. **reclaim**：`vspheremachineconfigpool_controller.go` 的读/清空改到 status；`reclaimSlotDisks`+`pollReclaimTask` 用 per-disk `Phase`（`Reclaiming`/`Available`/`Error`）+ `TaskRef`/`RetryAfter`/`LastError` 取代 per-slot `reclaimStatus`。回收成功不删记录，改标 `Reclaimed` 墓碑（`TombstoneDiskStatus`，清空 `VolumePath`/`DiskUUID`/`TaskRef`/`RetryAfter`），循环开头见 `Reclaimed` 即跳过——原因见「存量迁移」。
+4. **provision 判定与 condition**：未 provision 判定（`poolUnprovisionedInUseDisk`）经 `ObservedVolumePath`（status 优先、spec 兜底）判断；`PersistentDisksReady` 改看 per-disk `Phase==Error`。
+
+**存量迁移（两 release，不可同版本删）**：`reclaimStatus` 与 `persistentDisks.volumePath/diskUUID` 在基线 `dev/v1.13.1` 及交付仓库 CRD 中均已存在，属存量已发布字段。
+- **release 1（本 PR）**：加 status 字段；pool reconcile（normal 与 delete）入口调 `SeedPersistentDiskStatuses(pool)`：对 spec 有 `volumePath/diskUUID` 却无 status 记录的盘幂等播种一条 status（Phase 按 slot 态取 `Attached`/`Available`，owner 取 slot 的 MachineRef），并把存量 `configStatuses[].reclaimStatus` 折叠进对应盘记录后清空；此后只写 status，spec 旧字段冻结。overlay 读取时 status 优先、spec 兜底，未播种也不影响消费者。
+- **`Reclaimed` 墓碑（为何回收成功不删记录）**：因 release 1 里 spec 的 `volumePath` 冻结保留，若回收成功直接 `RemoveDiskStatus`，下一轮 seed 会因「spec 有 volumePath、status 无记录」再次播种，把已删的盘重新判为可回收，陷入 seed→删盘（file-not-found）→删记录→再 seed 的死循环，`reclaimed` 永不为真——升级删 pool 时 finalizer 摘不掉、正常运行时释放槽位回不到 `Available`。故回收成功保留记录、标 `Reclaimed`（观测值清空）：记录在则 seed 跳过、`HasReclaimablePersistentDiskBacking` 判不可回收；`HydrateSlotFromStatus` 见 `Reclaimed` 把内存 slot 的 `volumePath/diskUUID` 清空，使复用该槽位的新机器新建盘而非挂已删 vmdk；槽位复用时 backfill 覆盖墓碑。release 2 spec 字段删除后此约束自然消失，墓碑逻辑仍适用。
+- **release 2**：从 CRD 删 spec 的 `volumePath/diskUUID`（`UnitNumber` 保留为用户期望字段）与 `configStatuses[].reclaimStatus`（及 `MachineConfigSlotReclaimStatus` 类型）。不可同版本删，否则 CRD pruning 会在播种前裁掉指针。兜底：数据在 `.vmdk`，指针可按 unitNumber 从 vCenter 重发现。
+
+**验收与测试用例**：
+- hydrate（overlay）：status 优先 / spec 显式 UnitNumber 保留、其余观测值仍覆盖 / 无记录时 slot 不变。
+- 回填只写 status、不写 spec（spec 冻结留空）；`Status().Update` 冲突重试。
+- reclaim 相变：`Attached`→（机器删）`Available`→`Reclaiming`→删完标 `Reclaimed` 墓碑（保留记录、观测值清空）；失败落 `Error` + `LastError` + `RetryAfter`。
+- 墓碑防重播种：升级上来（spec 带 `volumePath`）的对象回收成功后，重复 reconcile 收敛到 `reclaimed=true`（槽位回 `Available`、删 pool 摘掉 finalizer），不再无限重删。
+- 存量迁移（seed）：仅 spec 带 `volumePath/diskUUID` 的对象播种且幂等、不覆盖既有记录；带旧 `reclaimStatus` 的 mid-reclaim 对象折叠进盘记录并清空旧字段。
+- `make manifests`/`make generate` 无 diff；`go test -vet=off` 通过。交付仓库 chart CRD 因整分支（含 A/B 的 status 字段）已滞后，统一在交付时整体重生成，不逐项手改。
 
 ### P2-2　govmomi 控制面 LB/VIP（#19）——⏸ 暂缓
 

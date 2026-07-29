@@ -239,6 +239,16 @@ type VSphereMachineConfigPoolStatus struct {
 	// +optional
 	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
 
+	// PersistentDiskStatuses tracks the observed state of each persistent disk,
+	// keyed by (hostname, disk name). The controller backfills the vmdk path,
+	// disk UUID, and actually-assigned SCSI unit here instead of writing them
+	// back onto spec, and drives reclaim through the per-disk Phase.
+	// +optional
+	// +listType=map
+	// +listMapKey=hostname
+	// +listMapKey=name
+	PersistentDiskStatuses []PersistentDiskStatus `json:"persistentDiskStatuses,omitempty"`
+
 	// v1beta2 groups all the fields that will be added or modified in
 	// VSphereMachineConfigPool's status with the V1Beta2 version.
 	// +optional
@@ -331,6 +341,100 @@ type MachineConfigSlotReclaimStatus struct {
 	// LastError stores the latest reclaim task failure.
 	// +optional
 	LastError string `json:"lastError,omitempty"`
+}
+
+// PersistentDiskPhase describes the lifecycle of a slot's persistent disk as
+// observed by the controller.
+type PersistentDiskPhase string
+
+const (
+	// PersistentDiskPhaseCreating means the disk has been requested but its
+	// vmdk path / UUID have not been backfilled yet.
+	PersistentDiskPhaseCreating PersistentDiskPhase = "Creating"
+	// PersistentDiskPhaseAttached means the disk is created and attached to the
+	// slot's VM.
+	PersistentDiskPhaseAttached PersistentDiskPhase = "Attached"
+	// PersistentDiskPhaseAvailable means the disk exists and is detached (its
+	// VM was deleted) but has not been reclaimed; it can be re-attached when the
+	// slot is reused.
+	PersistentDiskPhaseAvailable PersistentDiskPhase = "Available"
+	// PersistentDiskPhaseReclaiming means an asynchronous vCenter task to delete
+	// the disk is in flight.
+	PersistentDiskPhaseReclaiming PersistentDiskPhase = "Reclaiming"
+	// PersistentDiskPhaseError means the last reclaim task failed; the controller
+	// waits out RetryAfter before the next attempt.
+	PersistentDiskPhaseError PersistentDiskPhase = "Error"
+	// PersistentDiskPhaseReclaimed is the terminal tombstone: the disk's backing
+	// vmdk has been deleted. The record is deliberately kept (not removed) with its
+	// observed backing cleared, so the release-1 migration does not re-seed the disk
+	// from spec's frozen VolumePath on the next reconcile and drive an endless
+	// reclaim loop. It is overwritten by backfill when the slot is reused.
+	PersistentDiskPhaseReclaimed PersistentDiskPhase = "Reclaimed"
+)
+
+// PersistentDiskStatus tracks the observed state of a single persistent disk.
+// It replaces the controller-backfilled VolumePath/DiskUUID on spec and the
+// per-slot ReclaimStatus, keyed by (Hostname, Name).
+type PersistentDiskStatus struct {
+	// Hostname is the slot this disk belongs to (matches MachineConfigSlot.Hostname).
+	Hostname string `json:"hostname"`
+
+	// Name is the disk name (matches PersistentDisk.Name within the slot).
+	Name string `json:"name"`
+
+	// VolumePath is the datastore path to the backing .vmdk, backfilled after
+	// the disk is created.
+	// +optional
+	VolumePath string `json:"volumePath,omitempty"`
+
+	// DiskUUID is the disk UUID, backfilled after the disk is created. The guest
+	// uses it to identify and mount the disk.
+	// +optional
+	DiskUUID string `json:"diskUUID,omitempty"`
+
+	// UnitNumber is the SCSI unit number the disk was actually attached at. When
+	// spec does not pin a UnitNumber, this observed value is reused on the next
+	// VM recreation to keep disk ordering stable.
+	// +optional
+	UnitNumber *int32 `json:"unitNumber,omitempty"`
+
+	// Phase is the observed lifecycle of the disk: Creating -> Attached while in
+	// use, Attached -> Available when the VM is released, and
+	// Available -> Reclaiming -> Reclaimed as the backing is deleted (Error on a
+	// failed reclaim, retried after RetryAfter). Reclaimed is a terminal tombstone:
+	// the backing is gone but the record is kept so the release-1 migration does not
+	// re-seed the disk from spec's frozen VolumePath.
+	// +kubebuilder:validation:Enum=Creating;Attached;Available;Reclaiming;Reclaimed;Error
+	// +optional
+	Phase PersistentDiskPhase `json:"phase,omitempty"`
+
+	// OwnerMachineUID is the UID of the Machine currently owning the disk. It is
+	// preserved across VM delete/recreate so a rolling upgrade re-attaches the
+	// disk to the rebuilt machine.
+	// +optional
+	OwnerMachineUID string `json:"ownerMachineUID,omitempty"`
+
+	// OwnerMachineName is the name of the Machine currently owning the disk.
+	// +optional
+	OwnerMachineName string `json:"ownerMachineName,omitempty"`
+
+	// TaskRef tracks the in-flight vCenter reclaim task for this disk. CAPV
+	// reclaims disks asynchronously, so the task moniker is polled across
+	// reconciles (DCS/HCS call their SDKs synchronously and have no equivalent).
+	// +optional
+	TaskRef string `json:"taskRef,omitempty"`
+
+	// RetryAfter prevents tight retry loops after a failed reclaim task.
+	// +optional
+	RetryAfter *metav1.Time `json:"retryAfter,omitempty"`
+
+	// LastError stores the latest reclaim failure, surfaced when Phase is Error.
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+
+	// LastTransitionTime is the time Phase last changed.
+	// +optional
+	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true

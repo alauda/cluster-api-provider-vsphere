@@ -720,19 +720,12 @@ func (v *VimMachineService) persistMachineConfigPoolChanges(ctx context.Context,
 			return err
 		}
 
-		updated := false
-		for i := range pool.Spec.Configs {
-			if pool.Spec.Configs[i].Hostname == vimMachineCtx.MachineConfigSlot.Hostname {
-				pool.Spec.Configs[i].PersistentDisks = vimMachineCtx.MachineConfigSlot.PersistentDisks
-				updated = true
-				break
-			}
-		}
-
-		if !updated {
+		// Record the observed disk state (VolumePath/DiskUUID/UnitNumber) into
+		// pool status; spec is no longer written back by the controller.
+		if !ApplyDiskBackfill(pool, vimMachineCtx.MachineConfigSlot, vimMachineCtx.VSphereMachine.Name, string(vimMachineCtx.VSphereMachine.UID)) {
 			return nil
 		}
-		if err := v.Client.Update(ctx, pool); err != nil {
+		if err := v.Client.Status().Update(ctx, pool); err != nil {
 			if apierrors.IsConflict(err) {
 				continue
 			}

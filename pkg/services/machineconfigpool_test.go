@@ -322,6 +322,14 @@ func TestReleaseSlot(t *testing.T) {
 					},
 				},
 			},
+			// An attached disk on the slot must flip to Available on release: the
+			// VM is gone so the disk is detached but still backed and reusable.
+			PersistentDiskStatuses: []infrav1.PersistentDiskStatus{{
+				Hostname:   "host-1",
+				Name:       "data-0",
+				VolumePath: "[ds] host-1/data-0.vmdk",
+				Phase:      infrav1.PersistentDiskPhaseAttached,
+			}},
 		},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
@@ -333,6 +341,7 @@ func TestReleaseSlot(t *testing.T) {
 	_ = c.Get(ctx, client.ObjectKeyFromObject(pool), updatedPool)
 	g.Expect(updatedPool.Status.ConfigStatuses[0].State).To(Equal(infrav1.MachineConfigSlotStateReleased))
 	g.Expect(updatedPool.Status.ConfigStatuses[0].LastReleasedTime).NotTo(BeNil())
+	g.Expect(updatedPool.Status.PersistentDiskStatuses[0].Phase).To(Equal(infrav1.PersistentDiskPhaseAvailable))
 }
 
 func TestGetSlotForMachine(t *testing.T) {
@@ -529,17 +538,26 @@ func TestIsPoolFullyReusable(t *testing.T) {
 	released.Status.ConfigStatuses[0].LastReleasedTime = &now
 	g.Expect(IsPoolFullyReusable(released)).To(BeFalse())
 
+	// A reclaim task in flight (tracked per-disk in status) keeps the pool bound.
 	withTask := pool.DeepCopy()
-	withTask.Status.ConfigStatuses[0].ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{TaskRef: "task-1", State: "Running"}
+	withTask.Spec.Configs[0].PersistentDisks = []infrav1.PersistentDisk{{Name: "disk-1"}}
+	withTask.Status.PersistentDiskStatuses = []infrav1.PersistentDiskStatus{
+		{Hostname: "slot-1", Name: "disk-1", Phase: infrav1.PersistentDiskPhaseReclaiming, TaskRef: "task-1"},
+	}
 	g.Expect(IsPoolFullyReusable(withTask)).To(BeFalse())
 
+	// A disk whose observed VolumePath still lives on spec (un-seeded legacy).
 	withDisk := pool.DeepCopy()
 	withDisk.Spec.Configs[0].PersistentDisks = []infrav1.PersistentDisk{{Name: "disk-1", VolumePath: "[ds] vm/disk.vmdk"}}
 	g.Expect(IsPoolFullyReusable(withDisk)).To(BeFalse())
 
+	// A failed reclaim awaiting retry keeps the pool bound.
 	withRetry := pool.DeepCopy()
 	retryAfter := metav1.Now()
-	withRetry.Status.ConfigStatuses[0].ReclaimStatus = &infrav1.MachineConfigSlotReclaimStatus{RetryAfter: &retryAfter, State: "Failed"}
+	withRetry.Spec.Configs[0].PersistentDisks = []infrav1.PersistentDisk{{Name: "disk-1"}}
+	withRetry.Status.PersistentDiskStatuses = []infrav1.PersistentDiskStatus{
+		{Hostname: "slot-1", Name: "disk-1", Phase: infrav1.PersistentDiskPhaseError, RetryAfter: &retryAfter},
+	}
 	g.Expect(IsPoolFullyReusable(withRetry)).To(BeFalse())
 }
 
@@ -621,7 +639,7 @@ func TestPersistSlotChangesPersistsUnitNumber(t *testing.T) {
 			},
 		},
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).WithStatusSubresource(pool).Build()
 
 	unitNumber := int32(3)
 	err := PersistSlotChanges(ctx, c, &corev1.ObjectReference{Name: pool.Name, Namespace: pool.Namespace}, &infrav1.MachineConfigSlot{
@@ -634,15 +652,23 @@ func TestPersistSlotChangesPersistsUnitNumber(t *testing.T) {
 				DiskUUID:   "disk-uuid",
 			},
 		},
-	})
+	}, "machine-1", "machine-1-uid")
 	g.Expect(err).NotTo(HaveOccurred())
 
 	updatedPool := &infrav1.VSphereMachineConfigPool{}
 	_ = c.Get(ctx, client.ObjectKeyFromObject(pool), updatedPool)
-	g.Expect(updatedPool.Spec.Configs[0].PersistentDisks[0].UnitNumber).NotTo(BeNil())
-	g.Expect(*updatedPool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(Equal(unitNumber))
-	g.Expect(updatedPool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(Equal("[datastore1] disk-1/disk-1.vmdk"))
-	g.Expect(updatedPool.Spec.Configs[0].PersistentDisks[0].DiskUUID).To(Equal("disk-uuid"))
+
+	// Observed state is recorded in status, not written back to spec.
+	rec, _ := infrav1.FindDiskStatus(updatedPool, "host-1", "disk-1")
+	g.Expect(rec).NotTo(BeNil())
+	g.Expect(rec.UnitNumber).NotTo(BeNil())
+	g.Expect(*rec.UnitNumber).To(Equal(unitNumber))
+	g.Expect(rec.VolumePath).To(Equal("[datastore1] disk-1/disk-1.vmdk"))
+	g.Expect(rec.DiskUUID).To(Equal("disk-uuid"))
+	g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseAttached))
+	g.Expect(rec.OwnerMachineName).To(Equal("machine-1"))
+	g.Expect(updatedPool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(BeEmpty())
+	g.Expect(updatedPool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(BeNil())
 }
 
 func TestResolveMachineConsumerRef(t *testing.T) {
@@ -727,130 +753,97 @@ func TestResolveMachineConsumerRef(t *testing.T) {
 func TestApplyDiskBackfill(t *testing.T) {
 	int32Ptr := func(v int32) *int32 { return &v }
 
-	t.Run("backfills VolumePath DiskUUID UnitNumber", func(t *testing.T) {
-		g := NewWithT(t)
-		pool := &infrav1.VSphereMachineConfigPool{
+	newPool := func(disks ...infrav1.PersistentDisk) *infrav1.VSphereMachineConfigPool {
+		return &infrav1.VSphereMachineConfigPool{
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
 				Configs: []infrav1.MachineConfigSlot{{
-					Hostname: "host-1",
-					PersistentDisks: []infrav1.PersistentDisk{
-						{Name: "disk-a", SizeGiB: 20},
-					},
+					Hostname:        "host-1",
+					PersistentDisks: disks,
 				}},
 			},
 		}
+	}
+
+	t.Run("records observed state in status, leaving spec untouched", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
 		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
 			Hostname: "host-1",
 			PersistentDisks: []infrav1.PersistentDisk{
 				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
 			},
-		})
+		}, "machine-1", "machine-1-uid")
 		g.Expect(updated).To(BeTrue())
-		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk.vmdk"))
-		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].DiskUUID).To(Equal("uuid-1"))
-		g.Expect(*pool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(Equal(int32(1)))
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(rec.VolumePath).To(Equal("[ds] vm/disk.vmdk"))
+		g.Expect(rec.DiskUUID).To(Equal("uuid-1"))
+		g.Expect(*rec.UnitNumber).To(Equal(int32(1)))
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseAttached))
+		g.Expect(rec.OwnerMachineName).To(Equal("machine-1"))
+		g.Expect(rec.OwnerMachineUID).To(Equal("machine-1-uid"))
+		// spec is frozen — never written back.
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(BeEmpty())
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(BeNil())
 	})
 
-	t.Run("backfills duplicate-size disks by name", func(t *testing.T) {
+	t.Run("records duplicate-size disks by name", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereMachineConfigPool{
-			Spec: infrav1.VSphereMachineConfigPoolSpec{
-				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Configs: []infrav1.MachineConfigSlot{{
-					Hostname: "host-1",
-					PersistentDisks: []infrav1.PersistentDisk{
-						{Name: "disk-a", SizeGiB: 20},
-						{Name: "disk-b", SizeGiB: 20},
-					},
-				}},
-			},
-		}
+		pool := newPool(
+			infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20},
+			infrav1.PersistentDisk{Name: "disk-b", SizeGiB: 20},
+		)
 		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
 			Hostname: "host-1",
 			PersistentDisks: []infrav1.PersistentDisk{
 				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk-a.vmdk", DiskUUID: "uuid-a", UnitNumber: int32Ptr(0)},
 				{Name: "disk-b", SizeGiB: 20, VolumePath: "[ds] vm/disk-b.vmdk", DiskUUID: "uuid-b", UnitNumber: int32Ptr(1)},
 			},
-		})
+		}, "machine-1", "machine-1-uid")
 		g.Expect(updated).To(BeTrue())
-		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
-		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].DiskUUID).To(Equal("uuid-a"))
-		g.Expect(*pool.Spec.Configs[0].PersistentDisks[0].UnitNumber).To(Equal(int32(0)))
-		g.Expect(pool.Spec.Configs[0].PersistentDisks[1].VolumePath).To(Equal("[ds] vm/disk-b.vmdk"))
-		g.Expect(pool.Spec.Configs[0].PersistentDisks[1].DiskUUID).To(Equal("uuid-b"))
-		g.Expect(*pool.Spec.Configs[0].PersistentDisks[1].UnitNumber).To(Equal(int32(1)))
+		recA, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		recB, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-b")
+		g.Expect(recA.VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
+		g.Expect(*recA.UnitNumber).To(Equal(int32(0)))
+		g.Expect(recB.VolumePath).To(Equal("[ds] vm/disk-b.vmdk"))
+		g.Expect(*recB.UnitNumber).To(Equal(int32(1)))
 	})
 
-	t.Run("returns false when nothing changed", func(t *testing.T) {
+	t.Run("returns false when the status record is already up to date", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereMachineConfigPool{
-			Spec: infrav1.VSphereMachineConfigPoolSpec{
-				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Configs: []infrav1.MachineConfigSlot{{
-					Hostname: "host-1",
-					PersistentDisks: []infrav1.PersistentDisk{
-						{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
-					},
-				}},
-			},
-		}
+		pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
+		pool.Status.PersistentDiskStatuses = []infrav1.PersistentDiskStatus{{
+			Hostname: "host-1", Name: "disk-a",
+			VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1),
+			Phase: infrav1.PersistentDiskPhaseAttached, OwnerMachineName: "machine-1", OwnerMachineUID: "machine-1-uid",
+		}}
 		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
 			Hostname: "host-1",
 			PersistentDisks: []infrav1.PersistentDisk{
 				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk", DiskUUID: "uuid-1", UnitNumber: int32Ptr(1)},
 			},
-		})
+		}, "machine-1", "machine-1-uid")
 		g.Expect(updated).To(BeFalse())
 	})
 
-	t.Run("skips disk with mismatched UnitNumber", func(t *testing.T) {
+	t.Run("skips unprovisioned disk with no existing record", func(t *testing.T) {
 		g := NewWithT(t)
-		pool := &infrav1.VSphereMachineConfigPool{
-			Spec: infrav1.VSphereMachineConfigPoolSpec{
-				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Configs: []infrav1.MachineConfigSlot{{
-					Hostname: "host-1",
-					PersistentDisks: []infrav1.PersistentDisk{
-						{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(0)},
-					},
-				}},
-			},
-		}
+		pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
 		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
 			Hostname: "host-1",
 			PersistentDisks: []infrav1.PersistentDisk{
-				{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(1), VolumePath: "[ds] wrong/disk.vmdk"},
+				{Name: "disk-a", SizeGiB: 20}, // no VolumePath yet
 			},
-		})
-		g.Expect(updated).To(BeFalse(), "should skip update when UnitNumber disagrees")
-		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(BeEmpty())
-	})
-
-	t.Run("no-op for non-matching hostname", func(t *testing.T) {
-		g := NewWithT(t)
-		pool := &infrav1.VSphereMachineConfigPool{
-			Spec: infrav1.VSphereMachineConfigPoolSpec{
-				ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-				Configs: []infrav1.MachineConfigSlot{{
-					Hostname:        "host-1",
-					PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20}},
-				}},
-			},
-		}
-		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
-			Hostname: "host-other",
-			PersistentDisks: []infrav1.PersistentDisk{
-				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk.vmdk"},
-			},
-		})
+		}, "machine-1", "machine-1-uid")
 		g.Expect(updated).To(BeFalse())
+		g.Expect(pool.Status.PersistentDiskStatuses).To(BeEmpty())
 	})
 
 	t.Run("nil pool or slot returns false", func(t *testing.T) {
 		g := NewWithT(t)
-		g.Expect(ApplyDiskBackfill(nil, &infrav1.MachineConfigSlot{})).To(BeFalse())
-		g.Expect(ApplyDiskBackfill(&infrav1.VSphereMachineConfigPool{}, nil)).To(BeFalse())
+		g.Expect(ApplyDiskBackfill(nil, &infrav1.MachineConfigSlot{}, "", "")).To(BeFalse())
+		g.Expect(ApplyDiskBackfill(&infrav1.VSphereMachineConfigPool{}, nil, "", "")).To(BeFalse())
 	})
 }
 
@@ -1083,4 +1076,146 @@ func TestValidateIPUniqueness(t *testing.T) {
 	}
 	errs := ValidateIPUniqueness(pool)
 	g.Expect(errs).To(HaveLen(1)) // 10.0.0.1 duplicated once
+}
+
+func TestHydrateSlotFromStatus(t *testing.T) {
+	poolWith := func(records ...infrav1.PersistentDiskStatus) *infrav1.VSphereMachineConfigPool {
+		return &infrav1.VSphereMachineConfigPool{
+			Status: infrav1.VSphereMachineConfigPoolStatus{PersistentDiskStatuses: records},
+		}
+	}
+
+	t.Run("status observed values win over empty spec", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := poolWith(infrav1.PersistentDiskStatus{
+			Hostname: "host-1", Name: "disk-a",
+			VolumePath: "[ds] vm/disk-a.vmdk", DiskUUID: "uuid-a", UnitNumber: toInt32Ptr(2),
+		})
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:        "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20}},
+		}
+		HydrateSlotFromStatus(pool, slot)
+		g.Expect(slot.PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
+		g.Expect(slot.PersistentDisks[0].DiskUUID).To(Equal("uuid-a"))
+		g.Expect(*slot.PersistentDisks[0].UnitNumber).To(Equal(int32(2)))
+	})
+
+	t.Run("explicit spec UnitNumber is preserved, other observed values still overlaid", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := poolWith(infrav1.PersistentDiskStatus{
+			Hostname: "host-1", Name: "disk-a",
+			VolumePath: "[ds] vm/disk-a.vmdk", DiskUUID: "uuid-a", UnitNumber: toInt32Ptr(9),
+		})
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:        "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20, UnitNumber: toInt32Ptr(3)}},
+		}
+		HydrateSlotFromStatus(pool, slot)
+		g.Expect(*slot.PersistentDisks[0].UnitNumber).To(Equal(int32(3)), "pinned spec unit number wins")
+		g.Expect(slot.PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
+	})
+
+	t.Run("no status record leaves the slot untouched", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := poolWith()
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:        "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] legacy/disk.vmdk"}},
+		}
+		HydrateSlotFromStatus(pool, slot)
+		g.Expect(slot.PersistentDisks[0].VolumePath).To(Equal("[ds] legacy/disk.vmdk"))
+		g.Expect(slot.PersistentDisks[0].UnitNumber).To(BeNil())
+	})
+}
+
+func TestSeedPersistentDiskStatuses(t *testing.T) {
+	t.Run("seeds records from frozen spec values and freezes spec", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk-a.vmdk", DiskUUID: "uuid-a", UnitNumber: toInt32Ptr(0)},
+					},
+				}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
+					Hostname: "host-1", State: infrav1.MachineConfigSlotStateInUse,
+					MachineRef: &corev1.ObjectReference{Name: "worker-1", UID: "worker-1-uid"},
+				}},
+			},
+		}
+		changed := SeedPersistentDiskStatuses(pool)
+		g.Expect(changed).To(BeTrue())
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(rec.VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
+		g.Expect(rec.DiskUUID).To(Equal("uuid-a"))
+		g.Expect(*rec.UnitNumber).To(Equal(int32(0)))
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseAttached))
+		g.Expect(rec.OwnerMachineName).To(Equal("worker-1"))
+		g.Expect(rec.OwnerMachineUID).To(Equal("worker-1-uid"))
+		// spec is left intact (frozen), removed only in the next release.
+		g.Expect(pool.Spec.Configs[0].PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
+
+		// Idempotent: a second pass changes nothing.
+		g.Expect(SeedPersistentDiskStatuses(pool)).To(BeFalse())
+	})
+
+	t.Run("folds a legacy in-flight reclaimStatus into the disk record and clears it", func(t *testing.T) {
+		g := NewWithT(t)
+		retryAfter := metav1.Now()
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk-a.vmdk"},
+					},
+				}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
+					Hostname: "host-1", State: infrav1.MachineConfigSlotStateReleased,
+					ReclaimStatus: &infrav1.MachineConfigSlotReclaimStatus{
+						State:      infrav1.MachineConfigSlotReclaimStateFailed,
+						VolumePath: "[ds] vm/disk-a.vmdk",
+						RetryAfter: &retryAfter,
+						LastError:  "boom",
+					},
+				}},
+			},
+		}
+		g.Expect(SeedPersistentDiskStatuses(pool)).To(BeTrue())
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseError))
+		g.Expect(rec.LastError).To(Equal("boom"))
+		g.Expect(rec.RetryAfter).NotTo(BeNil())
+		// Legacy per-slot ReclaimStatus is cleared once folded.
+		g.Expect(pool.Status.ConfigStatuses[0].ReclaimStatus).To(BeNil())
+	})
+
+	t.Run("does not overwrite an existing record", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname:        "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] spec/disk.vmdk"}},
+				}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				PersistentDiskStatuses: []infrav1.PersistentDiskStatus{{
+					Hostname: "host-1", Name: "disk-a", VolumePath: "[ds] status/disk.vmdk", Phase: infrav1.PersistentDiskPhaseAttached,
+				}},
+			},
+		}
+		g.Expect(SeedPersistentDiskStatuses(pool)).To(BeFalse())
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec.VolumePath).To(Equal("[ds] status/disk.vmdk"))
+	})
 }

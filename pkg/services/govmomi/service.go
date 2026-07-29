@@ -1470,11 +1470,11 @@ func persistMachineConfigSlotBackfill(ctx context.Context, vmCtx *capvcontext.VM
 			return errors.Wrapf(err, "failed to get machine config pool for vm %s", vmCtx.VSphereVM.Name)
 		}
 
-		if !services.ApplyDiskBackfill(pool, vmCtx.MachineConfigSlot) {
+		if !services.ApplyDiskBackfill(pool, vmCtx.MachineConfigSlot, machine.Name, string(machine.UID)) {
 			return nil
 		}
 
-		if err := vmCtx.Client.Update(ctx, pool); err != nil {
+		if err := vmCtx.Client.Status().Update(ctx, pool); err != nil {
 			if apierrors.IsConflict(err) {
 				continue
 			}

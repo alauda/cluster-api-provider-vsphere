@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -438,22 +439,30 @@ func IsPoolFullyReusable(pool *infrav1.VSphereMachineConfigPool) bool {
 			if status.State == infrav1.MachineConfigSlotStateInUse || status.State == infrav1.MachineConfigSlotStateReleased {
 				return false
 			}
-			if status.ReclaimStatus != nil {
-				if status.ReclaimStatus.TaskRef != "" || status.ReclaimStatus.RetryAfter != nil {
-					return false
-				}
-			}
 		}
-		if hasReclaimablePersistentDiskBacking(slot) {
+		if HasReclaimablePersistentDiskBacking(pool, slot) {
 			return false
 		}
 	}
 	return true
 }
 
-func hasReclaimablePersistentDiskBacking(slot *infrav1.MachineConfigSlot) bool {
+// HasReclaimablePersistentDiskBacking reports whether any of the slot's disks
+// still has backing to reclaim, or a reclaim in flight. The observed volume path
+// and reclaim task now live in pool.Status.PersistentDiskStatuses; spec's frozen
+// VolumePath is honored as a fallback for objects that predate the status
+// migration and have not been seeded yet.
+func HasReclaimablePersistentDiskBacking(pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot) bool {
 	for i := range slot.PersistentDisks {
-		if slot.PersistentDisks[i].VolumePath != "" {
+		pd := &slot.PersistentDisks[i]
+		if rec, _ := infrav1.FindDiskStatus(pool, slot.Hostname, pd.Name); rec != nil {
+			if rec.VolumePath != "" || rec.TaskRef != "" || rec.RetryAfter != nil ||
+				rec.Phase == infrav1.PersistentDiskPhaseReclaiming || rec.Phase == infrav1.PersistentDiskPhaseError {
+				return true
+			}
+			continue
+		}
+		if pd.VolumePath != "" {
 			return true
 		}
 	}
@@ -491,6 +500,160 @@ func findSlotByHostname(pool *infrav1.VSphereMachineConfigPool, hostname string)
 		}
 	}
 	return nil
+}
+
+// HydrateSlotFromStatus overlays the controller-observed disk state (VolumePath,
+// DiskUUID, and the actually-assigned UnitNumber) from
+// pool.Status.PersistentDiskStatuses onto the in-memory slot's persistent disks.
+// Downstream consumers (VM clone reuse in clone.go, guest cloud-config in
+// util.GetPersistentDiskCloudConfig) keep reading these values off the slot, so
+// they see the observed state regardless of whether it still lives on spec
+// (legacy, frozen) or only in status (post-migration).
+//
+// A UnitNumber pinned explicitly on spec wins; otherwise the last observed unit
+// is reused to keep SCSI ordering stable across VM recreation.
+func HydrateSlotFromStatus(pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot) {
+	if pool == nil || slot == nil {
+		return
+	}
+	for i := range slot.PersistentDisks {
+		pd := &slot.PersistentDisks[i]
+		rec, _ := infrav1.FindDiskStatus(pool, slot.Hostname, pd.Name)
+		if rec == nil {
+			continue
+		}
+		if rec.Phase == infrav1.PersistentDiskPhaseReclaimed {
+			// Backing was reclaimed; clear any frozen spec observation so a reused
+			// slot provisions a fresh disk instead of trying to reattach the
+			// deleted vmdk. Backfill overwrites this tombstone with the new disk.
+			pd.VolumePath = ""
+			pd.DiskUUID = ""
+			continue
+		}
+		if rec.VolumePath != "" {
+			pd.VolumePath = rec.VolumePath
+		}
+		if rec.DiskUUID != "" {
+			pd.DiskUUID = rec.DiskUUID
+		}
+		if pd.UnitNumber == nil && rec.UnitNumber != nil {
+			u := *rec.UnitNumber
+			pd.UnitNumber = &u
+		}
+	}
+}
+
+// ObservedVolumePath returns the disk's controller-observed VolumePath. The
+// value now lives in pool.Status.PersistentDiskStatuses; spec's frozen VolumePath
+// is used as a fallback for objects that predate the status migration and have
+// not been seeded yet.
+func ObservedVolumePath(pool *infrav1.VSphereMachineConfigPool, hostname, name, specVolumePath string) string {
+	if rec, _ := infrav1.FindDiskStatus(pool, hostname, name); rec != nil {
+		return rec.VolumePath
+	}
+	return specVolumePath
+}
+
+// SeedPersistentDiskStatuses performs the release-1 migration: for every disk
+// whose observed state currently lives only on spec (frozen VolumePath/DiskUUID/
+// UnitNumber) or in a legacy per-slot ReclaimStatus, it creates the equivalent
+// pool.Status.PersistentDiskStatuses record so later releases can drop the spec
+// fields and the ReclaimStatus type. It never overwrites an existing record and
+// returns true if it changed status (so the caller persists it).
+func SeedPersistentDiskStatuses(pool *infrav1.VSphereMachineConfigPool) bool {
+	if pool == nil {
+		return false
+	}
+	slotStatus := make(map[string]*infrav1.MachineConfigSlotStatus, len(pool.Status.ConfigStatuses))
+	for i := range pool.Status.ConfigStatuses {
+		slotStatus[pool.Status.ConfigStatuses[i].Hostname] = &pool.Status.ConfigStatuses[i]
+	}
+
+	changed := false
+	for i := range pool.Spec.Configs {
+		slot := &pool.Spec.Configs[i]
+		st := slotStatus[slot.Hostname]
+		for j := range slot.PersistentDisks {
+			pd := &slot.PersistentDisks[j]
+			if pd.VolumePath == "" && pd.DiskUUID == "" {
+				continue
+			}
+			if rec, _ := infrav1.FindDiskStatus(pool, slot.Hostname, pd.Name); rec != nil {
+				continue
+			}
+			rec := infrav1.PersistentDiskStatus{
+				Hostname:   slot.Hostname,
+				Name:       pd.Name,
+				VolumePath: pd.VolumePath,
+				DiskUUID:   pd.DiskUUID,
+				UnitNumber: cloneInt32(pd.UnitNumber),
+				Phase:      seededDiskPhase(st),
+			}
+			if st != nil && st.MachineRef != nil {
+				rec.OwnerMachineName = st.MachineRef.Name
+				rec.OwnerMachineUID = string(st.MachineRef.UID)
+			}
+			foldLegacyReclaim(&rec, st, pd.VolumePath)
+			infrav1.UpsertDiskStatus(pool, rec)
+			changed = true
+		}
+		// Once every disk with legacy backing has a status record, the per-slot
+		// ReclaimStatus has been folded in; clear it so status has a single
+		// source of truth (the type is removed in the next release).
+		if st != nil && st.ReclaimStatus != nil {
+			st.ReclaimStatus = nil
+			changed = true
+		}
+	}
+	return changed
+}
+
+// markSlotDisksAvailable moves the slot's Attached disks to Available, i.e. the
+// VM was released so the disks are detached but still backed and reusable.
+func markSlotDisksAvailable(pool *infrav1.VSphereMachineConfigPool, hostname string) {
+	for i := range pool.Status.PersistentDiskStatuses {
+		rec := &pool.Status.PersistentDiskStatuses[i]
+		if rec.Hostname == hostname && rec.Phase == infrav1.PersistentDiskPhaseAttached {
+			rec.Phase = infrav1.PersistentDiskPhaseAvailable
+			rec.LastTransitionTime = metav1.Now()
+		}
+	}
+}
+
+// seededDiskPhase maps a slot's allocation state to the initial phase of a
+// seeded disk record.
+func seededDiskPhase(st *infrav1.MachineConfigSlotStatus) infrav1.PersistentDiskPhase {
+	if st == nil {
+		return infrav1.PersistentDiskPhaseAvailable
+	}
+	switch st.State {
+	case infrav1.MachineConfigSlotStateInUse:
+		return infrav1.PersistentDiskPhaseAttached
+	default:
+		return infrav1.PersistentDiskPhaseAvailable
+	}
+}
+
+// foldLegacyReclaim carries an in-flight legacy per-slot ReclaimStatus onto the
+// disk record it refers to, so reclamation continues seamlessly across the
+// migration.
+func foldLegacyReclaim(rec *infrav1.PersistentDiskStatus, st *infrav1.MachineConfigSlotStatus, volumePath string) {
+	if st == nil || st.ReclaimStatus == nil {
+		return
+	}
+	rs := st.ReclaimStatus
+	if rs.VolumePath != "" && rs.VolumePath != volumePath {
+		return
+	}
+	switch rs.State {
+	case infrav1.MachineConfigSlotReclaimStateRunning:
+		rec.Phase = infrav1.PersistentDiskPhaseReclaiming
+		rec.TaskRef = rs.TaskRef
+	case infrav1.MachineConfigSlotReclaimStateFailed:
+		rec.Phase = infrav1.PersistentDiskPhaseError
+		rec.RetryAfter = rs.RetryAfter
+		rec.LastError = rs.LastError
+	}
 }
 
 // ResolveMachineConfigPoolDatacenter returns the effective datacenter for a slot.
@@ -706,9 +869,11 @@ func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.Obje
 	}
 
 	slotCopy := *selectedSlot
+	slotCopy.PersistentDisks = append([]infrav1.PersistentDisk(nil), selectedSlot.PersistentDisks...)
 	if slotCopy.Datacenter == "" {
 		slotCopy.Datacenter = ResolveMachineConfigPoolDatacenter(pool, selectedSlot)
 	}
+	HydrateSlotFromStatus(pool, &slotCopy)
 
 	return &slotCopy, nil
 }
@@ -737,6 +902,7 @@ func ReleaseSlot(ctx context.Context, c client.Client, poolRef *corev1.ObjectRef
 				pool.Status.ConfigStatuses[i].State = infrav1.MachineConfigSlotStateReleased
 				now := metav1.Now()
 				pool.Status.ConfigStatuses[i].LastReleasedTime = &now
+				markSlotDisksAvailable(pool, s.Hostname)
 				found = true
 			}
 			break
@@ -775,7 +941,14 @@ func GetSlotForMachine(ctx context.Context, c client.Client, poolRef *corev1.Obj
 		if machineRef.UID != "" && status.MachineRef.UID != "" && status.MachineRef.UID != machineRef.UID {
 			continue
 		}
-		return findSlotByHostname(pool, status.Hostname), nil
+		slot := findSlotByHostname(pool, status.Hostname)
+		if slot == nil {
+			return nil, nil
+		}
+		slotCopy := *slot
+		slotCopy.PersistentDisks = append([]infrav1.PersistentDisk(nil), slot.PersistentDisks...)
+		HydrateSlotFromStatus(pool, &slotCopy)
+		return &slotCopy, nil
 	}
 
 	return nil, nil
@@ -814,55 +987,75 @@ func FindMachineConfigPoolForMachine(ctx context.Context, c client.Client, names
 	return nil, nil
 }
 
-// ApplyDiskBackfill updates persistent disk metadata (UnitNumber, VolumePath,
-// DiskUUID) in pool.Spec for the slot matching updatedSlot.Hostname.  Returns
-// true if any field was changed.
-func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infrav1.MachineConfigSlot) bool {
+// ApplyDiskBackfill records the controller-observed disk metadata (VolumePath,
+// DiskUUID, actually-assigned UnitNumber) from updatedSlot into
+// pool.Status.PersistentDiskStatuses, keyed by (hostname, disk name). Disks that
+// have a backfilled VolumePath are marked Attached and stamped with the owning
+// machine. It returns true if any observed field changed, so the caller only
+// issues a status update when needed. Spec is never written — observed state
+// lives in status (see HydrateSlotFromStatus for the read side).
+func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infrav1.MachineConfigSlot, ownerName, ownerUID string) bool {
 	if pool == nil || updatedSlot == nil {
 		return false
 	}
-	updated := false
-	for i := range pool.Spec.Configs {
-		if pool.Spec.Configs[i].Hostname != updatedSlot.Hostname {
+	changed := false
+	for j := range updatedSlot.PersistentDisks {
+		pd := &updatedSlot.PersistentDisks[j]
+		existing, _ := infrav1.FindDiskStatus(pool, updatedSlot.Hostname, pd.Name)
+		// Only record disks that are provisioned (have a VolumePath) or already
+		// have a status entry to keep in sync; unprovisioned disks are recorded
+		// by the pool reconciler when it seeds/observes them.
+		if pd.VolumePath == "" && existing == nil {
 			continue
 		}
-		for j := range pool.Spec.Configs[i].PersistentDisks {
-			pdInSpec := &pool.Spec.Configs[i].PersistentDisks[j]
-			for _, updatedDisk := range updatedSlot.PersistentDisks {
-				if pdInSpec.Name != updatedDisk.Name {
-					continue
-				}
-				// Skip if both have UnitNumber set but they disagree — avoids
-				// cross-writing between disks that happen to share a name.
-				if pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber {
-					continue
-				}
-				if pdInSpec.VolumePath != updatedDisk.VolumePath {
-					pdInSpec.VolumePath = updatedDisk.VolumePath
-					updated = true
-				}
-				if pdInSpec.DiskUUID != updatedDisk.DiskUUID {
-					pdInSpec.DiskUUID = updatedDisk.DiskUUID
-					updated = true
-				}
-				if (pdInSpec.UnitNumber == nil) != (updatedDisk.UnitNumber == nil) || (pdInSpec.UnitNumber != nil && updatedDisk.UnitNumber != nil && *pdInSpec.UnitNumber != *updatedDisk.UnitNumber) {
-					if updatedDisk.UnitNumber == nil {
-						pdInSpec.UnitNumber = nil
-					} else {
-						unitNumber := *updatedDisk.UnitNumber
-						pdInSpec.UnitNumber = &unitNumber
-					}
-					updated = true
-				}
+
+		rec := infrav1.PersistentDiskStatus{
+			Hostname:         updatedSlot.Hostname,
+			Name:             pd.Name,
+			VolumePath:       pd.VolumePath,
+			DiskUUID:         pd.DiskUUID,
+			UnitNumber:       cloneInt32(pd.UnitNumber),
+			Phase:            infrav1.PersistentDiskPhaseAttached,
+			OwnerMachineName: ownerName,
+			OwnerMachineUID:  ownerUID,
+		}
+		if existing != nil {
+			// Preserve any in-flight reclaim bookkeeping; a re-attach after
+			// reuse legitimately moves the disk back to Attached and drops it.
+			if diskObservedEqual(existing, &rec) {
+				continue
 			}
 		}
-		break
+		infrav1.UpsertDiskStatus(pool, rec)
+		changed = true
 	}
-	return updated
+	return changed
 }
 
-// PersistSlotChanges updates the VSphereMachineConfigPool Spec with the backfilled slot information.
-func PersistSlotChanges(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, updatedSlot *infrav1.MachineConfigSlot) error {
+func cloneInt32(v *int32) *int32 {
+	if v == nil {
+		return nil
+	}
+	out := *v
+	return &out
+}
+
+// diskObservedEqual reports whether the observed and ownership fields of two
+// disk status records match. Reclaim task fields and timestamps are ignored so
+// a plain re-backfill does not churn the status.
+func diskObservedEqual(a, b *infrav1.PersistentDiskStatus) bool {
+	return a.VolumePath == b.VolumePath &&
+		a.DiskUUID == b.DiskUUID &&
+		ptr.Equal(a.UnitNumber, b.UnitNumber) &&
+		a.Phase == b.Phase &&
+		a.OwnerMachineName == b.OwnerMachineName &&
+		a.OwnerMachineUID == b.OwnerMachineUID
+}
+
+// PersistSlotChanges records the backfilled slot disk metadata into the pool
+// status via a status update. ownerName/ownerUID identify the machine that owns
+// the slot.
+func PersistSlotChanges(ctx context.Context, c client.Client, poolRef *corev1.ObjectReference, updatedSlot *infrav1.MachineConfigSlot, ownerName, ownerUID string) error {
 	if poolRef == nil || updatedSlot == nil {
 		return nil
 	}
@@ -872,10 +1065,10 @@ func PersistSlotChanges(ctx context.Context, c client.Client, poolRef *corev1.Ob
 		return err
 	}
 
-	if !ApplyDiskBackfill(pool, updatedSlot) {
+	if !ApplyDiskBackfill(pool, updatedSlot, ownerName, ownerUID) {
 		return nil
 	}
-	if err := c.Update(ctx, pool); err != nil {
+	if err := c.Status().Update(ctx, pool); err != nil {
 		if apierrors.IsConflict(err) {
 			return errors.Wrapf(err, "transient conflict while persisting slot changes to pool %s/%s, will retry", pool.Namespace, pool.Name)
 		}

@@ -501,6 +501,97 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              persistentDiskStatuses:
+                description: |-
+                  PersistentDiskStatuses tracks the observed state of each persistent disk,
+                  keyed by (hostname, disk name). The controller backfills the vmdk path,
+                  disk UUID, and actually-assigned SCSI unit here instead of writing them
+                  back onto spec, and drives reclaim through the per-disk Phase.
+                items:
+                  description: |-
+                    PersistentDiskStatus tracks the observed state of a single persistent disk.
+                    It replaces the controller-backfilled VolumePath/DiskUUID on spec and the
+                    per-slot ReclaimStatus, keyed by (Hostname, Name).
+                  properties:
+                    diskUUID:
+                      description: |-
+                        DiskUUID is the disk UUID, backfilled after the disk is created. The guest
+                        uses it to identify and mount the disk.
+                      type: string
+                    hostname:
+                      description: Hostname is the slot this disk belongs to (matches
+                        MachineConfigSlot.Hostname).
+                      type: string
+                    lastError:
+                      description: LastError stores the latest reclaim failure, surfaced
+                        when Phase is Error.
+                      type: string
+                    lastTransitionTime:
+                      description: LastTransitionTime is the time Phase last changed.
+                      format: date-time
+                      type: string
+                    name:
+                      description: Name is the disk name (matches PersistentDisk.Name
+                        within the slot).
+                      type: string
+                    ownerMachineName:
+                      description: OwnerMachineName is the name of the Machine currently
+                        owning the disk.
+                      type: string
+                    ownerMachineUID:
+                      description: |-
+                        OwnerMachineUID is the UID of the Machine currently owning the disk. It is
+                        preserved across VM delete/recreate so a rolling upgrade re-attaches the
+                        disk to the rebuilt machine.
+                      type: string
+                    phase:
+                      description: |-
+                        Phase is the observed lifecycle of the disk: Creating -> Attached while in
+                        use, Attached -> Available when the VM is released, and
+                        Available -> Reclaiming -> Reclaimed as the backing is deleted (Error on a
+                        failed reclaim, retried after RetryAfter). Reclaimed is a terminal tombstone:
+                        the backing is gone but the record is kept so the release-1 migration does not
+                        re-seed the disk from spec's frozen VolumePath.
+                      enum:
+                      - Creating
+                      - Attached
+                      - Available
+                      - Reclaiming
+                      - Reclaimed
+                      - Error
+                      type: string
+                    retryAfter:
+                      description: RetryAfter prevents tight retry loops after a failed
+                        reclaim task.
+                      format: date-time
+                      type: string
+                    taskRef:
+                      description: |-
+                        TaskRef tracks the in-flight vCenter reclaim task for this disk. CAPV
+                        reclaims disks asynchronously, so the task moniker is polled across
+                        reconciles (DCS/HCS call their SDKs synchronously and have no equivalent).
+                      type: string
+                    unitNumber:
+                      description: |-
+                        UnitNumber is the SCSI unit number the disk was actually attached at. When
+                        spec does not pin a UnitNumber, this observed value is reused on the next
+                        VM recreation to keep disk ordering stable.
+                      format: int32
+                      type: integer
+                    volumePath:
+                      description: |-
+                        VolumePath is the datastore path to the backing .vmdk, backfilled after
+                        the disk is created.
+                      type: string
+                  required:
+                  - hostname
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - hostname
+                - name
+                x-kubernetes-list-type: map
               total:
                 description: Total is the total number of configuration slots defined
                   in the pool.
