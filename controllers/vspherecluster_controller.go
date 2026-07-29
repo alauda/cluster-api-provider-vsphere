@@ -23,14 +23,17 @@ import (
 	"github.com/pkg/errors"
 	"k8s.io/klog/v2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	clusterutilv1 "sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -53,6 +56,7 @@ import (
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vsphereclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vsphereclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status,verbs=get;list;watch
+// +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kubeadmcontrolplanes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=topology.tanzu.vmware.com,resources=availabilityzones,verbs=get;list;watch
 // +kubebuilder:rbac:groups=topology.tanzu.vmware.com,resources=availabilityzones/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups=topology.tanzu.vmware.com,resources=zones,verbs=get;list;watch
@@ -181,6 +185,27 @@ func AddClusterControllerToManager(ctx context.Context, controllerManagerCtx *ca
 			reconciler,
 		))
 	if err != nil {
+		return err
+	}
+
+	if err := c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&controlplanev1.KubeadmControlPlane{},
+			handler.TypedEnqueueRequestsFromMapFunc(toAffinityInput[*controlplanev1.KubeadmControlPlane](reconciler.Client)),
+			predicate.TypedFuncs[*controlplanev1.KubeadmControlPlane]{
+				GenericFunc: func(event.TypedGenericEvent[*controlplanev1.KubeadmControlPlane]) bool {
+					return false
+				},
+				UpdateFunc: func(e event.TypedUpdateEvent[*controlplanev1.KubeadmControlPlane]) bool {
+					return shouldEnqueueVSphereClusterForKubeadmControlPlaneUpdate(e.ObjectOld, e.ObjectNew)
+				},
+				DeleteFunc: func(event.TypedDeleteEvent[*controlplanev1.KubeadmControlPlane]) bool {
+					return false
+				},
+			},
+		),
+	); err != nil {
 		return err
 	}
 

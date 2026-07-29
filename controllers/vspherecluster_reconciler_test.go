@@ -618,6 +618,7 @@ func TestBuildKubeOvnAppReleaseSetsPullSecrets(t *testing.T) {
 	appRelease := buildKubeOvnAppRelease(
 		cluster,
 		"registry.example.com",
+		"",
 		"v1.0.0",
 		"192.168.0.0/16",
 		"10.96.0.0/12",
@@ -635,6 +636,33 @@ func TestBuildKubeOvnAppReleaseSetsPullSecrets(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
 	g.Expect(imagePullSecrets).To(Equal([]any{"global-registry-auth", "extra-registry-auth"}))
+
+	charts, found, err := unstructured.NestedSlice(appRelease.Object, "spec", "source", "charts")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(charts).To(HaveLen(1))
+	g.Expect(charts[0].(map[string]interface{})["name"]).To(Equal(kubeOvnLegacyChartName))
+}
+
+func TestBuildKubeOvnAppReleaseUsesRequestedChartName(t *testing.T) {
+	g := NewWithT(t)
+	appRelease := buildKubeOvnAppRelease(
+		&clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"}},
+		"registry.example.com",
+		kubeOvnChartNameV44,
+		"v4.4.0",
+		"192.168.0.0/16",
+		"10.96.0.0/12",
+		"100.64.0.0/16",
+		"",
+		nil,
+	)
+
+	charts, found, err := unstructured.NestedSlice(appRelease.Object, "spec", "source", "charts")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(charts).To(HaveLen(1))
+	g.Expect(charts[0].(map[string]interface{})["name"]).To(Equal(kubeOvnChartNameV44))
 }
 
 func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneNodesRegister(t *testing.T) {
