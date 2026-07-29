@@ -202,6 +202,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 				infrav1.VCenterAvailableCondition,
 				infrav1.IPAddressClaimedCondition,
 				infrav1.VMProvisionedCondition,
+				infrav1.BootstrapReadyCondition,
 				infrav1.PoweredOnCondition,
 			),
 		)
@@ -210,11 +211,13 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 			v1beta2conditions.ForConditionTypes{
 				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
 				infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+				infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
 				infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			},
 			v1beta2conditions.IgnoreTypesIfMissing{
 				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
+				infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
 				infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			},
@@ -238,6 +241,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 			infrav1.VSphereVMReadyV1Beta2Condition,
 			infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
 			infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+			infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 			infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
 			infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			infrav1.VSphereVMGuestSoftPowerOffSucceededV1Beta2Condition,

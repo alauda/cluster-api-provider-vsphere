@@ -121,6 +121,13 @@ const (
 	VSphereMachinePoweredOffV1Beta2Reason = "PoweredOff"
 )
 
+// Constants for the VSphereMachine's BootstrapReady condition used in the v1Beta2 API version. The condition
+// is mirrored from the underlying VSphereVM to surface bootstrap-delivery failures on the VSphereMachine.
+const (
+	// VSphereMachineBootstrapReadyV1Beta2Condition mirrors the VSphereVM's BootstrapReady condition.
+	VSphereMachineBootstrapReadyV1Beta2Condition = "BootstrapReady"
+)
+
 // VSphereMachineSpec defines the desired state of VSphereMachine.
 type VSphereMachineSpec struct {
 	VirtualMachineCloneSpec `json:",inline"`

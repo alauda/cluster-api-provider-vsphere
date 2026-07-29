@@ -134,11 +134,20 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 		log.Info("Preparing bootstrap data for new VM create")
 		bootstrapData, format, err := vms.getBootstrapData(ctx, vmCtx)
 		if err != nil {
-			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.CloningFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
+			// Attribute a precise BootstrapReady reason instead of misreporting these bootstrap-delivery
+			// failures as a clone failure. VMProvisioned stays at CloningReason (provisioning is in progress
+			// but blocked); BootstrapReady carries the real cause and pulls the Ready condition down.
+			reason := infrav1.BootstrapSecretGetFailedReason
+			v1beta2Reason := infrav1.VSphereVMBootstrapSecretGetFailedV1Beta2Reason
+			if _, ok := err.(*bootstrapSecretContentError); ok {
+				reason = infrav1.BootstrapSecretContentInvalidReason
+				v1beta2Reason = infrav1.VSphereVMBootstrapSecretContentInvalidV1Beta2Reason
+			}
+			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.BootstrapReadyCondition, reason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 			v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
-				Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+				Type:    infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
-				Reason:  infrav1.VSphereVMVirtualMachineNotProvisionedV1Beta2Reason,
+				Reason:  v1beta2Reason,
 				Message: err.Error(),
 			})
 			return vm, err
@@ -158,6 +167,13 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 			})
 			return vm, err
 		}
+		// The bootstrap data was delivered to the VM as part of the clone request.
+		conditions.MarkTrue(vmCtx.VSphereVM, infrav1.BootstrapReadyCondition)
+		v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
+			Type:   infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
+			Status: metav1.ConditionTrue,
+			Reason: infrav1.VSphereVMBootstrapReadyV1Beta2Reason,
+		})
 		if err := persistMachineConfigSlotBackfill(ctx, vmCtx); err != nil {
 			return vm, err
 		}
@@ -886,14 +902,27 @@ func (vms *VMService) getNetworkStatus(ctx context.Context, virtualMachineCtx *v
 	return apiNetStatus, nil
 }
 
+// bootstrapSecretGetError wraps a failure to read the bootstrap data Secret so the caller can surface a
+// BootstrapSecretGetFailed reason distinct from a genuine clone failure.
+type bootstrapSecretGetError struct{ err error }
+
+func (e *bootstrapSecretGetError) Error() string { return e.err.Error() }
+func (e *bootstrapSecretGetError) Unwrap() error { return e.err }
+
+// bootstrapSecretContentError indicates the bootstrap data Secret was read but is missing required content.
+type bootstrapSecretContentError struct{ msg string }
+
+func (e *bootstrapSecretContentError) Error() string { return e.msg }
+
 // getBootstrapData obtains a machine's bootstrap data from the relevant k8s secret and returns the
-// data and its format.
+// data and its format. Failures are returned as typed errors (bootstrapSecretGetError,
+// bootstrapSecretContentError) so callers can attribute a precise BootstrapReady reason.
 func (vms *VMService) getBootstrapData(ctx context.Context, vmCtx *capvcontext.VMContext) ([]byte, bootstrapv1.Format, error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	secret, err := vms.getBootstrapSecret(ctx, vmCtx)
 	if err != nil {
-		return nil, "", err
+		return nil, "", &bootstrapSecretGetError{err: err}
 	}
 	if secret == nil {
 		log.Info("VM has no bootstrap data")
@@ -908,7 +937,7 @@ func (vms *VMService) getBootstrapData(ctx context.Context, vmCtx *capvcontext.V
 
 	value, ok := secret.Data["value"]
 	if !ok {
-		return nil, "", errors.New("error retrieving bootstrap data: secret value key is missing")
+		return nil, "", &bootstrapSecretContentError{msg: "error retrieving bootstrap data: secret value key is missing"}
 	}
 
 	log.Info("Loaded bootstrap data", "format", string(format), "bytes", len(value), "hasMachineConfigSlot", vmCtx.MachineConfigSlot != nil)

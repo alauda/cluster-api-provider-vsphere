@@ -169,18 +169,21 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
   | CAPI 未产出 secret | `WaitingForBootstrapData`（准确） | 沿用现名 | `vspheremachine_controller.go:557` |
   | secret 读取失败 | `CloningFailed`（实际发生在 clone 前） | `BootstrapSecretGetFailed` | `getBootstrapData`（`service.go:135`） |
   | secret `value` 键缺失 | 同上 | `BootstrapSecretContentInvalid` | 同上 |
-  | 写入 guestinfo 失败 | `CloningFailed`（与真 clone 失败同出口） | `BootstrapDeliveryFailed` | clone 出口按错误类型分流（`service.go:152`） |
+  | 写入 guestinfo 失败 | `CloningFailed`（与真 clone 失败同出口） | 暂缓，仍 `CloningFailed`（见边界） | clone 出口（`service.go:159`） |
 
-  - **落点**：condition 定义在 `VSphereVM`（后三类的检测点，`BootstrapRef` 在其 spec 上），经既有 `SetMirror` 链（`vimmachine.go:118-121`）镜像到 `VSphereMachine`；「未产出」场景发生在 VSphereVM 创建前，直接落 `VSphereMachine`。用户统一在 `VSphereMachine` 上查看。
-  - **Ready 汇总**：两侧 `Ready` summary 名单（`vspherevm_controller.go:200-217`、`vspheremachine_controller.go:295-303`）加入 `BootstrapReady`；v1beta2 侧列入 `IgnoreTypesIfMissing`（bootstrap 就绪后条件可清除）。
-  - **边界**：guestinfo 写入不是独立步骤，bootstrap 数据作为 clone 请求的参数一次性提交，因此写入失败只能在 clone 出口按错误类型区分，精确性有限。规范的投递 hash 要求对 CAPV 大部分不适用，checksum 仅作可选诊断信息。
-- **验收**：四类场景在 `VSphereMachine` 上有可区分的 reason；bootstrap 类失败不再落入 `CloningFailed`。
+  - **落点**：condition 定义在 `VSphereVM`（`BootstrapRef` 在其 spec 上），且在 `createVM` 成功后置 `BootstrapReady=True`。镜像到 `VSphereMachine`：v1beta1 经既有 `SetMirror` 链（`vimmachine.go:120`，镜像 `VSphereVM` 的 `Ready`，而 `Ready` 已聚合 `BootstrapReady`）自动带到；v1beta2 需专门的按类型镜像 `reconcileBootstrapReadyCondition`（`vimmachine.go`，仿 `reconcilePoweredOnCondition`）。「未产出」场景发生在 VSphereVM 创建前，直接落 `VSphereMachine`。用户统一在 `VSphereMachine` 上查看。
+  - **Ready 汇总**：两侧 `Ready` summary 名单加入 `BootstrapReady`；v1beta2 侧列入 `IgnoreTypesIfMissing`（该条件仅在 VSphereVM 上报后才出现，缺失时忽略，避免 provisioning 期间把 `Ready` 拖成 `Unknown`）。v1beta1 `SetSummary` 本就只聚合已存在的条件，无需额外处理。
+  - **边界**：guestinfo 写入不是独立步骤，bootstrap 数据作为 clone 请求的参数随 `createVM` 一次性提交，与真实 clone 失败共用一个出口，无法干净区分，故本次暂缓——`createVM` 失败仍落 `CloningFailed`，只拆分 clone 前的 secret 读取失败与内容缺失两类。规范的投递 hash 要求对 CAPV 大部分不适用，checksum 仅作可选诊断信息。
+- **验收**：secret 读取失败与内容缺失两类在 `VSphereMachine` 上有可区分的 reason（不再落 `CloningFailed`）；guestinfo 写入失败按边界暂缓。
 
 ### P2-4　升级 `maxSurge: 0` 约束（#21）
 
 - **现状**：KCP/MD webhook 已校验 pool 的独占引用（引用的池存在、未被其他 KCP/MD 占用），但不校验升级策略。固定 IP 场景下这是缺口：`maxSurge≥1` 的滚动升级先建新机再删旧机，新机需要额外空闲槽位拿固定 IP，池满时升级会卡在等 IP。
-- **设计**：infra template 引用 `machineConfigPoolRef` 时，KCP/MD webhook 默认要求 `maxSurge: 0`（先删后建，复用刚释放的槽位）；允许 surge 时 precheck 需确认有足够空闲槽位。位置：`internal/webhooks/{kubeadmcontrolplane,machinedeployment}.go`。
-- **验收**：未扩容 MachineConfigPool 时无法绕过固定 IP 约束；webhook 单测。
+- **设计**：固定 IP 场景强制先删后建（复用刚释放的槽位），不支持 surge，故 webhook 采用强制校验而非 precheck。infra template 引用 `machineConfigPoolRef` 时，KCP/MD webhook（`internal/webhooks/{kubeadmcontrolplane,machinedeployment}.go`）追加三条约束：
+  - **`maxSurge == 0`**（KCP 与 MD 均适用）：只接受整型 0，`nil`（默认 1）与非零值一律拒绝。MD 的 `OnDelete` 策略无 surge，跳过。
+  - **MD `maxUnavailable ≥ 1`**：`maxSurge` 被钉为 0 后，滚动升级只能靠先删旧机腾槽位再建新机；而 CAPI 默认 `maxUnavailable=0`，与 `maxSurge=0` 组合会 0/0 卡死，故要求 `maxUnavailable` 显式 ≥ 1。
+  - **KCP `replicas ≥ 3`**：CAPI 仅允许控制面在副本数 ≥ 3 时用 `maxSurge=0`（scale-in）。由本 webhook 提前拦截并给出清晰 reason，避免落到 CAPI 那条含糊的 scale-in 报错；不支持单副本固定 IP 控制面。
+- **验收**：固定 IP 的 KCP/MD 只能以 `maxSurge=0`（且 MD `maxUnavailable≥1`、KCP `replicas≥3`）创建/更新，否则被 webhook 拒绝并给出对应 reason；webhook 单测覆盖各边界。
 
 ---
 

@@ -149,6 +149,25 @@ const (
 	// PoweredOffReason (Severity=Info) documents that the VM is powered off after its initial power-on
 	// completed, i.e. it was stopped out of band and the controller intentionally does not power it back on.
 	PoweredOffReason = "PoweredOff"
+
+	// BootstrapReadyCondition documents whether the bootstrap data for a VSphereVM was successfully
+	// retrieved from its referenced Secret and delivered to the underlying VM. It is defined on VSphereVM
+	// (where the bootstrap Secret is resolved and delivered as part of the clone) and aggregated into the
+	// VSphereVM Ready condition; the owning VSphereMachine mirrors it. It exists to give bootstrap-delivery
+	// failures a reason distinct from CloningReason/CloningFailedReason.
+	//
+	// NOTE: This condition is set on VSphereVM. The "waiting for the CAPI bootstrap Secret to be produced"
+	// case happens before the VSphereVM exists and is surfaced on VSphereMachine as
+	// VMProvisioned=WaitingForBootstrapData.
+	BootstrapReadyCondition clusterv1.ConditionType = "BootstrapReady"
+
+	// BootstrapSecretGetFailedReason (Severity=Warning) documents that the bootstrap data Secret referenced
+	// by the VSphereVM could not be read (e.g. not found or an API error).
+	BootstrapSecretGetFailedReason = "BootstrapSecretGetFailed"
+
+	// BootstrapSecretContentInvalidReason (Severity=Warning) documents that the bootstrap data Secret was
+	// read but is missing its required "value" key.
+	BootstrapSecretContentInvalidReason = "BootstrapSecretContentInvalid"
 )
 
 // Conditions and Reasons related to utilizing a VSphereIdentity to make connections to a VCenter.

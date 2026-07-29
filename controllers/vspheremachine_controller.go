@@ -301,11 +301,13 @@ func (r *machineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		if err := v1beta2conditions.SetSummaryCondition(machineContext.GetVSphereMachine(), machineContext.GetVSphereMachine(), infrav1.VSphereMachineReadyV1Beta2Condition,
 			v1beta2conditions.ForConditionTypes{
 				infrav1.VSphereMachineVirtualMachineProvisionedV1Beta2Condition,
+				infrav1.VSphereMachineBootstrapReadyV1Beta2Condition,
 				infrav1.VSphereMachinePoweredOnV1Beta2Condition,
 			},
-			// PoweredOn is only reported once the VM has completed its initial power-on; ignore it while missing
-			// so it does not drag the Ready condition to Unknown during provisioning.
+			// BootstrapReady and PoweredOn are only mirrored once the underlying VSphereVM reports them; ignore
+			// them while missing so they do not drag the Ready condition to Unknown during provisioning.
 			v1beta2conditions.IgnoreTypesIfMissing{
+				infrav1.VSphereMachineBootstrapReadyV1Beta2Condition,
 				infrav1.VSphereMachinePoweredOnV1Beta2Condition,
 			},
 			// Using a custom merge strategy to override reasons applied during merge.

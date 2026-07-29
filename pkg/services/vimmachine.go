@@ -176,6 +176,10 @@ func (v *VimMachineService) ReconcileNormal(ctx context.Context, machineCtx capv
 	// after its initial power-on surfaces the machine as not ready in v1beta2 as well.
 	reconcilePoweredOnCondition(vimMachineCtx.VSphereMachine, vm)
 
+	// Mirror the VM's BootstrapReady condition onto the VSphereMachine so bootstrap-delivery failures are
+	// visible there with a precise reason (v1beta1 is already covered by the VMProvisioned mirror below).
+	reconcileBootstrapReadyCondition(vimMachineCtx.VSphereMachine, vm)
+
 	// Waits the VM's ready state.
 	if !vm.Status.Ready {
 		log.Info("Waiting for VSphereVM to become ready")
@@ -226,6 +230,21 @@ func reconcilePoweredOnCondition(machine *infrav1.VSphereMachine, vm *infrav1.VS
 	}
 	v1beta2conditions.SetMirrorCondition(vm, machine, infrav1.VSphereVMPoweredOnV1Beta2Condition,
 		v1beta2conditions.TargetConditionType(infrav1.VSphereMachinePoweredOnV1Beta2Condition))
+}
+
+// reconcileBootstrapReadyCondition mirrors the VSphereVM's v1beta2 BootstrapReady condition onto the
+// VSphereMachine so bootstrap-delivery failures surface on the machine with a precise reason.
+//
+// v1beta1 is already covered by the VMProvisioned mirror, which copies the VSphereVM's Ready condition
+// (and Ready aggregates BootstrapReady). Only the v1beta2 side needs a dedicated mirror. It is mirrored
+// only once the VM reports it, so before the VSphereVM is created the (missing) condition is ignored by
+// the Ready summary.
+func reconcileBootstrapReadyCondition(machine *infrav1.VSphereMachine, vm *infrav1.VSphereVM) {
+	if v1beta2conditions.Get(vm, infrav1.VSphereVMBootstrapReadyV1Beta2Condition) == nil {
+		return
+	}
+	v1beta2conditions.SetMirrorCondition(vm, machine, infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
+		v1beta2conditions.TargetConditionType(infrav1.VSphereMachineBootstrapReadyV1Beta2Condition))
 }
 
 // GetHostInfo returns the hostname or IP address of the infrastructure host for the VSphere VM.
