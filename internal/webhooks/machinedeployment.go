@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -97,6 +98,21 @@ func (webhook *MachineDeployment) validatePoolRef(ctx context.Context, obj *clus
 
 	if err := rejectOtherObjectsReferencingPool(ctx, webhook.Client, poolRef, self); err != nil {
 		allErrs = append(allErrs, field.Forbidden(templatePath, err.Error()))
+	}
+
+	// OnDelete replaces machines delete-first and has no surge, so it needs no fixed-IP constraint.
+	if obj.Spec.Strategy == nil || obj.Spec.Strategy.Type != clusterv1.OnDeleteMachineDeploymentStrategyType {
+		var maxSurge, maxUnavailable *intstr.IntOrString
+		if obj.Spec.Strategy != nil && obj.Spec.Strategy.RollingUpdate != nil {
+			maxSurge = obj.Spec.Strategy.RollingUpdate.MaxSurge
+			maxUnavailable = obj.Spec.Strategy.RollingUpdate.MaxUnavailable
+		}
+		if err := requireZeroMaxSurge(maxSurge, field.NewPath("spec", "strategy", "rollingUpdate", "maxSurge")); err != nil {
+			allErrs = append(allErrs, err)
+		}
+		if err := requirePositiveMaxUnavailable(maxUnavailable, field.NewPath("spec", "strategy", "rollingUpdate", "maxUnavailable")); err != nil {
+			allErrs = append(allErrs, err)
+		}
 	}
 
 	return allErrs

@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
@@ -98,7 +99,61 @@ func (webhook *KubeadmControlPlane) validatePoolRef(ctx context.Context, obj *co
 		allErrs = append(allErrs, field.Forbidden(templatePath, err.Error()))
 	}
 
+	var maxSurge *intstr.IntOrString
+	if obj.Spec.RolloutStrategy != nil && obj.Spec.RolloutStrategy.RollingUpdate != nil {
+		maxSurge = obj.Spec.RolloutStrategy.RollingUpdate.MaxSurge
+	}
+	if err := requireZeroMaxSurge(maxSurge, field.NewPath("spec", "rolloutStrategy", "rollingUpdate", "maxSurge")); err != nil {
+		allErrs = append(allErrs, err)
+	}
+
+	// A fixed-IP rollout uses maxSurge 0 (scale-in), which Cluster API only permits for control planes with
+	// at least 3 replicas. Enforce it here so the rejection carries a clear, self-explanatory reason instead
+	// of Cluster API's generic scale-in error; single-replica control planes are not supported on fixed IP.
+	if obj.Spec.Replicas == nil || *obj.Spec.Replicas < 3 {
+		val := "1 (default)"
+		if obj.Spec.Replicas != nil {
+			val = fmt.Sprintf("%d", *obj.Spec.Replicas)
+		}
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "replicas"), val,
+			"a KubeadmControlPlane whose infrastructure template references a machineConfigPoolRef (fixed IP) must have at least 3 replicas: "+
+				"the fixed-IP rollout uses maxSurge 0 (scale-in), which Cluster API only permits for control planes with 3 or more replicas; single-replica control planes are not supported"))
+	}
+
 	return allErrs
+}
+
+// requireZeroMaxSurge enforces maxSurge: 0 for KCP/MachineDeployment objects whose infrastructure template
+// is bound to a VSphereMachineConfigPool (fixed IP). A rolling update with surge creates the replacement
+// machine before deleting the old one, which needs an extra free pool slot to obtain a fixed IP; a
+// fully-allocated pool cannot provide it and the upgrade would stall waiting for a slot. maxSurge: 0 replaces
+// machines delete-first so the freed slot is reused. A nil strategy/maxSurge means the API default (1).
+func requireZeroMaxSurge(maxSurge *intstr.IntOrString, fldPath *field.Path) *field.Error {
+	if maxSurge != nil && maxSurge.Type == intstr.Int && maxSurge.IntValue() == 0 {
+		return nil
+	}
+	val := "1 (default)"
+	if maxSurge != nil {
+		val = maxSurge.String()
+	}
+	return field.Invalid(fldPath, val, "maxSurge must be 0 when the infrastructure template references a machineConfigPoolRef (fixed IP): "+
+		"a rolling update with surge needs an extra free pool slot for the new machine; set maxSurge to 0 to replace machines delete-first and reuse the freed slot")
+}
+
+// requirePositiveMaxUnavailable enforces maxUnavailable >= 1 for a MachineDeployment whose infrastructure
+// template is bound to a VSphereMachineConfigPool (fixed IP). With maxSurge pinned to 0, a rollout can only
+// progress by first deleting an old machine to free its pool slot; maxUnavailable 0 (the Cluster API default)
+// forbids that, so the rollout would stall. A nil maxUnavailable means the API default (0).
+func requirePositiveMaxUnavailable(maxUnavailable *intstr.IntOrString, fldPath *field.Path) *field.Error {
+	if maxUnavailable != nil && !(maxUnavailable.Type == intstr.Int && maxUnavailable.IntValue() == 0) {
+		return nil
+	}
+	val := "0 (default)"
+	if maxUnavailable != nil {
+		val = maxUnavailable.String()
+	}
+	return field.Invalid(fldPath, val, "maxUnavailable must be at least 1 when the infrastructure template references a machineConfigPoolRef (fixed IP): "+
+		"with maxSurge pinned to 0, a rollout must delete an old machine to free its pool slot before creating the replacement; maxUnavailable 0 forbids that and the rollout would stall")
 }
 
 func rejectOtherObjectsReferencingPool(ctx context.Context, c client.Client, poolRef, self *corev1.ObjectReference) error {

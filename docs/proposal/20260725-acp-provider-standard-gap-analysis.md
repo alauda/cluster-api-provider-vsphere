@@ -97,7 +97,7 @@ P1 = 验收/上架必需；P2 = 随产品节奏推进。
 
 - **放置**（需 owner 确认）：capabilities/usage/known-issues/testing 放交付仓库（跟随交付版本）；fork 基线、patch 范围、兼容矩阵放源码仓库 README 或 `docs/development.md`；两仓交叉引用。
 - **设计**：
-  - `capabilities.md` 按 HCS 七段结构：基线、评估说明、提供能力、关键边界、主要缺口、由其他组件承接、代码存在但未验收路径。需写明：固定 IP 是默认主路径而 DHCP/IPAM 是 legacy、`maxSurge: 0` 升级策略、kube-ovn 依赖 annotation `cpaas.io/network-type` 的平台约定、supervisor 模式与历史 API 版本为未验收路径。
+  - `capabilities.md` 按 HCS 七段结构：基线、评估说明、提供能力、关键边界、主要缺口、由其他组件承接、代码存在但未验收路径。需写明：固定 IP 是默认主路径而 DHCP/IPAM 是 legacy、固定 IP 升级约束（`maxSurge=0` / MD `maxUnavailable≥1` / KCP `replicas≥3`，见 P2-4）、kube-ovn 依赖 annotation `cpaas.io/network-type` 的平台约定、supervisor 模式与历史 API 版本为未验收路径。
   - `usage.md`：固定 IP 建集群（单控制面/HA/worker）、MachineConfigPool、持久盘、多网卡、删除与 reclaim。
   - `known-issues.md`：按 HCS `KI-xxx-NNN` 格式。
   - `testing/`：测试计划、报告模板、正式版本报告。
@@ -105,7 +105,7 @@ P1 = 验收/上架必需；P2 = 随产品节奏推进。
 
 ### P1-5　默认固定 IP 模板（#13）
 
-- **设计**：ACP 默认模板改为 `VSphereMachineConfigPool` + `machineConfigPoolRef` + KCP/MD `maxSurge: 0`；DHCP/IPAM 模板保留并在 capabilities 标注 legacy。
+- **设计**：ACP 默认模板改为 `VSphereMachineConfigPool` + `machineConfigPoolRef`,并按 P2-4 约束配好升级策略（KCP `maxSurge=0` 且 `replicas≥3`；MD `maxSurge=0` 且 `maxUnavailable≥1`）；DHCP/IPAM 模板保留并在 capabilities 标注 legacy。
 - **验收**：默认创建路径走固定 IP/hostname 槽位；样例与 CRD 一致。
 
 ### P1-6　交付仓库去明文凭据（#6、#14）
@@ -202,9 +202,9 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 | G | 持久盘 observed state 迁 status | [源] | P2 | — | 中 |
 | H | govmomi LB/VIP | [源] | ⏸ 暂缓 | 自建 VIP 统一改造 | 大 |
 | I | BootstrapReady condition | [源] | P2 | — | 小 |
-| J | maxSurge: 0 约束 + precheck | [源] | P2 | E | 小 |
+| J | 固定 IP 升级约束（maxSurge=0 / MD maxUnavailable≥1 / KCP replicas≥3） | [源] | P2 | E | 小 |
 | K | Pool 槽位非持久化数据盘 | [源] | P1 | C 可并 | 中 |
-| L | 容灾 encryptionProviderConfigRef | [源] | P1 | — | 小 |
+| L | 容灾 encryption-config（改为 KCP YAML 声明，不涉及代码） | — | ⏸ 无代码 | — | 小 |
 | M | VM 开机仅在创建时执行一次 | [源] | P1 | — | 小 |
 
 **推进顺序**：A/B/C/K/L/M → D/F → E/J → G/I。
