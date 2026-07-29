@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 
 	pkgerrors "github.com/pkg/errors"
@@ -29,6 +30,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -410,7 +412,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, clientset)
+	controlPlaneNodes, ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, clientset)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -423,7 +425,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{}, err
 	}
 
-	appRelease := buildKubeOvnAppRelease(cluster, registry, chartName, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets)
+	appRelease := buildKubeOvnAppRelease(cluster, registry, chartName, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets, controlPlaneNodes)
 	dc, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to create dynamic client for workload cluster")
@@ -449,61 +451,49 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	return reconcile.Result{}, nil
 }
 
-func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx context.Context, cluster *clusterv1.Cluster, workloadClient kubernetes.Interface) (bool, error) {
+func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx context.Context, cluster *clusterv1.Cluster, workloadClient kubernetes.Interface) ([]string, bool, error) {
 	log := ctrl.LoggerFrom(ctx)
+	if cluster.Spec.ControlPlaneRef == nil || cluster.Spec.ControlPlaneRef.Kind != kubeadmControlPlaneKind || cluster.Spec.ControlPlaneRef.APIVersion != controlplanev1.GroupVersion.String() {
+		return nil, true, nil
+	}
+
+	nodes, err := workloadClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(map[string]string{
+			"node-role.kubernetes.io/control-plane": "",
+		}).String(),
+	})
+	if err != nil {
+		log.Error(err, "Skipping kube-ovn AppRelease reconcile because control plane Nodes cannot be listed")
+		return nil, false, nil
+	}
+
+	controlPlaneNodes := make([]string, 0, len(nodes.Items))
+	for _, node := range nodes.Items {
+		controlPlaneNodes = append(controlPlaneNodes, node.Name)
+	}
+	sort.Strings(controlPlaneNodes)
+
 	kcp, err := r.kubeadmControlPlaneForCluster(ctx, cluster)
 	if err != nil {
-		return false, err
+		return controlPlaneNodes, false, err
 	}
 	if kcp == nil {
 		log.Info("Skipping kube-ovn AppRelease reconcile until KubeadmControlPlane is available")
-		return false, nil
+		return controlPlaneNodes, false, nil
 	}
 	if !kcp.DeletionTimestamp.IsZero() {
 		log.Info("Skipping kube-ovn AppRelease reconcile while KubeadmControlPlane is deleting", "KubeadmControlPlane", klog.KObj(kcp))
-		return false, nil
+		return controlPlaneNodes, false, nil
+	}
+	if kcp.Spec.Replicas == nil {
+		return controlPlaneNodes, true, nil
 	}
 
-	desiredReplicas := int32(1)
-	if kcp.Spec.Replicas != nil {
-		desiredReplicas = *kcp.Spec.Replicas
+	if int32(len(controlPlaneNodes)) < *kcp.Spec.Replicas {
+		log.Info("Skipping kube-ovn AppRelease reconcile until all control plane Nodes are registered", "controlPlaneNodes", len(controlPlaneNodes), "desiredControlPlaneReplicas", *kcp.Spec.Replicas)
+		return controlPlaneNodes, false, nil
 	}
-
-	machines := &clusterv1.MachineList{}
-	if err := r.Client.List(ctx,
-		machines,
-		client.InNamespace(cluster.Namespace),
-		client.MatchingLabels{clusterv1.ClusterNameLabel: cluster.Name},
-		client.HasLabels{clusterv1.MachineControlPlaneLabel},
-	); err != nil {
-		return false, pkgerrors.Wrap(err, "failed to list control plane Machines")
-	}
-
-	var controlPlaneNodes int32
-	for _, machine := range machines.Items {
-		if !machine.DeletionTimestamp.IsZero() || machine.Status.NodeRef == nil {
-			continue
-		}
-		node, err := workloadClient.CoreV1().Nodes().Get(ctx, machine.Status.NodeRef.Name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			log.Info("Skipping kube-ovn AppRelease reconcile because control plane Node does not exist", "Machine", klog.KObj(&machine), "Node", machine.Status.NodeRef.Name)
-			continue
-		}
-		if err != nil {
-			log.Error(err, "Skipping kube-ovn AppRelease reconcile because control plane Node cannot be queried", "Machine", klog.KObj(&machine), "Node", machine.Status.NodeRef.Name)
-			return false, nil
-		}
-		if !node.DeletionTimestamp.IsZero() {
-			log.Info("Skipping kube-ovn AppRelease reconcile because control plane Node is deleting", "Machine", klog.KObj(&machine), "Node", node.Name)
-			continue
-		}
-		controlPlaneNodes++
-	}
-	if controlPlaneNodes < desiredReplicas {
-		log.Info("Skipping kube-ovn AppRelease reconcile until all control plane Nodes exist and are not deleting", "controlPlaneNodes", controlPlaneNodes, "desiredControlPlaneReplicas", desiredReplicas)
-		return false, nil
-	}
-	return true, nil
+	return controlPlaneNodes, true, nil
 }
 
 func (r *clusterReconciler) kubeadmControlPlaneForCluster(ctx context.Context, cluster *clusterv1.Cluster) (*controlplanev1.KubeadmControlPlane, error) {
@@ -607,6 +597,7 @@ func buildKubeOvnAppRelease(
 	joinCIDR string,
 	chartPullSecret string,
 	imagePullSecrets []interface{},
+	controlPlaneNodes []string,
 ) *unstructured.Unstructured {
 	if chartName == "" {
 		chartName = kubeOvnLegacyChartName
@@ -699,6 +690,13 @@ func buildKubeOvnAppRelease(
 				},
 			},
 		},
+	}
+	if len(controlPlaneNodes) > 0 {
+		nodes := make([]interface{}, 0, len(controlPlaneNodes))
+		for _, node := range controlPlaneNodes {
+			nodes = append(nodes, node)
+		}
+		_ = unstructured.SetNestedSlice(appRelease.Object, nodes, "spec", "values", "controlPlaneNodes")
 	}
 	if chartPullSecret != "" {
 		_ = unstructured.SetNestedField(appRelease.Object, chartPullSecret, "spec", "source", "chartPullSecret")
