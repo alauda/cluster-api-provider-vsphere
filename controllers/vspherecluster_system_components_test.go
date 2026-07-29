@@ -145,6 +145,10 @@ func TestReconcileWorkloadSystemComponentRepositories(t *testing.T) {
 			scheme := newSystemComponentTestScheme(t)
 			cluster, kcp := systemComponentTestClusterAndKCP(tt.kubernetesVersion, tt.coreDNSTag)
 			remoteClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(
+				&corev1.ServiceAccount{
+					ObjectMeta:       metav1.ObjectMeta{Name: "sentry", Namespace: "cpaas-system"},
+					ImagePullSecrets: []corev1.LocalObjectReference{{Name: "global-registry-auth"}},
+				},
 				&appsv1.DaemonSet{
 					ObjectMeta: metav1.ObjectMeta{Name: "kube-proxy", Namespace: "kube-system"},
 					Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
@@ -162,10 +166,14 @@ func TestReconcileWorkloadSystemComponentRepositories(t *testing.T) {
 			).Build()
 			r := &clusterReconciler{Client: remoteClient}
 
-			if err := r.reconcileKubeProxyRepository(ctx, cluster, kcp, remoteClient); err != nil {
+			sentryPullSecret, err := firstSentryImagePullSecret(ctx, remoteClient)
+			if err != nil {
+				t.Fatalf("get sentry imagePullSecret: %v", err)
+			}
+			if err := r.reconcileKubeProxyRepository(ctx, cluster, kcp, remoteClient, sentryPullSecret); err != nil {
 				t.Fatalf("reconcile kube-proxy: %v", err)
 			}
-			if err := r.reconcileCoreDNSRepository(ctx, cluster, kcp, remoteClient); err != nil {
+			if err := r.reconcileCoreDNSRepository(ctx, cluster, kcp, remoteClient, sentryPullSecret); err != nil {
 				t.Fatalf("reconcile CoreDNS: %v", err)
 			}
 
@@ -176,8 +184,8 @@ func TestReconcileWorkloadSystemComponentRepositories(t *testing.T) {
 			if got := daemonSet.Spec.Template.Spec.Containers[0].Image; got != tt.wantKubeProxyImage {
 				t.Fatalf("kube-proxy image = %q, want %q", got, tt.wantKubeProxyImage)
 			}
-			if got := daemonSet.Spec.Template.Spec.ImagePullSecrets; len(got) != 1 || got[0].Name != "existing-kube-proxy-secret" {
-				t.Fatalf("kube-proxy imagePullSecrets changed: %v", got)
+			if got := daemonSet.Spec.Template.Spec.ImagePullSecrets; len(got) != 2 || got[0].Name != "existing-kube-proxy-secret" || got[1].Name != "global-registry-auth" {
+				t.Fatalf("kube-proxy imagePullSecrets = %v, want existing-kube-proxy-secret and global-registry-auth", got)
 			}
 
 			deployment := &appsv1.Deployment{}
@@ -187,16 +195,16 @@ func TestReconcileWorkloadSystemComponentRepositories(t *testing.T) {
 			if got := deployment.Spec.Template.Spec.Containers[0].Image; got != tt.wantCoreDNSImage {
 				t.Fatalf("CoreDNS image = %q, want %q", got, tt.wantCoreDNSImage)
 			}
-			if got := deployment.Spec.Template.Spec.ImagePullSecrets; len(got) != 1 || got[0].Name != "existing-coredns-secret" {
-				t.Fatalf("CoreDNS imagePullSecrets changed: %v", got)
+			if got := deployment.Spec.Template.Spec.ImagePullSecrets; len(got) != 2 || got[0].Name != "existing-coredns-secret" || got[1].Name != "global-registry-auth" {
+				t.Fatalf("CoreDNS imagePullSecrets = %v, want existing-coredns-secret and global-registry-auth", got)
 			}
 
 			daemonSetResourceVersion := daemonSet.ResourceVersion
 			deploymentResourceVersion := deployment.ResourceVersion
-			if err := r.reconcileKubeProxyRepository(ctx, cluster, kcp, remoteClient); err != nil {
+			if err := r.reconcileKubeProxyRepository(ctx, cluster, kcp, remoteClient, sentryPullSecret); err != nil {
 				t.Fatalf("second kube-proxy reconcile: %v", err)
 			}
-			if err := r.reconcileCoreDNSRepository(ctx, cluster, kcp, remoteClient); err != nil {
+			if err := r.reconcileCoreDNSRepository(ctx, cluster, kcp, remoteClient, sentryPullSecret); err != nil {
 				t.Fatalf("second CoreDNS reconcile: %v", err)
 			}
 			if err := remoteClient.Get(ctx, client.ObjectKeyFromObject(daemonSet), daemonSet); err != nil {
@@ -230,7 +238,7 @@ func TestReconcileKubeProxyRepositoryWaitsForKubeadmControlPlaneRollout(t *testi
 	remoteClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(daemonSet).Build()
 	r := &clusterReconciler{Client: remoteClient}
 
-	if err := r.reconcileKubeProxyRepository(ctx, cluster, kcp, remoteClient); err != nil {
+	if err := r.reconcileKubeProxyRepository(ctx, cluster, kcp, remoteClient, nil); err != nil {
 		t.Fatalf("reconcile kube-proxy: %v", err)
 	}
 	got := &appsv1.DaemonSet{}
@@ -257,7 +265,7 @@ func TestReconcileCoreDNSRepositoryWaitsForKubeadmControlPlaneRollout(t *testing
 	remoteClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(deployment).Build()
 	r := &clusterReconciler{Client: remoteClient}
 
-	if err := r.reconcileCoreDNSRepository(ctx, cluster, kcp, remoteClient); err != nil {
+	if err := r.reconcileCoreDNSRepository(ctx, cluster, kcp, remoteClient, nil); err != nil {
 		t.Fatalf("reconcile CoreDNS: %v", err)
 	}
 	got := &appsv1.Deployment{}
