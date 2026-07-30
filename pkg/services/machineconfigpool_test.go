@@ -840,10 +840,131 @@ func TestApplyDiskBackfill(t *testing.T) {
 		g.Expect(pool.Status.PersistentDiskStatuses).To(BeEmpty())
 	})
 
+	t.Run("seeds Creating for a fallback disk with only a unit number", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(2)}, // clone assigned a unit, vmdk not observed yet
+			},
+		}, "machine-1", "machine-1-uid")
+		g.Expect(updated).To(BeTrue())
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseCreating))
+		g.Expect(rec.VolumePath).To(BeEmpty())
+		g.Expect(*rec.UnitNumber).To(Equal(int32(2)))
+	})
+
+	t.Run("Creating flips to Attached once VolumePath is observed", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
+		pool.Status.PersistentDiskStatuses = []infrav1.PersistentDiskStatus{{
+			Hostname: "host-1", Name: "disk-a", UnitNumber: int32Ptr(2),
+			Phase: infrav1.PersistentDiskPhaseCreating, OwnerMachineName: "machine-1", OwnerMachineUID: "machine-1-uid",
+		}}
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk-a.vmdk", DiskUUID: "uuid-a", UnitNumber: int32Ptr(2)},
+			},
+		}, "machine-1", "machine-1-uid")
+		g.Expect(updated).To(BeTrue())
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseAttached))
+		g.Expect(rec.VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
+	})
+
+	t.Run("does not downgrade an active disk to Creating", func(t *testing.T) {
+		g := NewWithT(t)
+		for _, phase := range []infrav1.PersistentDiskPhase{
+			infrav1.PersistentDiskPhaseAttached,
+			infrav1.PersistentDiskPhaseAvailable,
+			infrav1.PersistentDiskPhaseReclaiming,
+		} {
+			pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
+			pool.Status.PersistentDiskStatuses = []infrav1.PersistentDiskStatus{{
+				Hostname: "host-1", Name: "disk-a", VolumePath: "[ds] vm/disk-a.vmdk", UnitNumber: int32Ptr(2),
+				Phase: phase, OwnerMachineName: "machine-1", OwnerMachineUID: "machine-1-uid",
+			}}
+			updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+				Hostname: "host-1",
+				PersistentDisks: []infrav1.PersistentDisk{
+					{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(2)}, // no VolumePath (lost hydrate)
+				},
+			}, "machine-1", "machine-1-uid")
+			g.Expect(updated).To(BeFalse(), "phase %s must not be downgraded", phase)
+			rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+			g.Expect(rec.Phase).To(Equal(phase))
+		}
+	})
+
+	t.Run("a reused Reclaimed tombstone can be reseeded to Creating", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
+		pool.Status.PersistentDiskStatuses = []infrav1.PersistentDiskStatus{{
+			Hostname: "host-1", Name: "disk-a", Phase: infrav1.PersistentDiskPhaseReclaimed,
+		}}
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				{Name: "disk-a", SizeGiB: 20, UnitNumber: int32Ptr(2)},
+			},
+		}, "machine-2", "machine-2-uid")
+		g.Expect(updated).To(BeTrue())
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseCreating))
+		g.Expect(rec.OwnerMachineName).To(Equal("machine-2"))
+	})
+
 	t.Run("nil pool or slot returns false", func(t *testing.T) {
 		g := NewWithT(t)
 		g.Expect(ApplyDiskBackfill(nil, &infrav1.MachineConfigSlot{}, "", "")).To(BeFalse())
 		g.Expect(ApplyDiskBackfill(&infrav1.VSphereMachineConfigPool{}, nil, "", "")).To(BeFalse())
+	})
+
+	t.Run("records ephemeral disk observed unit without a VolumePath gate", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool()
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			EphemeralDisks: []infrav1.EphemeralDisk{
+				{Name: "cache-1", SizeGiB: 20, UnitNumber: int32Ptr(3)},
+			},
+		}, "machine-1", "machine-1-uid")
+		g.Expect(updated).To(BeTrue())
+		rec, _ := infrav1.FindEphemeralDiskStatus(pool, "host-1", "cache-1")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(*rec.UnitNumber).To(Equal(int32(3)))
+	})
+
+	t.Run("skips ephemeral disk before its unit is known", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool()
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			EphemeralDisks: []infrav1.EphemeralDisk{
+				{Name: "cache-1", SizeGiB: 20}, // unit not assigned yet
+			},
+		}, "machine-1", "machine-1-uid")
+		g.Expect(updated).To(BeFalse())
+		g.Expect(pool.Status.EphemeralDiskStatuses).To(BeEmpty())
+	})
+
+	t.Run("returns false when the ephemeral unit is already recorded", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool()
+		pool.Status.EphemeralDiskStatuses = []infrav1.EphemeralDiskStatus{
+			{Hostname: "host-1", Name: "cache-1", UnitNumber: int32Ptr(3)},
+		}
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			EphemeralDisks: []infrav1.EphemeralDisk{
+				{Name: "cache-1", SizeGiB: 20, UnitNumber: int32Ptr(3)},
+			},
+		}, "machine-1", "machine-1-uid")
+		g.Expect(updated).To(BeFalse())
 	})
 }
 
@@ -913,6 +1034,59 @@ func TestValidateSlotFields(t *testing.T) {
 		}
 		errs := ValidateSlotFields(pool)
 		g.Expect(errs).To(HaveLen(3)) // duplicate name, unitNumber, mountPath
+	})
+
+	t.Run("valid ephemeral disks alongside persistent disks have no errors", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "etcd", SizeGiB: 20, UnitNumber: int32Ptr(0), MountPath: "/var/lib/etcd"},
+					},
+					EphemeralDisks: []infrav1.EphemeralDisk{
+						{Name: "cache", SizeGiB: 50, MountPath: "/var/lib/containerd"},
+					},
+				}},
+			},
+		}
+		g.Expect(ValidateSlotFields(pool)).To(BeEmpty())
+	})
+
+	t.Run("flags ephemeral disk bad size and empty name", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					EphemeralDisks: []infrav1.EphemeralDisk{
+						{Name: "", SizeGiB: 0},
+					},
+				}},
+			},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(2)) // required name, sizeGiB<1
+	})
+
+	t.Run("flags name and mountPath colliding across persistent and ephemeral disks", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "shared", SizeGiB: 10, UnitNumber: int32Ptr(1), MountPath: "/data"},
+					},
+					EphemeralDisks: []infrav1.EphemeralDisk{
+						{Name: "shared", SizeGiB: 10, MountPath: "/data"},
+					},
+				}},
+			},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(2)) // duplicate name and mountPath across the two lists
 	})
 }
 
@@ -1126,6 +1300,35 @@ func TestHydrateSlotFromStatus(t *testing.T) {
 		HydrateSlotFromStatus(pool, slot)
 		g.Expect(slot.PersistentDisks[0].VolumePath).To(Equal("[ds] legacy/disk.vmdk"))
 		g.Expect(slot.PersistentDisks[0].UnitNumber).To(BeNil())
+	})
+
+	t.Run("ephemeral observed unit is overlaid onto the slot", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				EphemeralDiskStatuses: []infrav1.EphemeralDiskStatus{
+					{Hostname: "host-1", Name: "cache-1", UnitNumber: toInt32Ptr(4)},
+				},
+			},
+		}
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:       "host-1",
+			EphemeralDisks: []infrav1.EphemeralDisk{{Name: "cache-1", SizeGiB: 20}},
+		}
+		HydrateSlotFromStatus(pool, slot)
+		g.Expect(slot.EphemeralDisks[0].UnitNumber).NotTo(BeNil())
+		g.Expect(*slot.EphemeralDisks[0].UnitNumber).To(Equal(int32(4)))
+	})
+
+	t.Run("no ephemeral status record leaves the unit nil", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{}
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:       "host-1",
+			EphemeralDisks: []infrav1.EphemeralDisk{{Name: "cache-1", SizeGiB: 20}},
+		}
+		HydrateSlotFromStatus(pool, slot)
+		g.Expect(slot.EphemeralDisks[0].UnitNumber).To(BeNil())
 	})
 }
 

@@ -91,3 +91,35 @@ func RemoveDiskStatus(pool *VSphereMachineConfigPool, hostname, name string) {
 	}
 	pool.Status.PersistentDiskStatuses = out
 }
+
+// FindEphemeralDiskStatus locates an existing ephemeral-disk status entry by
+// (hostname, name). The returned pointer references
+// pool.Status.EphemeralDiskStatuses[i] for in-place mutation. Returns
+// (nil, -1) when not found.
+func FindEphemeralDiskStatus(pool *VSphereMachineConfigPool, hostname, name string) (*EphemeralDiskStatus, int) {
+	if pool == nil {
+		return nil, -1
+	}
+	for i := range pool.Status.EphemeralDiskStatuses {
+		e := &pool.Status.EphemeralDiskStatuses[i]
+		if e.Hostname == hostname && e.Name == name {
+			return e, i
+		}
+	}
+	return nil, -1
+}
+
+// UpsertEphemeralDiskStatus inserts or updates the (hostname, name) entry in
+// place. Unlike UpsertDiskStatus there is no Phase/LastTransitionTime bookkeeping:
+// the record carries only the observed SCSI unit number.
+func UpsertEphemeralDiskStatus(pool *VSphereMachineConfigPool, rec EphemeralDiskStatus) {
+	if pool == nil {
+		return
+	}
+	existing, idx := FindEphemeralDiskStatus(pool, rec.Hostname, rec.Name)
+	if existing == nil {
+		pool.Status.EphemeralDiskStatuses = append(pool.Status.EphemeralDiskStatuses, rec)
+		return
+	}
+	pool.Status.EphemeralDiskStatuses[idx] = rec
+}

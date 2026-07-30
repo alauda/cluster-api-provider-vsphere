@@ -25,6 +25,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"math/big"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1035,7 +1036,7 @@ func Test_GetPersistentDiskCloudConfig(t *testing.T) {
 		MountPath:  "/var/lib/data",
 		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "6000C29d-45cb-2787-e901-a2a0131b2e82",
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1095,6 +1096,101 @@ func Test_GetPersistentDiskCloudConfig(t *testing.T) {
 	}
 }
 
+func Test_GetPersistentDiskCloudConfigWithEphemeralDisks(t *testing.T) {
+	actual, err := util.GetPersistentDiskCloudConfig(
+		[]infrav1.PersistentDisk{{
+			Name:       "data-1",
+			UnitNumber: toInt32Ptr(2),
+			MountPath:  "/var/lib/data",
+			VolumePath: "[ds] vm/data-1.vmdk",
+			DiskUUID:   "6000C29d-45cb-2787-e901-a2a0131b2e82",
+		}},
+		[]infrav1.EphemeralDisk{{
+			Name:       "cache-1",
+			UnitNumber: toInt32Ptr(3),
+			MountPath:  "/var/lib/containerd",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var actualObj interface{}
+	if err := yaml.Unmarshal(actual, &actualObj); err != nil {
+		t.Fatalf("failed to parse actual cloud-config: %v", err)
+	}
+	actualMap := actualObj.(map[interface{}]interface{})
+	writeFiles := actualMap["write_files"].([]interface{})
+	configEntry := writeFiles[0].(map[interface{}]interface{})
+	decodedConfig, err := base64.StdEncoding.DecodeString(configEntry["content"].(string))
+	if err != nil {
+		t.Fatalf("failed to decode disk table: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(decodedConfig), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 disk-table rows (one persistent, one ephemeral), got %d: %q", len(lines), string(decodedConfig))
+	}
+
+	// Persistent row keeps its backfilled UUID.
+	persistentFields := strings.Split(lines[0], "\t")
+	if persistentFields[0] != "data-1" || persistentFields[5] != "6000C29d-45cb-2787-e901-a2a0131b2e82" {
+		t.Fatalf("unexpected persistent row: %q", lines[0])
+	}
+
+	// Ephemeral row: name/unit/mount/fsFormat set, disk-UUID column empty (so the
+	// guest falls back to by-unit lookup) and wipe flag false.
+	ephemeralFields := strings.Split(lines[1], "\t")
+	if len(ephemeralFields) != 7 {
+		t.Fatalf("expected 7 tab-separated fields in ephemeral row, got %d: %q", len(ephemeralFields), lines[1])
+	}
+	if got, want := ephemeralFields[0], "cache-1"; got != want {
+		t.Fatalf("ephemeral name = %q, want %q", got, want)
+	}
+	if got, want := ephemeralFields[1], "3"; got != want {
+		t.Fatalf("ephemeral unit = %q, want %q", got, want)
+	}
+	if got, want := ephemeralFields[2], "/var/lib/containerd"; got != want {
+		t.Fatalf("ephemeral mountPath = %q, want %q", got, want)
+	}
+	if got, want := ephemeralFields[3], "ext4"; got != want {
+		t.Fatalf("ephemeral fsFormat = %q, want %q (should default)", got, want)
+	}
+	if ephemeralFields[5] != "" {
+		t.Fatalf("expected empty disk-UUID column for ephemeral disk, got %q", ephemeralFields[5])
+	}
+	if got, want := ephemeralFields[6], "false"; got != want {
+		t.Fatalf("ephemeral wipe flag = %q, want %q", got, want)
+	}
+}
+
+func Test_GetPersistentDiskCloudConfigEphemeralOnly(t *testing.T) {
+	// A slot with only ephemeral disks still emits the reconcile machinery.
+	actual, err := util.GetPersistentDiskCloudConfig(nil, []infrav1.EphemeralDisk{{
+		Name:       "cache-1",
+		UnitNumber: toInt32Ptr(4),
+		MountPath:  "/var/lib/containerd",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(actual), "/etc/capv/persistent-disks.tsv") {
+		t.Fatalf("expected ephemeral-only config to emit the disk table, got: %s", string(actual))
+	}
+}
+
+func Test_GetPersistentDiskCloudConfigEphemeralRequiresUnit(t *testing.T) {
+	_, err := util.GetPersistentDiskCloudConfig(nil, []infrav1.EphemeralDisk{{
+		Name:      "cache-1",
+		MountPath: "/var/lib/containerd",
+	}})
+	if err == nil {
+		t.Fatal("expected ephemeral disk without an observed unit number to fail")
+	}
+	if !strings.Contains(err.Error(), "cache-1") || !strings.Contains(err.Error(), "unitNumber") {
+		t.Fatalf("expected error to mention disk and unitNumber, got: %v", err)
+	}
+}
+
 func Test_GetPersistentDiskCloudConfigRequiresCompleteBackfill(t *testing.T) {
 	testCases := []struct {
 		name           string
@@ -1131,7 +1227,7 @@ func Test_GetPersistentDiskCloudConfigRequiresCompleteBackfill(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{tc.persistentDisk})
+			_, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{tc.persistentDisk}, nil)
 			if err == nil {
 				t.Fatal("expected incomplete persistent disk metadata to fail")
 			}
@@ -1407,7 +1503,7 @@ runcmd:
 		MountPath:  "/var/lib/data",
 		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "uuid-data-1",
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1444,7 +1540,7 @@ runcmd:
 		MountPath:  "/var/lib/data",
 		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "uuid-data-1",
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1479,7 +1575,7 @@ func Test_MergeCloudConfigUserData_WriteFilesReplaceByPath(t *testing.T) {
 		MountPath:  "/var/lib/data",
 		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "old-uuid",
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1489,7 +1585,7 @@ func Test_MergeCloudConfigUserData_WriteFilesReplaceByPath(t *testing.T) {
 		MountPath:  "/var/lib/data",
 		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "new-uuid",
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1548,7 +1644,7 @@ runcmd:
 		MountPath:  "/var/lib/data",
 		VolumePath: "[ds] vm/data-1.vmdk",
 		DiskUUID:   "uuid-data-1",
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1981,6 +2077,77 @@ func mtu(i int64) *int64 {
 
 func toStringPtr(s string) *string {
 	return &s
+}
+
+func Test_DeterministicDiskPath(t *testing.T) {
+	// Clean, path-safe names produce an exact "[datastore] <vmName>/<host>-<disk>.vmdk":
+	// the per-VM directory namespaces disks across VMs, the file name is self-describing.
+	// Empty required inputs return "".
+	tests := []struct {
+		name      string
+		vmName    string
+		datastore string
+		diskName  string
+		want      string
+	}{
+		{name: "happy path", vmName: "vm-1", datastore: "datastore1", diskName: "etcd", want: "[datastore1] vm-1/vm-1-etcd.vmdk"},
+		{name: "datastore with spaces is kept verbatim", vmName: "vm-1", datastore: "my datastore", diskName: "data-0", want: "[my datastore] vm-1/vm-1-data-0.vmdk"},
+		{name: "dots underscores hyphens allowed", vmName: "vm.1_a-b", datastore: "ds", diskName: "d.0_x-y", want: "[ds] vm.1_a-b/vm.1_a-b-d.0_x-y.vmdk"},
+		{name: "empty datastore returns empty", vmName: "vm-1", datastore: "", diskName: "etcd", want: ""},
+		{name: "empty vm name returns empty", vmName: "", datastore: "ds", diskName: "etcd", want: ""},
+		{name: "empty disk name returns empty", vmName: "vm-1", datastore: "ds", diskName: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			g.Expect(util.DeterministicDiskPath(tt.vmName, tt.datastore, tt.diskName)).To(gomega.Equal(tt.want))
+		})
+	}
+
+	t.Run("different host/disk splits do not collide (per-VM directory namespaces)", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		// Readable names "a-b-c" coincide, but the per-VM directory ("a" vs "a-b")
+		// keeps the full paths distinct.
+		g.Expect(util.DeterministicDiskPath("a", "ds", "b-c")).ToNot(gomega.Equal(util.DeterministicDiskPath("a-b", "ds", "c")))
+	})
+}
+
+func Test_DeterministicDiskName(t *testing.T) {
+	hexSuffix := regexp.MustCompile(`^-[0-9a-f]{5}$`)
+
+	t.Run("clean name is readable host-disk", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		g.Expect(util.DeterministicDiskName("vm-1", "etcd")).To(gomega.Equal("vm-1-etcd"))
+		g.Expect(util.DeterministicDiskName("vm.1_a-b", "d.0_x-y")).To(gomega.Equal("vm.1_a-b-d.0_x-y"))
+	})
+
+	t.Run("unsafe chars are sanitized and disambiguated by a hash suffix", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		got := util.DeterministicDiskName("vm-1", "a/b")
+		// Sanitized prefix preserved, unsafe byte replaced by '-', hash appended.
+		g.Expect(got).To(gomega.HavePrefix("vm-1-a-b"))
+		g.Expect(hexSuffix.MatchString(got[len("vm-1-a-b"):])).To(gomega.BeTrue())
+	})
+
+	t.Run("unsafe names that sanitize alike are kept apart by the raw-input hash", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		// "a/b" and "a]b" both sanitize to "a-b"; the hash over the raw inputs disambiguates.
+		g.Expect(util.DeterministicDiskName("vm-1", "a/b")).ToNot(gomega.Equal(util.DeterministicDiskName("vm-1", "a]b")))
+	})
+
+	t.Run("over-long name is truncated and hashed within the 250-byte budget", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		got := util.DeterministicDiskName("vm-1", strings.Repeat("a", 300))
+		g.Expect(len(got)).To(gomega.Equal(250)) // 255 minus the ".vmdk" the caller appends
+		g.Expect(hexSuffix.MatchString(got[len(got)-6:])).To(gomega.BeTrue())
+	})
+
+	t.Run("is idempotent", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		for _, tc := range [][2]string{{"vm-1", "etcd"}, {"vm-1", "a/b"}, {"vm-1", strings.Repeat("a", 300)}} {
+			g.Expect(util.DeterministicDiskName(tc[0], tc[1])).To(gomega.Equal(util.DeterministicDiskName(tc[0], tc[1])))
+		}
+	})
 }
 
 func toBoolPtr(b bool) *bool {

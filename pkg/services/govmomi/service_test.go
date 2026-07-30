@@ -537,6 +537,80 @@ func getPoweredoffVM(ctx context.Context, c *vim25.Client) (*object.VirtualMachi
 	return vm, err
 }
 
+func TestDetachPersistentDisksIgnoresEphemeralDisks(t *testing.T) {
+	vms := &VMService{}
+
+	dataDiskCount := func(ctx context.Context, vm *object.VirtualMachine) (int, int32) {
+		devices, err := vm.Device(ctx)
+		if err != nil {
+			return -1, 0
+		}
+		disks := devices.SelectByType((*types.VirtualDisk)(nil))
+		var unit int32
+		if len(disks) > 0 {
+			if u := disks[0].(*types.VirtualDisk).UnitNumber; u != nil {
+				unit = *u
+			}
+		}
+		return len(disks), unit
+	}
+
+	newVMCtx := func(vm *object.VirtualMachine, slot *infrav1.MachineConfigSlot) *virtualMachineContext {
+		vmCtx := emptyVirtualMachineContext()
+		vmCtx.Obj = vm
+		vmCtx.VSphereVM = &infrav1.VSphereVM{
+			ObjectMeta: metav1.ObjectMeta{Name: "vspherevm1", Namespace: "default"},
+		}
+		vmCtx.MachineConfigSlot = slot
+		return vmCtx
+	}
+
+	t.Run("a slot with only ephemeral disks detaches nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			vm, err := getPoweredoffVM(ctx, c)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			before, unit := dataDiskCount(ctx, vm)
+			g.Expect(before).To(BeNumerically(">", 0))
+
+			// The ephemeral disk even names the attached disk's unit; detach must
+			// still leave it in place because it only ever operates on persistent
+			// disks.
+			slot := &infrav1.MachineConfigSlot{
+				Hostname:       "worker-01",
+				EphemeralDisks: []infrav1.EphemeralDisk{{Name: "cache-1", SizeGiB: 10, UnitNumber: ptr.To(unit)}},
+			}
+			g.Expect(vms.detachPersistentDisks(ctx, newVMCtx(vm, slot))).To(Succeed())
+
+			after, _ := dataDiskCount(ctx, vm)
+			g.Expect(after).To(Equal(before), "ephemeral disks must not be detached")
+			return nil
+		})
+	})
+
+	t.Run("control: a persistent disk at the same unit is detached", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			vm, err := getPoweredoffVM(ctx, c)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			before, unit := dataDiskCount(ctx, vm)
+			g.Expect(before).To(BeNumerically(">", 0))
+
+			slot := &infrav1.MachineConfigSlot{
+				Hostname:        "worker-01",
+				PersistentDisks: []infrav1.PersistentDisk{{Name: "data-1", SizeGiB: 10, UnitNumber: ptr.To(unit)}},
+			}
+			g.Expect(vms.detachPersistentDisks(ctx, newVMCtx(vm, slot))).To(Succeed())
+
+			after, _ := dataDiskCount(ctx, vm)
+			g.Expect(after).To(Equal(before-1), "the persistent disk at the matched unit should be detached")
+			return nil
+		})
+	})
+}
+
 func storagePolicyModel() (*simulator.Model, error) {
 	model := simulator.VPX()
 	err := model.Create()
@@ -645,7 +719,30 @@ func TestFindPersistentDiskDevice(t *testing.T) {
 		disk := newDisk(1, ideKey, int32Ptr(0), 20, "[ds] vm/data.vmdk")
 		disks := object.VirtualDeviceList{disk}
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, VolumePath: "[ds] vm/data.vmdk"}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).NotTo(BeNil())
+		g.Expect(result.Key).To(Equal(int32(1)))
+	})
+
+	t.Run("tier1 self-heal: match by derived expectedPath when VolumePath lost", func(t *testing.T) {
+		g := NewWithT(t)
+		// Status write was lost so pd.VolumePath is empty, but the disk was created
+		// at the deterministic path; expectedPath re-derives it and matches.
+		disk := newDisk(1, scsiKey, int32Ptr(3), 20, "[ds] vm/data.vmdk")
+		disks := object.VirtualDeviceList{disk}
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
+		result := findPersistentDiskDevice(pd, "[ds] vm/data.vmdk", disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).NotTo(BeNil())
+		g.Expect(result.Key).To(Equal(int32(1)))
+	})
+
+	t.Run("tier1: recorded VolumePath takes precedence over expectedPath", func(t *testing.T) {
+		g := NewWithT(t)
+		recorded := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/recorded.vmdk")
+		derived := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/derived.vmdk")
+		disks := object.VirtualDeviceList{recorded, derived}
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, VolumePath: "[ds] vm/recorded.vmdk"}
+		result := findPersistentDiskDevice(pd, "[ds] vm/derived.vmdk", disks, map[int32]struct{}{}, scsiKeys)
 		g.Expect(result).NotTo(BeNil())
 		g.Expect(result.Key).To(Equal(int32(1)))
 	})
@@ -657,7 +754,7 @@ func TestFindPersistentDiskDevice(t *testing.T) {
 		disks := object.VirtualDeviceList{osDisk, dataDisk}
 
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, UnitNumber: int32Ptr(0)}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
 		g.Expect(result).NotTo(BeNil())
 		g.Expect(result.Key).To(Equal(int32(2)), "should match SCSI disk, not IDE OS disk")
 	})
@@ -668,77 +765,39 @@ func TestFindPersistentDiskDevice(t *testing.T) {
 		disks := object.VirtualDeviceList{osDisk}
 
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, UnitNumber: int32Ptr(1)}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
 		g.Expect(result).To(BeNil(), "should not match IDE disk by unit number")
 	})
 
-	t.Run("tier3: capacity match on SCSI only", func(t *testing.T) {
+	t.Run("no capacity fallback: same-size SCSI disks without path or unit return nil", func(t *testing.T) {
 		g := NewWithT(t)
-		osDisk := newDisk(1, ideKey, int32Ptr(0), 20, "[ds] vm/os.vmdk")
-		dataDisk := newDisk(2, scsiKey, int32Ptr(0), 20, "[ds] vm/data.vmdk")
-		disks := object.VirtualDeviceList{osDisk, dataDisk}
-
-		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
-		g.Expect(result).NotTo(BeNil())
-		g.Expect(result.Key).To(Equal(int32(2)), "should match SCSI disk by capacity, not IDE")
-	})
-
-	t.Run("tier3: duplicate capacity chooses first deterministic unused candidate", func(t *testing.T) {
-		g := NewWithT(t)
-		d1 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
-		d2 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
-		disks := object.VirtualDeviceList{d1, d2}
-
-		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
-		g.Expect(result).NotTo(BeNil())
-		g.Expect(result.Key).To(Equal(int32(1)))
-	})
-
-	t.Run("tier3: skips used duplicate capacity candidates", func(t *testing.T) {
-		g := NewWithT(t)
+		// Two same-capacity SCSI disks, but pd carries neither a path nor a unit —
+		// the removed tier 3 would have guessed one; now the match must fail so
+		// ValidatePersistentDiskBackfill refuses power-on instead of guessing.
 		d1 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
 		d2 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
 		disks := object.VirtualDeviceList{d1, d2}
 
-		used := map[int32]struct{}{1: {}}
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-		result := findPersistentDiskDevice(pd, disks, used, map[int32]struct{}{}, scsiKeys)
-		g.Expect(result).NotTo(BeNil())
-		g.Expect(result.Key).To(Equal(int32(2)))
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).To(BeNil())
 	})
 
-	t.Run("tier3: skips referenced duplicate capacity candidates", func(t *testing.T) {
+	t.Run("no capacity fallback: single same-size candidate still returns nil", func(t *testing.T) {
 		g := NewWithT(t)
-		d1 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
-		d2 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
-		disks := object.VirtualDeviceList{d1, d2}
+		// Even a lone same-size candidate is not enough: identity must come from
+		// path or unit, not capacity.
+		only := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
+		disks := object.VirtualDeviceList{only}
 
-		referenced := findReferencedPersistentDiskKeys([]infrav1.PersistentDisk{{Name: "other", UnitNumber: int32Ptr(0)}}, disks, scsiKeys)
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, referenced, scsiKeys)
-		g.Expect(result).NotTo(BeNil())
-		g.Expect(result.Key).To(Equal(int32(2)))
-	})
-
-	t.Run("tier3: input device order does not affect deterministic selection", func(t *testing.T) {
-		g := NewWithT(t)
-		d1 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
-		d2 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
-		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-
-		resultA := findPersistentDiskDevice(pd, object.VirtualDeviceList{d1, d2}, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
-		resultB := findPersistentDiskDevice(pd, object.VirtualDeviceList{d2, d1}, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
-		g.Expect(resultA).NotTo(BeNil())
-		g.Expect(resultB).NotTo(BeNil())
-		g.Expect(resultA.Key).To(Equal(int32(1)))
-		g.Expect(resultB.Key).To(Equal(int32(1)))
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).To(BeNil())
 	})
 
 	t.Run("nil pd returns nil", func(t *testing.T) {
 		g := NewWithT(t)
-		result := findPersistentDiskDevice(nil, object.VirtualDeviceList{}, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
+		result := findPersistentDiskDevice(nil, "", object.VirtualDeviceList{}, map[int32]struct{}{}, scsiKeys)
 		g.Expect(result).To(BeNil())
 	})
 }

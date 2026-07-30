@@ -120,6 +120,15 @@ type MachineConfigSlot struct {
 	// PersistentDisks that survive VM deletion.
 	// +optional
 	PersistentDisks []PersistentDisk `json:"persistentDisks,omitempty"`
+
+	// EphemeralDisks are non-persistent data disks. Unlike PersistentDisks they
+	// are created fresh (as empty disks) whenever the slot's VM is (re)created
+	// and deleted together with the VM: they do not participate in detach
+	// preservation, reclaim, or slot-release gating. Their SCSI unit number is
+	// assigned by the controller at clone time and observed in
+	// status.ephemeralDiskStatuses; it is not user-declared.
+	// +optional
+	EphemeralDisks []EphemeralDisk `json:"ephemeralDisks,omitempty"`
 }
 
 // MachineConfigSlotNetwork defines the primary and additional network configurations for a slot.
@@ -209,6 +218,47 @@ type PersistentDisk struct {
 	DiskUUID string `json:"diskUUID,omitempty"`
 }
 
+// EphemeralDisk defines a non-persistent data disk that is created empty with
+// the slot's VM and deleted together with it. It mirrors the guest-facing
+// fields of PersistentDisk (size, placement, mount, format) but omits all
+// persistence semantics: there is no UnitNumber spec field (the SCSI unit is
+// controller-assigned at clone time and observed in
+// status.ephemeralDiskStatuses), no VolumePath/DiskUUID backfill (the backing
+// vmdk is always newly created), and no WipeFilesystem (a fresh disk is always
+// empty and formatted from scratch).
+type EphemeralDisk struct {
+	// Name is the disk name. It shares a namespace with the slot's persistent
+	// disks: a name must be unique across both lists within the slot.
+	Name string `json:"name"`
+	// SizeGiB is the disk size.
+	// +kubebuilder:validation:Minimum=1
+	SizeGiB int32 `json:"sizeGiB"`
+	// Datastore is the vSphere datastore name.
+	// +optional
+	Datastore string `json:"datastore,omitempty"`
+	// StoragePolicy is the vSphere storage policy name.
+	// +optional
+	StoragePolicy string `json:"storagePolicy,omitempty"`
+
+	// MountPath is the mount path inside the VM guest OS (e.g., "/var/lib/containerd").
+	// +optional
+	MountPath string `json:"mountPath,omitempty"`
+
+	// MountOptions for the filesystem mount.
+	// +optional
+	MountOptions []string `json:"mountOptions,omitempty"`
+
+	// FSFormat is the filesystem format (default "ext4").
+	// +optional
+	FSFormat string `json:"fsFormat,omitempty"`
+
+	// UnitNumber carries the controller-observed SCSI unit number in memory only
+	// (json:"-", never serialized to the CRD). It is hydrated each reconcile from
+	// status.ephemeralDiskStatuses so clone and cloud-config consumers can address
+	// the disk, mirroring how PersistentDisk.UnitNumber is used downstream.
+	UnitNumber *int32 `json:"-"`
+}
+
 // VSphereMachineConfigPoolStatus defines the observed state of VSphereMachineConfigPool.
 type VSphereMachineConfigPoolStatus struct {
 	// ConfigStatuses tracks the state of each slot.
@@ -248,6 +298,18 @@ type VSphereMachineConfigPoolStatus struct {
 	// +listMapKey=hostname
 	// +listMapKey=name
 	PersistentDiskStatuses []PersistentDiskStatus `json:"persistentDiskStatuses,omitempty"`
+
+	// EphemeralDiskStatuses records the controller-observed SCSI unit number of
+	// each non-persistent disk, keyed by (hostname, disk name). The unit is
+	// assigned at clone time and reused (hydrated back onto the in-memory slot)
+	// on the next reconcile so the guest disk table can address the disk. Unlike
+	// PersistentDiskStatuses this carries no VolumePath/DiskUUID/Phase: ephemeral
+	// disks are recreated with the VM and never reclaimed.
+	// +optional
+	// +listType=map
+	// +listMapKey=hostname
+	// +listMapKey=name
+	EphemeralDiskStatuses []EphemeralDiskStatus `json:"ephemeralDiskStatuses,omitempty"`
 
 	// v1beta2 groups all the fields that will be added or modified in
 	// VSphereMachineConfigPool's status with the V1Beta2 version.
@@ -435,6 +497,26 @@ type PersistentDiskStatus struct {
 	// LastTransitionTime is the time Phase last changed.
 	// +optional
 	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
+}
+
+// EphemeralDiskStatus records the controller-observed SCSI unit number of a
+// single non-persistent disk, keyed by (Hostname, Name). It deliberately omits
+// VolumePath/DiskUUID/Phase: an ephemeral disk's backing vmdk is always newly
+// created and deleted with the VM, so there is nothing to reclaim and no
+// lifecycle to track. The recorded UnitNumber is hydrated back onto the
+// in-memory slot each reconcile so the guest disk table can address the disk.
+type EphemeralDiskStatus struct {
+	// Hostname is the slot this disk belongs to (matches MachineConfigSlot.Hostname).
+	Hostname string `json:"hostname"`
+
+	// Name is the disk name (matches EphemeralDisk.Name within the slot).
+	Name string `json:"name"`
+
+	// UnitNumber is the SCSI unit number the disk was attached at, assigned by
+	// the controller at clone time and reused on the next VM recreation to keep
+	// guest disk addressing stable.
+	// +optional
+	UnitNumber *int32 `json:"unitNumber,omitempty"`
 }
 
 // +kubebuilder:object:root=true

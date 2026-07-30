@@ -21,7 +21,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -466,8 +465,15 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 	for i, dataDisk := range vmCtx.VSphereVM.Spec.DataDisks {
 		log.V(2).Info("Adding disk", "name", dataDisk.Name, "spec", dataDisk)
 
-		// ADDITION: Check for persistent disk in MachineConfigSlot
+		// ADDITION: Check for a slot-managed disk (persistent or ephemeral) in the
+		// MachineConfigSlot. Disk names are unique across both lists, so a data
+		// disk matches at most one of them. Persistent disks may carry a
+		// backfilled VolumePath (reuse an existing vmdk) and a pinned/observed
+		// UnitNumber; ephemeral disks never have a VolumePath (always created
+		// fresh) but do carry a controller-observed UnitNumber hydrated from
+		// status. slotDisk captures the placement/unit shared by both.
 		var pd *infrav1.PersistentDisk
+		var ed *infrav1.EphemeralDisk
 		if vmCtx.MachineConfigSlot != nil {
 			for j := range vmCtx.MachineConfigSlot.PersistentDisks {
 				if vmCtx.MachineConfigSlot.PersistentDisks[j].Name == dataDisk.Name {
@@ -475,6 +481,25 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 					break
 				}
 			}
+			if pd == nil {
+				for j := range vmCtx.MachineConfigSlot.EphemeralDisks {
+					if vmCtx.MachineConfigSlot.EphemeralDisks[j].Name == dataDisk.Name {
+						ed = &vmCtx.MachineConfigSlot.EphemeralDisks[j]
+						break
+					}
+				}
+			}
+		}
+
+		// Placement/unit shared by both disk kinds. VolumePath stays empty for
+		// ephemeral disks, forcing a fresh create below.
+		var slotDatastore, slotStoragePolicy, slotVolumePath string
+		var slotPinnedUnit *int32
+		switch {
+		case pd != nil:
+			slotDatastore, slotStoragePolicy, slotVolumePath, slotPinnedUnit = pd.Datastore, pd.StoragePolicy, pd.VolumePath, pd.UnitNumber
+		case ed != nil:
+			slotDatastore, slotStoragePolicy, slotPinnedUnit = ed.Datastore, ed.StoragePolicy, ed.UnitNumber
 		}
 
 		backing := &types.VirtualDiskFlatVer2BackingInfo{
@@ -484,14 +509,31 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 			},
 		}
 
-		// ADDITION: Backfill VolumePath if available
-		if pd != nil && pd.VolumePath != "" {
-			backing.FileName = pd.VolumePath
-		} else if pd != nil && pd.Datastore != "" {
-			// Reconfigure VM disk creation allows datastore selection via the backing file path.
-			// Use a datastore-qualified file name placeholder so each persistent disk can land on
-			// its own datastore without changing the VM-level datastore selection.
-			backing.FileName = datastoreFileHint(pd.Datastore)
+		// ADDITION: Resolve the backing file name.
+		switch {
+		case slotVolumePath != "":
+			// Persistent disk reusing an existing vmdk: attach the recorded path.
+			backing.FileName = slotVolumePath
+		case pd != nil && slotDatastore != "":
+			// Fresh persistent disk on a known datastore: name the vmdk
+			// deterministically and record it on the slot so status carries a Tier-1
+			// VolumePath from the moment of clone, instead of relying on vCenter's
+			// auto-generated name and a later capacity guess. DeterministicDiskName
+			// sanitizes/hashes any disk name (it never rejects), so even an unsafe or
+			// over-long name yields a stable, unique path rather than falling back to a
+			// capacity guess. FileOperationCreate below still creates the file; the
+			// write is self-healing because the same path is re-derivable at observe
+			// time.
+			path := util.DeterministicDiskPath(vmCtx.VSphereVM.Name, slotDatastore, dataDisk.Name)
+			backing.FileName = path
+			pd.VolumePath = path
+		case slotDatastore != "":
+			// Ephemeral disk (or a persistent disk whose name is not path-safe):
+			// Reconfigure VM disk creation allows datastore selection via the backing
+			// file path. Use a datastore-qualified file name placeholder so each slot
+			// disk can land on its own datastore without changing the VM-level
+			// datastore selection; vCenter names the file.
+			backing.FileName = datastoreFileHint(slotDatastore)
 		}
 
 		// Set provisioning type for the new data disk.
@@ -521,20 +563,26 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 		vd := dev.GetVirtualDevice()
 		vd.ControllerKey = controllerKey
 
-		// Assign unit number, favoring fixed unit number from persistent disk spec if provided.
+		// Assign unit number, favoring a pinned (persistent spec) or observed
+		// (persistent/ephemeral status) unit if provided; otherwise assign a free
+		// unit and backfill it onto the matched slot disk so it persists to status
+		// and stays stable across VM recreations.
 		var unitNumber int32
-		if pd != nil && pd.UnitNumber != nil {
-			unitNumber = *pd.UnitNumber
+		if slotPinnedUnit != nil {
+			unitNumber = *slotPinnedUnit
 			if err := unitNumberAssigner.markUsed(unitNumber); err != nil {
-				return nil, errors.Wrapf(err, "invalid unit number for persistent disk %q", pd.Name)
+				return nil, errors.Wrapf(err, "invalid unit number for data disk %q", dataDisk.Name)
 			}
 		} else {
 			unitNumber, err = unitNumberAssigner.assign()
 			if err != nil {
 				return nil, err
 			}
-			if pd != nil {
+			switch {
+			case pd != nil:
 				pd.UnitNumber = &unitNumber
+			case ed != nil:
+				ed.UnitNumber = &unitNumber
 			}
 		}
 		vd.UnitNumber = &unitNumber
@@ -546,23 +594,24 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 			Operation: types.VirtualDeviceConfigSpecOperationAdd,
 		}
 
-		// ADDITION: Only create the file if we don't have an existing VolumePath
-		if pd == nil || pd.VolumePath == "" {
+		// ADDITION: Only create the file if we don't have an existing VolumePath.
+		// Ephemeral disks never carry a VolumePath, so they are always created fresh.
+		if slotVolumePath == "" {
 			spec.FileOperation = types.VirtualDeviceConfigSpecFileOperationCreate
 		}
 
-		if pd != nil && pd.StoragePolicy != "" {
-			profileID, ok := storageProfileIDs[pd.StoragePolicy]
+		if slotStoragePolicy != "" {
+			profileID, ok := storageProfileIDs[slotStoragePolicy]
 			if !ok {
 				pbmClient, err := pbm.NewClient(ctx, vmCtx.Session.Client.Client)
 				if err != nil {
-					return nil, errors.Wrap(err, "unable to create pbm client for persistent disk storage policy")
+					return nil, errors.Wrap(err, "unable to create pbm client for data disk storage policy")
 				}
-				profileID, err = pbmClient.ProfileIDByName(ctx, pd.StoragePolicy)
+				profileID, err = pbmClient.ProfileIDByName(ctx, slotStoragePolicy)
 				if err != nil {
-					return nil, errors.Wrapf(err, "unable to get storageProfileID from name %s for persistent disk %s", pd.StoragePolicy, pd.Name)
+					return nil, errors.Wrapf(err, "unable to get storageProfileID from name %s for data disk %s", slotStoragePolicy, dataDisk.Name)
 				}
-				storageProfileIDs[pd.StoragePolicy] = profileID
+				storageProfileIDs[slotStoragePolicy] = profileID
 			}
 			spec.Profile = []types.BaseVirtualMachineProfileSpec{
 				&types.VirtualMachineDefinedProfileSpec{ProfileId: profileID},
@@ -576,11 +625,7 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 }
 
 func datastoreFileHint(datastore string) string {
-	ds := strings.TrimSpace(datastore)
-	if ds == "" {
-		return ""
-	}
-	return fmt.Sprintf("[%s]", ds)
+	return util.DatastorePrefix(datastore)
 }
 
 func getDataDiskController(devices object.VirtualDeviceList, primaryDisk *types.VirtualDisk) (types.BaseVirtualController, error) {

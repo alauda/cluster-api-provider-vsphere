@@ -393,6 +393,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 					if pool.Spec.Configs[i].Hostname == hostname {
 						slotCopy := pool.Spec.Configs[i]
 						slotCopy.PersistentDisks = append([]infrav1.PersistentDisk(nil), pool.Spec.Configs[i].PersistentDisks...)
+						slotCopy.EphemeralDisks = append([]infrav1.EphemeralDisk(nil), pool.Spec.Configs[i].EphemeralDisks...)
 						services.HydrateSlotFromStatus(pool, &slotCopy)
 						slot = &slotCopy
 						break

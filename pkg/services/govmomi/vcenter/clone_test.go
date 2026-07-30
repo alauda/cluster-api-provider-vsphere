@@ -28,6 +28,7 @@ import (
 	"github.com/vmware/govmomi/simulator"
 	_ "github.com/vmware/govmomi/vapi/simulator" // run init func to register the tagging API endpoints.
 	"github.com/vmware/govmomi/vim25/types"
+	"k8s.io/utils/ptr"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
@@ -181,7 +182,7 @@ func TestCreateDataDisks(t *testing.T) {
 		devices            object.VirtualDeviceList
 		controller         types.BaseVirtualController
 		dataDisks          []infrav1.VSphereDisk
-		machineConfigSlot       *infrav1.MachineConfigSlot
+		machineConfigSlot  *infrav1.MachineConfigSlot
 		expectedUnitNumber []int
 		expectedCreateOps  []bool
 		err                string
@@ -328,6 +329,20 @@ func TestCreateDataDisks(t *testing.T) {
 					},
 				},
 			}
+			// The VM name is the directory component of a deterministic disk path.
+			vsphereVM.Name = "test-vm"
+
+			// Snapshot inputs before createDataDisks mutates the slot: a fresh
+			// persistent disk on a known datastore gets its VolumePath backfilled, so
+			// the pre-run VolumePath is what distinguishes reuse from first-create.
+			var inputVolumePaths, inputDatastores []string
+			if tc.machineConfigSlot != nil {
+				for i := range tc.machineConfigSlot.PersistentDisks {
+					inputVolumePaths = append(inputVolumePaths, tc.machineConfigSlot.PersistentDisks[i].VolumePath)
+					inputDatastores = append(inputDatastores, tc.machineConfigSlot.PersistentDisks[i].Datastore)
+				}
+			}
+
 			vmContext := &capvcontext.VMContext{VSphereVM: vsphereVM, MachineConfigSlot: tc.machineConfigSlot, Session: session}
 			newDisks, funcError := createDataDisks(ctx.TODO(), vmContext, tc.devices)
 			if (tc.err != "" && funcError == nil) || (tc.err == "" && funcError != nil) || (funcError != nil && tc.err != funcError.Error()) {
@@ -365,10 +380,17 @@ func TestCreateDataDisks(t *testing.T) {
 					if tc.machineConfigSlot != nil && len(tc.machineConfigSlot.PersistentDisks) > index {
 						pd := tc.machineConfigSlot.PersistentDisks[index]
 						switch {
-						case pd.VolumePath != "":
-							g.Expect(backingInfo.FileName).To(gomega.Equal(pd.VolumePath))
-						case pd.Datastore != "":
-							g.Expect(backingInfo.FileName).To(gomega.Equal(fmt.Sprintf("[%s]", pd.Datastore)))
+						case inputVolumePaths[index] != "":
+							// Reuse: backing is the recorded path; VolumePath unchanged.
+							g.Expect(backingInfo.FileName).To(gomega.Equal(inputVolumePaths[index]))
+							g.Expect(pd.VolumePath).To(gomega.Equal(inputVolumePaths[index]))
+						case inputDatastores[index] != "":
+							// First create on a known datastore: a deterministic path is
+							// assigned to both the backing file and status, and the file is
+							// still created (asserted via expectedCreateOps above).
+							expectedPath := fmt.Sprintf("[%s] %s/%s-%s.vmdk", inputDatastores[index], "test-vm", "test-vm", tc.dataDisks[index].Name)
+							g.Expect(backingInfo.FileName).To(gomega.Equal(expectedPath))
+							g.Expect(pd.VolumePath).To(gomega.Equal(expectedPath))
 						}
 						if pd.StoragePolicy != "" {
 							g.Expect(disk.GetVirtualDeviceConfigSpec().Profile).ToNot(gomega.BeEmpty())
@@ -397,6 +419,105 @@ func TestCreateDataDisks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateDataDisksEphemeral(t *testing.T) {
+	g := gomega.NewWithT(t)
+	model, session, server := initSimulator(t)
+	t.Cleanup(model.Remove)
+	t.Cleanup(server.Close)
+	vm := model.Map().Any("VirtualMachine").(*simulator.VirtualMachine)
+	machine := object.NewVirtualMachine(session.Client.Client, vm.Reference())
+	deviceList, err := machine.Device(ctx.TODO())
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	newVMContext := func(dataDisks []infrav1.VSphereDisk, slot *infrav1.MachineConfigSlot) *capvcontext.VMContext {
+		return &capvcontext.VMContext{
+			VSphereVM: &infrav1.VSphereVM{
+				Spec: infrav1.VSphereVMSpec{
+					VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{DataDisks: dataDisks},
+				},
+			},
+			MachineConfigSlot: slot,
+			Session:           session,
+		}
+	}
+
+	t.Run("ephemeral disk is always created fresh with no VolumePath and a backfilled unit", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:       "host-1",
+			EphemeralDisks: []infrav1.EphemeralDisk{{Name: "cache-1", SizeGiB: 10}},
+		}
+		vmContext := newVMContext([]infrav1.VSphereDisk{{Name: "cache-1", SizeGiB: 10}}, slot)
+
+		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(newDisks).To(gomega.HaveLen(1))
+
+		spec := newDisks[0].GetVirtualDeviceConfigSpec()
+		// Always created fresh — never reuses an existing vmdk.
+		g.Expect(spec.FileOperation).To(gomega.Equal(types.VirtualDeviceConfigSpecFileOperationCreate))
+		backing := spec.Device.GetVirtualDevice().Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+		g.Expect(backing.FileName).To(gomega.BeEmpty())
+		// Assigned unit is backfilled onto the in-memory ephemeral disk so it can
+		// be persisted to status and hydrated back next reconcile.
+		g.Expect(slot.EphemeralDisks[0].UnitNumber).NotTo(gomega.BeNil())
+		g.Expect(*spec.Device.GetVirtualDevice().UnitNumber).To(gomega.Equal(*slot.EphemeralDisks[0].UnitNumber))
+	})
+
+	t.Run("ephemeral disk selects its datastore via a file-name hint", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:       "host-1",
+			EphemeralDisks: []infrav1.EphemeralDisk{{Name: "cache-1", SizeGiB: 10, Datastore: "datastore1"}},
+		}
+		vmContext := newVMContext([]infrav1.VSphereDisk{{Name: "cache-1", SizeGiB: 10}}, slot)
+
+		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		spec := newDisks[0].GetVirtualDeviceConfigSpec()
+		g.Expect(spec.FileOperation).To(gomega.Equal(types.VirtualDeviceConfigSpecFileOperationCreate))
+		backing := spec.Device.GetVirtualDevice().Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+		g.Expect(backing.FileName).To(gomega.Equal("[datastore1]"))
+	})
+
+	t.Run("observed ephemeral unit is reused when hydrated", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:       "host-1",
+			EphemeralDisks: []infrav1.EphemeralDisk{{Name: "cache-1", SizeGiB: 10, UnitNumber: ptr.To(int32(4))}},
+		}
+		vmContext := newVMContext([]infrav1.VSphereDisk{{Name: "cache-1", SizeGiB: 10}}, slot)
+
+		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(*newDisks[0].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().UnitNumber).To(gomega.Equal(int32(4)))
+	})
+
+	t.Run("ephemeral and persistent disks receive distinct unit numbers", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		slot := &infrav1.MachineConfigSlot{
+			Hostname:        "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{{Name: "data-1", SizeGiB: 10, UnitNumber: ptr.To(int32(5))}},
+			EphemeralDisks:  []infrav1.EphemeralDisk{{Name: "cache-1", SizeGiB: 10}},
+		}
+		vmContext := newVMContext([]infrav1.VSphereDisk{
+			{Name: "data-1", SizeGiB: 10},
+			{Name: "cache-1", SizeGiB: 10},
+		}, slot)
+
+		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(newDisks).To(gomega.HaveLen(2))
+
+		persistentUnit := *newDisks[0].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().UnitNumber
+		ephemeralUnit := *newDisks[1].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().UnitNumber
+		g.Expect(persistentUnit).To(gomega.Equal(int32(5)))
+		g.Expect(ephemeralUnit).NotTo(gomega.Equal(int32(5)))
+		g.Expect(slot.EphemeralDisks[0].UnitNumber).NotTo(gomega.BeNil())
+		g.Expect(*slot.EphemeralDisks[0].UnitNumber).To(gomega.Equal(ephemeralUnit))
+	})
 }
 
 func TestCreateDataDisksUsesSCSIControllerWhenPrimaryDiskIsIDE(t *testing.T) {

@@ -124,6 +124,60 @@ spec:
                         If set, it takes precedence over VSphereMachineConfigPool.spec.datacenter.
                         If unset, the pool-level Datacenter acts as the default.
                       type: string
+                    ephemeralDisks:
+                      description: |-
+                        EphemeralDisks are non-persistent data disks. Unlike PersistentDisks they
+                        are created fresh (as empty disks) whenever the slot's VM is (re)created
+                        and deleted together with the VM: they do not participate in detach
+                        preservation, reclaim, or slot-release gating. Their SCSI unit number is
+                        assigned by the controller at clone time and observed in
+                        status.ephemeralDiskStatuses; it is not user-declared.
+                      items:
+                        description: |-
+                          EphemeralDisk defines a non-persistent data disk that is created empty with
+                          the slot's VM and deleted together with it. It mirrors the guest-facing
+                          fields of PersistentDisk (size, placement, mount, format) but omits all
+                          persistence semantics: there is no UnitNumber spec field (the SCSI unit is
+                          controller-assigned at clone time and observed in
+                          status.ephemeralDiskStatuses), no VolumePath/DiskUUID backfill (the backing
+                          vmdk is always newly created), and no WipeFilesystem (a fresh disk is always
+                          empty and formatted from scratch).
+                        properties:
+                          datastore:
+                            description: Datastore is the vSphere datastore name.
+                            type: string
+                          fsFormat:
+                            description: FSFormat is the filesystem format (default
+                              "ext4").
+                            type: string
+                          mountOptions:
+                            description: MountOptions for the filesystem mount.
+                            items:
+                              type: string
+                            type: array
+                          mountPath:
+                            description: MountPath is the mount path inside the VM
+                              guest OS (e.g., "/var/lib/containerd").
+                            type: string
+                          name:
+                            description: |-
+                              Name is the disk name. It shares a namespace with the slot's persistent
+                              disks: a name must be unique across both lists within the slot.
+                            type: string
+                          sizeGiB:
+                            description: SizeGiB is the disk size.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          storagePolicy:
+                            description: StoragePolicy is the vSphere storage policy
+                              name.
+                            type: string
+                        required:
+                        - name
+                        - sizeGiB
+                        type: object
+                      type: array
                     hostname:
                       description: |-
                         Hostname is the unique identifier for this slot and will be assigned to the VM.
@@ -501,6 +555,47 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              ephemeralDiskStatuses:
+                description: |-
+                  EphemeralDiskStatuses records the controller-observed SCSI unit number of
+                  each non-persistent disk, keyed by (hostname, disk name). The unit is
+                  assigned at clone time and reused (hydrated back onto the in-memory slot)
+                  on the next reconcile so the guest disk table can address the disk. Unlike
+                  PersistentDiskStatuses this carries no VolumePath/DiskUUID/Phase: ephemeral
+                  disks are recreated with the VM and never reclaimed.
+                items:
+                  description: |-
+                    EphemeralDiskStatus records the controller-observed SCSI unit number of a
+                    single non-persistent disk, keyed by (Hostname, Name). It deliberately omits
+                    VolumePath/DiskUUID/Phase: an ephemeral disk's backing vmdk is always newly
+                    created and deleted with the VM, so there is nothing to reclaim and no
+                    lifecycle to track. The recorded UnitNumber is hydrated back onto the
+                    in-memory slot each reconcile so the guest disk table can address the disk.
+                  properties:
+                    hostname:
+                      description: Hostname is the slot this disk belongs to (matches
+                        MachineConfigSlot.Hostname).
+                      type: string
+                    name:
+                      description: Name is the disk name (matches EphemeralDisk.Name
+                        within the slot).
+                      type: string
+                    unitNumber:
+                      description: |-
+                        UnitNumber is the SCSI unit number the disk was attached at, assigned by
+                        the controller at clone time and reused on the next VM recreation to keep
+                        guest disk addressing stable.
+                      format: int32
+                      type: integer
+                  required:
+                  - hostname
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - hostname
+                - name
+                x-kubernetes-list-type: map
               persistentDiskStatuses:
                 description: |-
                   PersistentDiskStatuses tracks the observed state of each persistent disk,

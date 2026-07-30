@@ -23,9 +23,11 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -726,43 +728,76 @@ func ValidatePersistentDiskBackfill(persistentDisks []infrav1.PersistentDisk) er
 	return nil
 }
 
-func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk) ([]byte, error) {
-	if len(persistentDisks) == 0 {
+// ValidateEphemeralDiskBackfill checks that every ephemeral disk has its
+// controller-assigned SCSI unit observed. Unlike persistent disks there is no
+// VolumePath/DiskUUID to backfill (the backing is always created fresh), so the
+// unit number is the only prerequisite for writing the guest disk table.
+func ValidateEphemeralDiskBackfill(ephemeralDisks []infrav1.EphemeralDisk) error {
+	var incomplete []string
+	for i := range ephemeralDisks {
+		disk := ephemeralDisks[i]
+		if disk.UnitNumber == nil {
+			incomplete = append(incomplete, fmt.Sprintf("disk %q missing unitNumber", disk.Name))
+		}
+	}
+	if len(incomplete) > 0 {
+		return errors.Errorf("ephemeral disk metadata incomplete: %s", strings.Join(incomplete, "; "))
+	}
+	return nil
+}
+
+// GetPersistentDiskCloudConfig builds the cloud-init config that provisions the
+// slot's data disks inside the guest. Persistent and ephemeral disks share the
+// same reconcile script and disk table (/etc/capv/persistent-disks.tsv): each
+// row carries name, unit, mount path, fs format, mount options, disk UUID, and
+// a wipe flag. Ephemeral rows leave the disk-UUID column empty (so the guest
+// script's UUID lookup fails and falls back to addressing the disk by SCSI
+// unit) and never wipe (a freshly created disk is always empty).
+func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk, ephemeralDisks []infrav1.EphemeralDisk) ([]byte, error) {
+	if len(persistentDisks) == 0 && len(ephemeralDisks) == 0 {
 		return nil, nil
 	}
 	if err := ValidatePersistentDiskBackfill(persistentDisks); err != nil {
 		return nil, err
 	}
-	normalizedPersistentDisks := make([]infrav1.PersistentDisk, 0, len(persistentDisks))
-	for i := range persistentDisks {
-		disk := persistentDisks[i]
-		if disk.FSFormat == "" && disk.MountPath != "" {
-			disk.FSFormat = "ext4"
-		}
-		normalizedPersistentDisks = append(normalizedPersistentDisks, disk)
+	if err := ValidateEphemeralDiskBackfill(ephemeralDisks); err != nil {
+		return nil, err
 	}
 
 	var configFile strings.Builder
-	for _, disk := range normalizedPersistentDisks {
+	// writeDiskRow emits one /etc/capv/persistent-disks.tsv row. Persistent and
+	// ephemeral disks share the row format; they differ only in the disk-UUID and
+	// wipe columns, passed in by the caller.
+	writeDiskRow := func(name string, unit int32, mountPath, fsFormat string, mountOptions []string, diskUUID string, wipe bool) {
+		if fsFormat == "" && mountPath != "" {
+			fsFormat = "ext4"
+		}
 		options := "defaults"
-		if len(disk.MountOptions) > 0 {
-			options = strings.Join(disk.MountOptions, ",")
+		if len(mountOptions) > 0 {
+			options = strings.Join(mountOptions, ",")
 		}
 		wipeFs := "false"
-		if disk.WipeFilesystem != nil && *disk.WipeFilesystem {
+		if wipe {
 			wipeFs = "true"
 		}
 		fmt.Fprintf(
 			&configFile,
 			"%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
-			disk.Name,
-			*disk.UnitNumber,
-			disk.MountPath,
-			disk.FSFormat,
-			options,
-			disk.DiskUUID,
-			wipeFs,
+			name, unit, mountPath, fsFormat, options, diskUUID, wipeFs,
 		)
+	}
+
+	for i := range persistentDisks {
+		disk := persistentDisks[i]
+		wipe := disk.WipeFilesystem != nil && *disk.WipeFilesystem
+		writeDiskRow(disk.Name, *disk.UnitNumber, disk.MountPath, disk.FSFormat, disk.MountOptions, disk.DiskUUID, wipe)
+	}
+	// Ephemeral disks use two fixed columns: an empty disk-UUID (so the guest
+	// script's UUID lookup fails and it addresses the disk by SCSI unit) and
+	// wipe=false (a freshly created disk is always empty).
+	for i := range ephemeralDisks {
+		disk := ephemeralDisks[i]
+		writeDiskRow(disk.Name, *disk.UnitNumber, disk.MountPath, disk.FSFormat, disk.MountOptions, "", false)
 	}
 
 	reconcileScript := persistentDiskReconcileScript()
@@ -997,6 +1032,92 @@ func mergeMap(base map[interface{}]interface{}, extra map[interface{}]interface{
 
 func capvDiskPath(name string) string {
 	return "/dev/disk/by-capv/" + name
+}
+
+// DeterministicDiskPath derives the datastore path of a slot-managed data disk
+// that CAPV creates itself, so status carries a Tier-1 VolumePath from the moment
+// of clone instead of relying on vCenter's auto-generated vmdk name and a later
+// capacity guess. The layout is "[datastore] <vmName>/<name>.vmdk", where the
+// per-VM directory (an exact vmName, a DNS-1123 object name that is always a safe
+// path component) namespaces disks across VMs, and the file is named by
+// DeterministicDiskName(vmName, diskName). A retained persistent disk keeps living
+// under this directory across VM recreations because the directory persists as
+// long as the retained vmdk does, and the next VM reattaches by the recorded full
+// path. Used ONLY when first creating a fresh disk on a known datastore; existing
+// disks keep their recorded path. The datastore name is trusted verbatim (it
+// originates from vSphere and is already used unguarded elsewhere).
+//
+// Returns "" only when a required input (datastore, vmName, diskName) is empty.
+func DeterministicDiskPath(vmName, datastore, diskName string) string {
+	ds := strings.TrimSpace(datastore)
+	vm := strings.TrimSpace(vmName)
+	if ds == "" || vm == "" || strings.TrimSpace(diskName) == "" {
+		return ""
+	}
+	return DatastorePrefix(ds) + " " + vm + "/" + DeterministicDiskName(vmName, diskName) + ".vmdk"
+}
+
+// DatastorePrefix returns the "[datastore]" token that opens a datastore path, or
+// "" when the datastore name is empty. It is the single builder shared by
+// DeterministicDiskPath and clone.go's datastoreFileHint.
+func DatastorePrefix(datastore string) string {
+	ds := strings.TrimSpace(datastore)
+	if ds == "" {
+		return ""
+	}
+	return "[" + ds + "]"
+}
+
+// DeterministicDiskName composes an idempotent, path-safe vmdk file-name base
+// (without the ".vmdk" suffix) for a slot-managed data disk from the creating
+// VM's hostname and the disk name. The readable form is "<hostname>-<diskName>".
+//
+// The name must be a single datastore path component within the 255-byte
+// VMFS/NFS limit and must never collapse two distinct (hostname, diskName) pairs
+// onto one name (which would match the wrong disk). To guarantee both without
+// rejecting any input: every byte outside [A-Za-z0-9._-] is replaced with '-',
+// and whenever that replacement changes the string or the result would exceed the
+// budget (255 minus the ".vmdk" the caller appends), a collision-resistant suffix
+// "-<first 5 hex of SHA-256(hostname 0x00 diskName)>" is appended to a truncated
+// prefix. The hash is taken over the raw inputs, so distinct pairs never share a
+// name even when their sanitized/truncated prefixes coincide. The function is
+// pure: identical inputs always yield the identical name.
+func DeterministicDiskName(hostname, diskName string) string {
+	const maxBase = 255 - len(".vmdk") // leave room for the ".vmdk" the caller appends
+	host := strings.TrimSpace(hostname)
+	disk := strings.TrimSpace(diskName)
+	readable := host + "-" + disk
+
+	sanitized := sanitizeDiskPathComponent(readable)
+	if sanitized == readable && len(sanitized) <= maxBase {
+		return sanitized
+	}
+
+	sum := sha256.Sum256([]byte(host + "\x00" + disk))
+	suffix := "-" + hex.EncodeToString(sum[:])[:5]
+	if prefixBudget := maxBase - len(suffix); len(sanitized) > prefixBudget {
+		sanitized = sanitized[:prefixBudget]
+	}
+	return sanitized + suffix
+}
+
+// sanitizeDiskPathComponent replaces every byte outside [A-Za-z0-9._-] with '-'
+// so the result is safe as a single datastore path component. Each non-ASCII rune
+// collapses to a single '-'. It never returns "" for a non-empty input.
+func sanitizeDiskPathComponent(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.' || r == '_' || r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
 }
 
 func persistentDiskReconcileScript() string {

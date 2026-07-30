@@ -439,6 +439,7 @@ func (v *VimMachineService) createOrPatchVSphereVM(ctx context.Context, vimMachi
 			vm.Annotations["infrastructure.cluster.x-k8s.io/machine-config-slot-hostname"] = vimMachineCtx.MachineConfigSlot.Hostname
 			v.mergeSlotNetwork(vm, vimMachineCtx.MachineConfigSlot.Network)
 			v.mergeSlotPersistentDisks(vm, vimMachineCtx.MachineConfigSlot.PersistentDisks)
+			v.mergeSlotEphemeralDisks(vm, vimMachineCtx.MachineConfigSlot.EphemeralDisks)
 		}
 
 		// If Failure Domain is present on CAPI machine, use that to override the vm clone spec.
@@ -786,19 +787,36 @@ func (v *VimMachineService) mergeSlotNetwork(vm *infrav1.VSphereVM, slotNetwork 
 
 func (v *VimMachineService) mergeSlotPersistentDisks(vm *infrav1.VSphereVM, persistentDisks []infrav1.PersistentDisk) {
 	for _, pd := range persistentDisks {
-		found := false
-		for i, existing := range vm.Spec.DataDisks {
-			if existing.Name == pd.Name {
-				vm.Spec.DataDisks[i].SizeGiB = pd.SizeGiB
-				found = true
-				break
-			}
-		}
-		if !found {
-			vm.Spec.DataDisks = append(vm.Spec.DataDisks, infrav1.VSphereDisk{
-				Name:    pd.Name,
-				SizeGiB: pd.SizeGiB,
-			})
+		upsertDataDisk(vm, pd.Name, pd.SizeGiB)
+	}
+}
+
+// mergeSlotEphemeralDisks folds the slot's non-persistent disks into the
+// VSphereVM's DataDisks by name, mirroring mergeSlotPersistentDisks. Only Name
+// and SizeGiB are carried here; datastore/storage-policy placement and the
+// controller-assigned SCSI unit are applied later in clone.go by matching the
+// data disk back to the slot's EphemeralDisks. Names are unique across the
+// slot's persistent and ephemeral disks, so a given DataDisk matches at most
+// one of the two lists.
+func (v *VimMachineService) mergeSlotEphemeralDisks(vm *infrav1.VSphereVM, ephemeralDisks []infrav1.EphemeralDisk) {
+	for _, ed := range ephemeralDisks {
+		upsertDataDisk(vm, ed.Name, ed.SizeGiB)
+	}
+}
+
+// upsertDataDisk adds a data disk with the given name and size to the VM's
+// DataDisks, or updates the size of the existing entry with that name. Disk names
+// are unique across a slot's persistent and ephemeral lists, so the name is a
+// safe key.
+func upsertDataDisk(vm *infrav1.VSphereVM, name string, sizeGiB int32) {
+	for i := range vm.Spec.DataDisks {
+		if vm.Spec.DataDisks[i].Name == name {
+			vm.Spec.DataDisks[i].SizeGiB = sizeGiB
+			return
 		}
 	}
+	vm.Spec.DataDisks = append(vm.Spec.DataDisks, infrav1.VSphereDisk{
+		Name:    name,
+		SizeGiB: sizeGiB,
+	})
 }

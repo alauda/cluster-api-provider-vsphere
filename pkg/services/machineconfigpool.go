@@ -42,11 +42,17 @@ const (
 	diskReservedUnitNumber = 7
 )
 
-// ValidateSlotFields checks the structural validity of every slot's persistent
-// disk fields (unit number range, size, and intra-slot uniqueness of disk name,
-// unit number, and mount path). It is a pure function shared by the pool
-// reconciler (P1-2 MembersValid condition) and the validating webhook (P1-3) so
-// the two never drift. Hostname format is validated separately.
+// ValidateSlotFields checks the structural validity of every slot's data disk
+// fields (unit number range, size, and intra-slot uniqueness of disk name, unit
+// number, and mount path). Persistent and ephemeral disks share one name and
+// mount-path namespace within a slot, so a name or mount path used by a
+// persistent disk cannot be reused by an ephemeral disk and vice versa.
+// Ephemeral disks have no user-declared unit number (it is controller-assigned),
+// so only persistent disks contribute to unit-number uniqueness; cross-kind
+// unit conflicts are prevented at clone time by the unitNumberAssigner. It is a
+// pure function shared by the pool reconciler (P1-2 MembersValid condition) and
+// the validating webhook (P1-3) so the two never drift. Hostname format is
+// validated separately.
 func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList {
 	var allErrs field.ErrorList
 	if pool == nil {
@@ -54,14 +60,15 @@ func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList 
 	}
 	for i := range pool.Spec.Configs {
 		slot := &pool.Spec.Configs[i]
-		diskPathBase := field.NewPath("spec", "configs").Index(i).Child("persistentDisks")
+		pdPathBase := field.NewPath("spec", "configs").Index(i).Child("persistentDisks")
+		edPathBase := field.NewPath("spec", "configs").Index(i).Child("ephemeralDisks")
 
 		seenNames := map[string]struct{}{}
 		seenUnits := map[int32]struct{}{}
 		seenMounts := map[string]struct{}{}
 		for j := range slot.PersistentDisks {
 			pd := &slot.PersistentDisks[j]
-			diskPath := diskPathBase.Index(j)
+			diskPath := pdPathBase.Index(j)
 
 			if pd.Name == "" {
 				allErrs = append(allErrs, field.Required(diskPath.Child("name"), "must be set"))
@@ -96,6 +103,31 @@ func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList 
 					allErrs = append(allErrs, field.Duplicate(diskPath.Child("mountPath"), pd.MountPath))
 				} else {
 					seenMounts[pd.MountPath] = struct{}{}
+				}
+			}
+		}
+
+		for j := range slot.EphemeralDisks {
+			ed := &slot.EphemeralDisks[j]
+			diskPath := edPathBase.Index(j)
+
+			if ed.Name == "" {
+				allErrs = append(allErrs, field.Required(diskPath.Child("name"), "must be set"))
+			} else if _, dup := seenNames[ed.Name]; dup {
+				allErrs = append(allErrs, field.Duplicate(diskPath.Child("name"), ed.Name))
+			} else {
+				seenNames[ed.Name] = struct{}{}
+			}
+
+			if ed.SizeGiB < 1 {
+				allErrs = append(allErrs, field.Invalid(diskPath.Child("sizeGiB"), ed.SizeGiB, "must be at least 1"))
+			}
+
+			if ed.MountPath != "" {
+				if _, dup := seenMounts[ed.MountPath]; dup {
+					allErrs = append(allErrs, field.Duplicate(diskPath.Child("mountPath"), ed.MountPath))
+				} else {
+					seenMounts[ed.MountPath] = struct{}{}
 				}
 			}
 		}
@@ -541,6 +573,20 @@ func HydrateSlotFromStatus(pool *infrav1.VSphereMachineConfigPool, slot *infrav1
 			pd.UnitNumber = &u
 		}
 	}
+	for i := range slot.EphemeralDisks {
+		ed := &slot.EphemeralDisks[i]
+		rec, _ := infrav1.FindEphemeralDiskStatus(pool, slot.Hostname, ed.Name)
+		if rec == nil {
+			continue
+		}
+		// Ephemeral disks have no spec unit; reuse the last observed unit so the
+		// guest disk table addresses the disk at a stable SCSI position across VM
+		// recreation.
+		if ed.UnitNumber == nil && rec.UnitNumber != nil {
+			u := *rec.UnitNumber
+			ed.UnitNumber = &u
+		}
+	}
 }
 
 // ObservedVolumePath returns the disk's controller-observed VolumePath. The
@@ -870,6 +916,7 @@ func allocateSlotOnce(ctx context.Context, c client.Client, poolRef *corev1.Obje
 
 	slotCopy := *selectedSlot
 	slotCopy.PersistentDisks = append([]infrav1.PersistentDisk(nil), selectedSlot.PersistentDisks...)
+	slotCopy.EphemeralDisks = append([]infrav1.EphemeralDisk(nil), selectedSlot.EphemeralDisks...)
 	if slotCopy.Datacenter == "" {
 		slotCopy.Datacenter = ResolveMachineConfigPoolDatacenter(pool, selectedSlot)
 	}
@@ -947,6 +994,7 @@ func GetSlotForMachine(ctx context.Context, c client.Client, poolRef *corev1.Obj
 		}
 		slotCopy := *slot
 		slotCopy.PersistentDisks = append([]infrav1.PersistentDisk(nil), slot.PersistentDisks...)
+		slotCopy.EphemeralDisks = append([]infrav1.EphemeralDisk(nil), slot.EphemeralDisks...)
 		HydrateSlotFromStatus(pool, &slotCopy)
 		return &slotCopy, nil
 	}
@@ -1002,11 +1050,35 @@ func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infr
 	for j := range updatedSlot.PersistentDisks {
 		pd := &updatedSlot.PersistentDisks[j]
 		existing, _ := infrav1.FindDiskStatus(pool, updatedSlot.Hostname, pd.Name)
-		// Only record disks that are provisioned (have a VolumePath) or already
-		// have a status entry to keep in sync; unprovisioned disks are recorded
-		// by the pool reconciler when it seeds/observes them.
-		if pd.VolumePath == "" && existing == nil {
+
+		// Pick the phase from provisioning progress:
+		//   - VolumePath known -> Attached (created/observed/reused vmdk).
+		//   - only UnitNumber  -> Creating (clone assigned a unit but the vmdk is not
+		//     observed yet; the disk falls back to unit-based matching until then).
+		//   - neither          -> nothing to record; the pool reconciler seeds/observes
+		//     it. Leave any existing entry untouched.
+		var phase infrav1.PersistentDiskPhase
+		switch {
+		case pd.VolumePath != "":
+			phase = infrav1.PersistentDiskPhaseAttached
+		case pd.UnitNumber != nil:
+			phase = infrav1.PersistentDiskPhaseCreating
+		default:
 			continue
+		}
+
+		// Never downgrade an already-active disk to Creating. Only seed Creating
+		// when there is no record yet, the record is still Creating, or it is a
+		// reused Reclaimed tombstone. In the normal flow an active disk's VolumePath
+		// is hydrated back onto the slot before this runs, so it takes the Attached
+		// branch and never reaches here; this is defense against a lost hydrate.
+		if phase == infrav1.PersistentDiskPhaseCreating && existing != nil {
+			switch existing.Phase {
+			case infrav1.PersistentDiskPhaseCreating, infrav1.PersistentDiskPhaseReclaimed:
+				// ok to (re)seed Creating
+			default:
+				continue
+			}
 		}
 
 		rec := infrav1.PersistentDiskStatus{
@@ -1015,7 +1087,7 @@ func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infr
 			VolumePath:       pd.VolumePath,
 			DiskUUID:         pd.DiskUUID,
 			UnitNumber:       cloneInt32(pd.UnitNumber),
-			Phase:            infrav1.PersistentDiskPhaseAttached,
+			Phase:            phase,
 			OwnerMachineName: ownerName,
 			OwnerMachineUID:  ownerUID,
 		}
@@ -1027,6 +1099,26 @@ func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infr
 			}
 		}
 		infrav1.UpsertDiskStatus(pool, rec)
+		changed = true
+	}
+	for j := range updatedSlot.EphemeralDisks {
+		ed := &updatedSlot.EphemeralDisks[j]
+		// The only observed state for an ephemeral disk is its assigned SCSI unit,
+		// which becomes available after clone. Record it (unlike persistent disks,
+		// there is no VolumePath gate) so the next reconcile can hydrate it back
+		// onto the slot; skip until the unit is known.
+		if ed.UnitNumber == nil {
+			continue
+		}
+		existing, _ := infrav1.FindEphemeralDiskStatus(pool, updatedSlot.Hostname, ed.Name)
+		if existing != nil && ptr.Equal(existing.UnitNumber, ed.UnitNumber) {
+			continue
+		}
+		infrav1.UpsertEphemeralDiskStatus(pool, infrav1.EphemeralDiskStatus{
+			Hostname:   updatedSlot.Hostname,
+			Name:       ed.Name,
+			UnitNumber: cloneInt32(ed.UnitNumber),
+		})
 		changed = true
 	}
 	return changed
