@@ -138,16 +138,21 @@ func (r *clusterReconciler) reconcileWorkloadSystemComponentRepositories(ctx con
 		return reconcile.Result{}, err
 	}
 
-	if err := r.reconcileKubeProxyRepository(ctx, cluster, kcp, remoteClient); err != nil {
+	sentryPullSecret, err := firstSentryImagePullSecret(ctx, remoteClient)
+	if err != nil && !apierrors.IsNotFound(err) {
 		return reconcile.Result{}, err
 	}
-	if err := r.reconcileCoreDNSRepository(ctx, cluster, kcp, remoteClient); err != nil {
+
+	if err := r.reconcileKubeProxyRepository(ctx, cluster, kcp, remoteClient, sentryPullSecret); err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := r.reconcileCoreDNSRepository(ctx, cluster, kcp, remoteClient, sentryPullSecret); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
 }
 
-func (r *clusterReconciler) reconcileKubeProxyRepository(ctx context.Context, cluster *clusterv1.Cluster, kcp *controlplanev1.KubeadmControlPlane, remoteClient client.Client) error {
+func (r *clusterReconciler) reconcileKubeProxyRepository(ctx context.Context, cluster *clusterv1.Cluster, kcp *controlplanev1.KubeadmControlPlane, remoteClient client.Client, imagePullSecret *corev1.LocalObjectReference) error {
 	if kcp.Status.Replicas != kcp.Status.UpdatedReplicas {
 		ctrl.LoggerFrom(ctx).V(4).Info("Skipping kube-proxy repository reconcile until KubeadmControlPlane is fully updated",
 			"replicas", kcp.Status.Replicas,
@@ -169,10 +174,10 @@ func (r *clusterReconciler) reconcileKubeProxyRepository(ctx context.Context, cl
 		}
 		return err
 	}
-	return patchSystemComponentImage(ctx, remoteClient, daemonSet, daemonSet.Spec.Template.Spec.Containers, "kube-proxy", imageRepository, kcp.Spec.Version)
+	return patchSystemComponentImage(ctx, remoteClient, daemonSet, &daemonSet.Spec.Template.Spec, "kube-proxy", imageRepository, kcp.Spec.Version, imagePullSecret)
 }
 
-func (r *clusterReconciler) reconcileCoreDNSRepository(ctx context.Context, cluster *clusterv1.Cluster, kcp *controlplanev1.KubeadmControlPlane, remoteClient client.Client) error {
+func (r *clusterReconciler) reconcileCoreDNSRepository(ctx context.Context, cluster *clusterv1.Cluster, kcp *controlplanev1.KubeadmControlPlane, remoteClient client.Client, imagePullSecret *corev1.LocalObjectReference) error {
 	if kcp.Status.Replicas != kcp.Status.UpdatedReplicas {
 		ctrl.LoggerFrom(ctx).V(4).Info("Skipping CoreDNS repository reconcile until KubeadmControlPlane is fully updated",
 			"replicas", kcp.Status.Replicas,
@@ -191,22 +196,32 @@ func (r *clusterReconciler) reconcileCoreDNSRepository(ctx context.Context, clus
 		}
 		return err
 	}
-	return patchSystemComponentImage(ctx, remoteClient, deployment, deployment.Spec.Template.Spec.Containers, "coredns", imageRepository, imageTag)
+	return patchSystemComponentImage(ctx, remoteClient, deployment, &deployment.Spec.Template.Spec, "coredns", imageRepository, imageTag, imagePullSecret)
+}
+
+func firstSentryImagePullSecret(ctx context.Context, remoteClient client.Client) (*corev1.LocalObjectReference, error) {
+	sa := &corev1.ServiceAccount{}
+	if err := remoteClient.Get(ctx, client.ObjectKey{Namespace: "cpaas-system", Name: "sentry"}, sa); err != nil {
+		return nil, err
+	}
+	if len(sa.ImagePullSecrets) == 0 {
+		return nil, nil
+	}
+	return &sa.ImagePullSecrets[0], nil
 }
 
 // patchSystemComponentImage repoints the named container's image in obj to
-// imageRepository (and imageTag when non-empty) and patches obj when the image
-// changes. containers must be obj's own container slice so mutations are
-// reflected in the patch. It is a no-op when the container is absent or the
-// image already matches.
-func patchSystemComponentImage(ctx context.Context, remoteClient client.Client, obj client.Object, containers []corev1.Container, containerName, imageRepository, imageTag string) error {
+// imageRepository (and imageTag when non-empty), adds imagePullSecret when
+// provided, and patches obj when the pod template changes. podSpec must be
+// obj's own pod spec so mutations are reflected in the patch.
+func patchSystemComponentImage(ctx context.Context, remoteClient client.Client, obj client.Object, podSpec *corev1.PodSpec, containerName, imageRepository, imageTag string, imagePullSecret *corev1.LocalObjectReference) error {
 	original, ok := obj.DeepCopyObject().(client.Object)
 	if !ok {
 		return fmt.Errorf("object %T does not implement client.Object", obj)
 	}
 	changed := false
-	for i := range containers {
-		container := &containers[i]
+	for i := range podSpec.Containers {
+		container := &podSpec.Containers[i]
 		if container.Name != containerName {
 			continue
 		}
@@ -226,6 +241,9 @@ func patchSystemComponentImage(ctx context.Context, remoteClient client.Client, 
 		}
 		break
 	}
+	if ensureImagePullSecret(podSpec, imagePullSecret) {
+		changed = true
+	}
 	if !changed {
 		return nil
 	}
@@ -235,6 +253,19 @@ func patchSystemComponentImage(ctx context.Context, remoteClient client.Client, 
 		return err
 	}
 	return patchHelper.Patch(ctx, obj)
+}
+
+func ensureImagePullSecret(podSpec *corev1.PodSpec, imagePullSecret *corev1.LocalObjectReference) bool {
+	if imagePullSecret == nil || imagePullSecret.Name == "" {
+		return false
+	}
+	for _, existing := range podSpec.ImagePullSecrets {
+		if existing.Name == imagePullSecret.Name {
+			return false
+		}
+	}
+	podSpec.ImagePullSecrets = append(podSpec.ImagePullSecrets, *imagePullSecret)
+	return true
 }
 
 func coreDNSImageTag(kcp *controlplanev1.KubeadmControlPlane) string {

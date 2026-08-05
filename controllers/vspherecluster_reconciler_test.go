@@ -490,48 +490,27 @@ func TestClusterReconciler_ControlPlaneNodesAvailableForKubeOvnReconcile(t *test
 	tests := []struct {
 		name          string
 		desired       int32
-		nodeRefs      int32
 		existingNodes int32
-		deletingNodes map[int32]bool
-		getNodeErr    error
+		listNodeErr   error
 		wantReady     bool
 	}{
 		{
-			name:          "all control plane Machines have existing Nodes",
+			name:          "all control plane Nodes are registered",
 			desired:       3,
-			nodeRefs:      3,
 			existingNodes: 3,
 			wantReady:     true,
 		},
 		{
-			name:          "some control plane Machines have not registered Nodes",
+			name:          "some control plane Nodes are not registered",
 			desired:       3,
-			nodeRefs:      2,
 			existingNodes: 2,
 			wantReady:     false,
 		},
 		{
-			name:          "some registered Nodes do not exist",
-			desired:       3,
-			nodeRefs:      3,
-			existingNodes: 2,
-			wantReady:     false,
-		},
-		{
-			name:          "some registered Nodes are deleting",
-			desired:       3,
-			nodeRefs:      3,
-			existingNodes: 3,
-			deletingNodes: map[int32]bool{2: true},
-			wantReady:     false,
-		},
-		{
-			name:          "workload cluster Nodes cannot be queried",
-			desired:       1,
-			nodeRefs:      1,
-			existingNodes: 1,
-			getNodeErr:    fmt.Errorf("workload cluster is not ready"),
-			wantReady:     false,
+			name:        "workload cluster Nodes cannot be listed",
+			desired:     1,
+			listNodeErr: fmt.Errorf("workload cluster is not ready"),
+			wantReady:   false,
 		},
 	}
 
@@ -564,44 +543,29 @@ func TestClusterReconciler_ControlPlaneNodesAvailableForKubeOvnReconcile(t *test
 				},
 			}
 			workloadObjects := make([]runtime.Object, 0, tt.existingNodes)
-			for i := int32(0); i < tt.desired; i++ {
-				machine := &clusterv1.Machine{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: cluster.Namespace,
-						Name:      fmt.Sprintf("test-control-plane-%d", i),
-						Labels: map[string]string{
-							clusterv1.ClusterNameLabel:         cluster.Name,
-							clusterv1.MachineControlPlaneLabel: "",
-						},
+			for i := int32(0); i < tt.existingNodes; i++ {
+				workloadObjects = append(workloadObjects, &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+					Name: fmt.Sprintf("test-control-plane-%d", i),
+					Labels: map[string]string{
+						"node-role.kubernetes.io/control-plane": "",
 					},
-				}
-				if i < tt.nodeRefs {
-					machine.Status.NodeRef = &corev1.ObjectReference{Name: machine.Name}
-				}
-				objects = append(objects, machine)
-
-				if i < tt.existingNodes {
-					node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}
-					if tt.deletingNodes[i] {
-						deletionTimestamp := metav1.Now()
-						node.DeletionTimestamp = &deletionTimestamp
-						node.Finalizers = []string{"test.finalizer"}
-					}
-					workloadObjects = append(workloadObjects, node)
-				}
+				}})
 			}
 
 			controllerManagerContext := fake.NewControllerManagerContext(objects...)
 			workloadClient := kubernetesfake.NewSimpleClientset(workloadObjects...)
-			if tt.getNodeErr != nil {
-				workloadClient.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
-					return true, nil, tt.getNodeErr
+			if tt.listNodeErr != nil {
+				workloadClient.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, tt.listNodeErr
 				})
 			}
 			r := clusterReconciler{Client: controllerManagerContext.Client}
-			ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, workloadClient)
+			controlPlaneNodes, ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, workloadClient)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(ready).To(Equal(tt.wantReady))
+			if tt.wantReady {
+				g.Expect(controlPlaneNodes).To(Equal([]string{"test-control-plane-0", "test-control-plane-1", "test-control-plane-2"}))
+			}
 		})
 	}
 }
@@ -625,6 +589,7 @@ func TestBuildKubeOvnAppReleaseSetsPullSecrets(t *testing.T) {
 		"100.64.0.0/16",
 		"global-registry-auth",
 		[]any{"global-registry-auth", "extra-registry-auth"},
+		nil,
 	)
 
 	chartPullSecret, found, err := unstructured.NestedString(appRelease.Object, "spec", "source", "chartPullSecret")
@@ -656,6 +621,7 @@ func TestBuildKubeOvnAppReleaseUsesRequestedChartName(t *testing.T) {
 		"100.64.0.0/16",
 		"",
 		nil,
+		nil,
 	)
 
 	charts, found, err := unstructured.NestedSlice(appRelease.Object, "spec", "source", "charts")
@@ -663,6 +629,27 @@ func TestBuildKubeOvnAppReleaseUsesRequestedChartName(t *testing.T) {
 	g.Expect(found).To(BeTrue())
 	g.Expect(charts).To(HaveLen(1))
 	g.Expect(charts[0].(map[string]interface{})["name"]).To(Equal(kubeOvnChartNameV44))
+}
+
+func TestBuildKubeOvnAppReleaseSetsControlPlaneNodes(t *testing.T) {
+	g := NewWithT(t)
+	appRelease := buildKubeOvnAppRelease(
+		&clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"}},
+		"registry.example.com",
+		kubeOvnChartNameV44,
+		"v4.4.0",
+		"192.168.0.0/16",
+		"10.96.0.0/12",
+		"100.64.0.0/16",
+		"",
+		nil,
+		[]string{"cp-0", "cp-1", "cp-2"},
+	)
+
+	controlPlaneNodes, found, err := unstructured.NestedSlice(appRelease.Object, "spec", "values", "controlPlaneNodes")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(controlPlaneNodes).To(Equal([]any{"cp-0", "cp-1", "cp-2"}))
 }
 
 func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneNodesRegister(t *testing.T) {
