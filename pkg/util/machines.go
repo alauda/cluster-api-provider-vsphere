@@ -1126,6 +1126,8 @@ set -u
 
 CONFIG_FILE="/etc/capv/persistent-disks.tsv"
 DEVICE_DIR="/dev/disk/by-capv"
+CONTAINERD_MOUNT_PATH="/var/lib/containerd"
+POD_LOG_PATH="/var/log/pods"
 
 mkdir -p "${DEVICE_DIR}"
 
@@ -1237,6 +1239,43 @@ find_device_by_unit() {
   printf '%s\n' "${raw_device}"
 }
 
+ensure_pod_log_symlink() {
+  [ "${1:-}" = "${CONTAINERD_MOUNT_PATH}" ] || return 0
+  if ! mountpoint -q "${CONTAINERD_MOUNT_PATH}"; then
+    echo "containerd path ${CONTAINERD_MOUNT_PATH} is not a mount point; skip pod log symlink" >&2
+    return 0
+  fi
+
+  mkdir -p /var/log
+  if [ -L "${POD_LOG_PATH}" ]; then
+    current_target="$(readlink "${POD_LOG_PATH}" 2>/dev/null || true)"
+    if [ "${current_target}" = "${CONTAINERD_MOUNT_PATH}" ]; then
+      return 0
+    fi
+    rm -f "${POD_LOG_PATH}"
+  elif [ -e "${POD_LOG_PATH}" ]; then
+    if [ -d "${POD_LOG_PATH}" ]; then
+      for item in "${POD_LOG_PATH}"/* "${POD_LOG_PATH}"/.[!.]* "${POD_LOG_PATH}"/..?*; do
+        [ -e "${item}" ] || continue
+        target="${CONTAINERD_MOUNT_PATH}/$(basename "${item}")"
+        if [ -e "${target}" ]; then
+          echo "pod log migration target ${target} already exists; keep ${item}" >&2
+          continue
+        fi
+        mv "${item}" "${CONTAINERD_MOUNT_PATH}/"
+      done
+      if ! rmdir "${POD_LOG_PATH}" 2>/dev/null; then
+        echo "pod log path ${POD_LOG_PATH} could not be migrated cleanly; skip symlink" >&2
+        return 0
+      fi
+    else
+      rm -f "${POD_LOG_PATH}"
+    fi
+  fi
+
+  ln -s "${CONTAINERD_MOUNT_PATH}" "${POD_LOG_PATH}"
+}
+
 while true; do
   if [ ! -f "${CONFIG_FILE}" ]; then
     sleep 30
@@ -1296,6 +1335,7 @@ while true; do
       # ext4 creates lost+found on mkfs; etcd refuses to start if its
       # data-dir is not empty, so remove it after mounting.
       rm -rf "${mount_path}/lost+found"
+      ensure_pod_log_symlink "${mount_path}"
     fi
   done < "${CONFIG_FILE}"
 

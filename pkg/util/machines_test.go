@@ -1096,6 +1096,58 @@ func Test_GetPersistentDiskCloudConfig(t *testing.T) {
 	}
 }
 
+func Test_GetPersistentDiskCloudConfigCreatesPodLogSymlinkForPersistentContainerdDisk(t *testing.T) {
+	actual, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+		Name:       "containerd-data",
+		UnitNumber: toInt32Ptr(2),
+		MountPath:  "/var/lib/containerd",
+		VolumePath: "[ds] vm/containerd-data.vmdk",
+		DiskUUID:   "6000C29d-45cb-2787-e901-a2a0131b2e82",
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var actualObj interface{}
+	if err := yaml.Unmarshal(actual, &actualObj); err != nil {
+		t.Fatalf("failed to parse actual cloud-config: %v", err)
+	}
+	actualMap := actualObj.(map[interface{}]interface{})
+	writeFiles := actualMap["write_files"].([]interface{})
+
+	configEntry := writeFiles[0].(map[interface{}]interface{})
+	decodedConfig, err := base64.StdEncoding.DecodeString(configEntry["content"].(string))
+	if err != nil {
+		t.Fatalf("failed to decode disk table: %v", err)
+	}
+	if !strings.Contains(string(decodedConfig), "containerd-data\t2\t/var/lib/containerd\text4") {
+		t.Fatalf("expected disk table to contain containerd mount path, got: %s", string(decodedConfig))
+	}
+
+	scriptEntry := writeFiles[1].(map[interface{}]interface{})
+	decodedScript, err := base64.StdEncoding.DecodeString(scriptEntry["content"].(string))
+	if err != nil {
+		t.Fatalf("failed to decode reconcile script: %v", err)
+	}
+	scriptText := string(decodedScript)
+	for _, expected := range []string{
+		"CONTAINERD_MOUNT_PATH=\"/var/lib/containerd\"",
+		"POD_LOG_PATH=\"/var/log/pods\"",
+		"ensure_pod_log_symlink()",
+		"[ \"${1:-}\" = \"${CONTAINERD_MOUNT_PATH}\" ] || return 0",
+		"mountpoint -q \"${CONTAINERD_MOUNT_PATH}\"",
+		"for item in \"${POD_LOG_PATH}\"/* \"${POD_LOG_PATH}\"/.[!.]* \"${POD_LOG_PATH}\"/..?*; do",
+		"mv \"${item}\" \"${CONTAINERD_MOUNT_PATH}/\"",
+		"rmdir \"${POD_LOG_PATH}\"",
+		"ln -s \"${CONTAINERD_MOUNT_PATH}\" \"${POD_LOG_PATH}\"",
+		"ensure_pod_log_symlink \"${mount_path}\"",
+	} {
+		if !strings.Contains(scriptText, expected) {
+			t.Fatalf("expected reconcile script to contain %q, got: %s", expected, scriptText)
+		}
+	}
+}
+
 func Test_GetPersistentDiskCloudConfigWithEphemeralDisks(t *testing.T) {
 	actual, err := util.GetPersistentDiskCloudConfig(
 		[]infrav1.PersistentDisk{{
@@ -1175,6 +1227,21 @@ func Test_GetPersistentDiskCloudConfigEphemeralOnly(t *testing.T) {
 	}
 	if !strings.Contains(string(actual), "/etc/capv/persistent-disks.tsv") {
 		t.Fatalf("expected ephemeral-only config to emit the disk table, got: %s", string(actual))
+	}
+
+	var actualObj interface{}
+	if err := yaml.Unmarshal(actual, &actualObj); err != nil {
+		t.Fatalf("failed to parse actual cloud-config: %v", err)
+	}
+	actualMap := actualObj.(map[interface{}]interface{})
+	writeFiles := actualMap["write_files"].([]interface{})
+	scriptEntry := writeFiles[1].(map[interface{}]interface{})
+	decodedScript, err := base64.StdEncoding.DecodeString(scriptEntry["content"].(string))
+	if err != nil {
+		t.Fatalf("failed to decode reconcile script: %v", err)
+	}
+	if !strings.Contains(string(decodedScript), "ensure_pod_log_symlink \"${mount_path}\"") {
+		t.Fatalf("expected ephemeral-only containerd disk to install pod log symlink logic, got: %s", string(decodedScript))
 	}
 }
 

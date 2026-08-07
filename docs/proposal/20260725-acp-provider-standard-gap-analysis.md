@@ -12,15 +12,16 @@
 
 ## 一、结论
 
-CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题（pause/deletion 顺序、地址 ready、kube-ovn 状态、槽位复用）已修复，交付产物已在交付仓库具备。剩余差距集中在五块（推进顺序见第四章）：
+CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题（pause/deletion 顺序、地址 ready、kube-ovn 状态、槽位复用）已修复，交付产物已在交付仓库具备。剩余差距集中在六块（推进顺序见第四章）：
 
 1. **MachineConfigPool 补齐**（P1-1/2/3/7）：缺容量计数器，Pool 级 condition 不全，webhook 校验覆盖少，槽位缺非持久化数据盘声明。
 2. **ACP 文档与默认固定 IP 模板**（P1-4/5）：capabilities 等四件套缺失，默认模板仍走 DHCP。
 3. **交付仓库质量**（P1-6）：values.yaml 含明文凭据。
 4. **容灾支持**（P1-8，非规范项）：无 encryption-provider 配置注入，主备集群无法复用同一加密密钥。
 5. **开机语义**（P1-9，非规范项）：VM 被 controller 每轮强制开机，管理员无法手动停机维护。
+6. **节点日志盘语义**（P1-10）：`/var/lib/containerd` 由 MachineConfigPool 数据盘挂载时，`/var/log/pods` 需软链到该持久化路径，避免 pod 日志落系统盘。
 
-前三块直接对应规范的「质量门禁」与「最小验收清单」；第四、五块是与 DCS 对齐但规范未点名的能力（容灾密钥复用、开机语义）。
+前三块直接对应规范的「质量门禁」与「最小验收清单」；第四、五块是与 DCS 对齐但规范未点名的能力（容灾密钥复用、开机语义）；第六块是数据盘/日志路径约定的 spec 补齐项。
 
 ---
 
@@ -51,6 +52,7 @@ CAPV 的 CAPI 合同与主模型四件套完整，规范点名的正确性问题
 | 19 | 控制面 LB/VIP 由 ClusterReconciler 管理 | `VSphereClusterSpec` 无 `controlPlaneLoadBalancer`，VIP 由模板 kube-vip 承担 | ⏸ | P2-2 |
 | 20 | bootstrap 状态可诊断 | 仅 secret 未产出场景有准确 reason（`WaitingForBootstrapData`）；secret 读取失败/内容缺失/写入 VM guestinfo 失败均落 `CloningFailed`，与真实 clone 失败不可区分 | 🟡 | P2-3 |
 | 21 | 固定 IP 升级默认 `maxSurge: 0` | KCP/MD webhook 只校验 pool 独占引用，不校验升级策略；池满时 `maxSurge≥1` 的升级会卡住 | 🟡 | P2-4 |
+| 22 | `/var/log/pods` 随 containerd 持久盘迁移 | Pool 数据盘可挂载 `/var/lib/containerd`，但 guest 挂盘脚本未创建 `/var/log/pods` 软链，pod 日志仍可能落系统盘 | 🟡 | P1-10 |
 
 ---
 
@@ -147,6 +149,17 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 - **边界**：控制面/worker 一致适用；condition 为单向门闩，只置真不复位（VM 重启不影响判定）；非规范项，规范未点名，但已达成共识。
 - **验收**：新建 Machine 时 VM 正常开机并 Ready；之后管理员手动停机，controller 不再自动重开，Machine 状态如实反映停机；删除与升级重建路径不受影响。
 
+### P1-10　`/var/log/pods` 软链到 containerd 持久盘（#22）
+
+- **背景**：ACP 节点规范要求 pod 日志不落系统盘。当 `VSphereMachineConfigPool` 槽位把某块数据盘挂载到 `/var/lib/containerd` 时，`/var/log/pods` 也应随之迁移到这块盘上，通过软链满足 kubelet 默认 pod log 路径，同时复用 containerd 持久盘容量。
+- **现状**：CAPV 已在 VM 首次开机前把 Pool 槽位数据盘注入 cloud-init：`GetPersistentDiskCloudConfig` 生成 `/etc/capv/persistent-disks.tsv`、`capv-persistent-disk-reconcile.service` 与 containerd/kubelet systemd drop-in；挂盘脚本会格式化并 mount 到声明的 `mountPath`。但脚本只处理数据盘挂载，不处理 `/var/log/pods`，因此即使 `/var/lib/containerd` 已在持久盘上，pod log 目录仍可能由 kubelet 在系统盘创建。
+- **设计**：不新增 API，复用 `PersistentDisk.MountPath`（以及 P1-7 的 `EphemeralDisk.MountPath`，同一脚本框架）作为触发条件。只要 disk table 中存在 `mountPath == "/var/lib/containerd"`，就在 `capv-persistent-disk-reconcile.sh` 完成挂载后、oneshot service 退出前创建软链：
+  - 按当前规范验收项创建 `/var/log/pods -> /var/lib/containerd`（若后续规范允许子目录，可改为 `/var/lib/containerd/pods`，但本项按“软链到 `/var/lib/containerd`”实现）。
+  - `mkdir -p /var/lib/containerd /var/log`；若 `/var/log/pods` 已是目标软链则幂等返回；若是旧软链或普通文件则替换；若是目录，优先迁移已有内容后再替换为软链。标准新机路径下该目录应为空或不存在，因为 service 通过 `Before=`/`After=`/`Requires=` 保证早于 kubelet/containerd。
+  - 逻辑放在 `persistentDiskReconcileScript()` 内部，而不是独立 cloud-init `runcmd`，确保与挂盘、containerd/kubelet 启动顺序绑定，并且 persistent/ephemeral 两类槽位数据盘共享。
+- **存量机器**：CAPV 只在 VM powered-off、首次启动前更新 guestinfo user-data；已运行机器即使 controller 升级也不会重跑 cloud-init，因此不会自动补软链。**节点滚动升级可以补齐**：滚动替换出来的新 VM 会拿到新的 user-data，挂载 `/var/lib/containerd` 后在 kubelet 启动前创建软链。若必须原地修老节点，应通过运维脚本/DaemonSet 等 out-of-band 手段处理，并单独评估 `/var/log/pods` 既有内容、kubelet/containerd 文件句柄与重启窗口。
+- **验收**：声明 `/var/lib/containerd` 数据盘的新节点启动后，`/var/lib/containerd` 为数据盘挂载点，`/var/log/pods` 为指向 `/var/lib/containerd` 的软链，kubelet/containerd 正常启动；未声明该 mountPath 的节点不创建软链。单测覆盖 persistent 与 ephemeral 两类触发、无触发时不生成/不执行软链逻辑、已有目录/软链的幂等处理。
+
 ### P2-1　持久盘 observed state 迁到 status（#18）
 
 **目标**：把三项纯观测态 `VolumePath`/`DiskUUID`/`UnitNumber`（回填值）从 spec（`configs[].persistentDisks[]`）迁到 pool status，controller 不再回写 spec；独立类型 `MachineConfigSlotReclaimStatus` 废弃，揉进新 per-disk 记录的 `Phase`。对齐 DCS/HCS 的 `status.persistentDiskStatus[]`。
@@ -236,8 +249,9 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 | K | Pool 槽位非持久化数据盘 | [源] | P1 | C 可并 | 中 |
 | L | 容灾 encryption-config（改为 KCP YAML 声明，不涉及代码） | — | ⏸ 无代码 | — | 小 |
 | M | VM 开机仅在创建时执行一次 | [源] | P1 | — | 小 |
+| N | `/var/log/pods` 软链到 containerd 持久盘 | [源] | P1 | — | 小 |
 
-**推进顺序**：A/B/C/K/L/M → D/F → E/J → G/I。
+**推进顺序**：A/B/C/K/L/M/N → D/F → E/J → G/I。
 
 **通用完成标准**：`make manifests`/`make generate` 无 diff；`go test ./...` 通过；新增/变更有单测；capabilities 与代码一致；CRD 变更同步交付仓库 chart。
 
@@ -256,6 +270,7 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 | pause/deletion 顺序 | `controllers/vspherecluster_reconciler.go:137-143`、`vspheremachine_controller.go:327-333`、`vspherevm_controller.go:264-426`、`vmware/vspherecluster_reconciler.go:124-131` |
 | kube-ovn AppRelease | `controllers/vspherecluster_reconciler.go:363-476` |
 | 槽位复用/持久盘检查 | `controllers/vspherevm_controller.go:490-549` |
+| 数据盘 guest 挂载与 `/var/log/pods` 软链 | `pkg/util/machines.go`（`GetPersistentDiskCloudConfig`、`persistentDiskReconcileScript`、systemd drop-in） |
 | clusterModules 回写 spec | `controllers/clustermodule_reconciler.go:166` |
 | 默认模板 / 升级 webhook | `templates/cluster-template.yaml`、`internal/webhooks/{kubeadmcontrolplane,machinedeployment}.go` |
 
