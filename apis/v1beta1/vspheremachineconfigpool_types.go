@@ -88,6 +88,7 @@ type VSphereMachineConfigPoolSpec struct {
 	Datacenter string `json:"datacenter,omitempty"`
 
 	// Configs is the list of pre-defined machine configuration slots.
+	// +kubebuilder:validation:MinItems=1
 	Configs []MachineConfigSlot `json:"configs"`
 
 	// ReleaseDelayHours is the time to wait before marking a released slot as "Available" for any machine.
@@ -114,8 +115,8 @@ type MachineConfigSlot struct {
 	Datacenter string `json:"datacenter,omitempty"`
 
 	// Network describes the primary and additional network configurations for this slot.
-	// +optional
-	Network *MachineConfigSlotNetwork `json:"network,omitempty"`
+	// +kubebuilder:validation:Required
+	Network *MachineConfigSlotNetwork `json:"network"`
 
 	// PersistentDisks that survive VM deletion.
 	// +optional

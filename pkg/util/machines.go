@@ -1127,6 +1127,7 @@ set -u
 CONFIG_FILE="/etc/capv/persistent-disks.tsv"
 DEVICE_DIR="/dev/disk/by-capv"
 CONTAINERD_MOUNT_PATH="/var/lib/containerd"
+POD_LOG_TARGET_PATH="${CONTAINERD_MOUNT_PATH}/logs"
 POD_LOG_PATH="/var/log/pods"
 
 mkdir -p "${DEVICE_DIR}"
@@ -1246,23 +1247,28 @@ ensure_pod_log_symlink() {
     return 0
   fi
 
-  mkdir -p /var/log
+  mkdir -p /var/log "${POD_LOG_TARGET_PATH}"
   if [ -L "${POD_LOG_PATH}" ]; then
     current_target="$(readlink "${POD_LOG_PATH}" 2>/dev/null || true)"
-    if [ "${current_target}" = "${CONTAINERD_MOUNT_PATH}" ]; then
+    if [ "${current_target}" = "${POD_LOG_TARGET_PATH}" ]; then
       return 0
     fi
-    rm -f "${POD_LOG_PATH}"
+    if [ "${current_target}" = "${CONTAINERD_MOUNT_PATH}" ]; then
+      rm -f "${POD_LOG_PATH}"
+    else
+      echo "pod log path ${POD_LOG_PATH} points to unexpected target ${current_target}; skip symlink" >&2
+      return 0
+    fi
   elif [ -e "${POD_LOG_PATH}" ]; then
     if [ -d "${POD_LOG_PATH}" ]; then
       for item in "${POD_LOG_PATH}"/* "${POD_LOG_PATH}"/.[!.]* "${POD_LOG_PATH}"/..?*; do
         [ -e "${item}" ] || continue
-        target="${CONTAINERD_MOUNT_PATH}/$(basename "${item}")"
+        target="${POD_LOG_TARGET_PATH}/$(basename "${item}")"
         if [ -e "${target}" ]; then
           echo "pod log migration target ${target} already exists; keep ${item}" >&2
           continue
         fi
-        mv "${item}" "${CONTAINERD_MOUNT_PATH}/"
+        mv "${item}" "${POD_LOG_TARGET_PATH}/"
       done
       if ! rmdir "${POD_LOG_PATH}" 2>/dev/null; then
         echo "pod log path ${POD_LOG_PATH} could not be migrated cleanly; skip symlink" >&2
@@ -1273,7 +1279,7 @@ ensure_pod_log_symlink() {
     fi
   fi
 
-  ln -s "${CONTAINERD_MOUNT_PATH}" "${POD_LOG_PATH}"
+  ln -s "${POD_LOG_TARGET_PATH}" "${POD_LOG_PATH}"
 }
 
 while true; do

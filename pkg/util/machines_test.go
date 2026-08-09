@@ -1132,14 +1132,16 @@ func Test_GetPersistentDiskCloudConfigCreatesPodLogSymlinkForPersistentContainer
 	scriptText := string(decodedScript)
 	for _, expected := range []string{
 		"CONTAINERD_MOUNT_PATH=\"/var/lib/containerd\"",
+		"POD_LOG_TARGET_PATH=\"${CONTAINERD_MOUNT_PATH}/logs\"",
 		"POD_LOG_PATH=\"/var/log/pods\"",
 		"ensure_pod_log_symlink()",
 		"[ \"${1:-}\" = \"${CONTAINERD_MOUNT_PATH}\" ] || return 0",
 		"mountpoint -q \"${CONTAINERD_MOUNT_PATH}\"",
+		"mkdir -p /var/log \"${POD_LOG_TARGET_PATH}\"",
 		"for item in \"${POD_LOG_PATH}\"/* \"${POD_LOG_PATH}\"/.[!.]* \"${POD_LOG_PATH}\"/..?*; do",
-		"mv \"${item}\" \"${CONTAINERD_MOUNT_PATH}/\"",
+		"mv \"${item}\" \"${POD_LOG_TARGET_PATH}/\"",
 		"rmdir \"${POD_LOG_PATH}\"",
-		"ln -s \"${CONTAINERD_MOUNT_PATH}\" \"${POD_LOG_PATH}\"",
+		"ln -s \"${POD_LOG_TARGET_PATH}\" \"${POD_LOG_PATH}\"",
 		"ensure_pod_log_symlink \"${mount_path}\"",
 	} {
 		if !strings.Contains(scriptText, expected) {

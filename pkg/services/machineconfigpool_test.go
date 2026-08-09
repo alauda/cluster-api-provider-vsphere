@@ -32,6 +32,8 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 )
 
+var validNetwork = &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{NetworkName: "net"}}
+
 func TestAllocateSlot(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
@@ -632,6 +634,7 @@ func TestPersistSlotChangesPersistsUnitNumber(t *testing.T) {
 			Configs: []infrav1.MachineConfigSlot{
 				{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "disk-1"},
 					},
@@ -985,6 +988,44 @@ func TestObjectForConsumerRef(t *testing.T) {
 
 func TestValidateSlotFields(t *testing.T) {
 	int32Ptr := func(v int32) *int32 { return &v }
+	validNetwork := &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{NetworkName: "net"}}
+
+	t.Run("rejects empty configs", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(1))
+		g.Expect(errs[0].Field).To(Equal("spec.configs"))
+	})
+
+	t.Run("rejects slot without network", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{Hostname: "host-1"}},
+			},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(1))
+		g.Expect(errs[0].Field).To(Equal("spec.configs[0].network"))
+	})
+
+	t.Run("rejects slot without primary networkName", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					Network:  &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{}},
+				}},
+			},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(1))
+		g.Expect(errs[0].Field).To(Equal("spec.configs[0].network.primary.networkName"))
+	})
 
 	t.Run("valid pool has no errors", func(t *testing.T) {
 		g := NewWithT(t)
@@ -992,6 +1033,7 @@ func TestValidateSlotFields(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "etcd", SizeGiB: 20, UnitNumber: int32Ptr(0), MountPath: "/var/lib/etcd"},
 						{Name: "data", SizeGiB: 50, UnitNumber: int32Ptr(1), MountPath: "/var/lib/data"},
@@ -1008,6 +1050,7 @@ func TestValidateSlotFields(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "a", SizeGiB: 0, UnitNumber: int32Ptr(7)},
 						{Name: "b", SizeGiB: 10, UnitNumber: int32Ptr(16)},
@@ -1025,6 +1068,7 @@ func TestValidateSlotFields(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "dup", SizeGiB: 10, UnitNumber: int32Ptr(1), MountPath: "/data"},
 						{Name: "dup", SizeGiB: 10, UnitNumber: int32Ptr(1), MountPath: "/data"},
@@ -1042,6 +1086,7 @@ func TestValidateSlotFields(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "etcd", SizeGiB: 20, UnitNumber: int32Ptr(0), MountPath: "/var/lib/etcd"},
 					},
@@ -1060,6 +1105,7 @@ func TestValidateSlotFields(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					EphemeralDisks: []infrav1.EphemeralDisk{
 						{Name: "", SizeGiB: 0},
 					},
@@ -1076,6 +1122,7 @@ func TestValidateSlotFields(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "shared", SizeGiB: 10, UnitNumber: int32Ptr(1), MountPath: "/data"},
 					},
@@ -1339,6 +1386,7 @@ func TestSeedPersistentDiskStatuses(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk-a.vmdk", DiskUUID: "uuid-a", UnitNumber: toInt32Ptr(0)},
 					},
@@ -1375,6 +1423,7 @@ func TestSeedPersistentDiskStatuses(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				Configs: []infrav1.MachineConfigSlot{{
 					Hostname: "host-1",
+					Network:  validNetwork,
 					PersistentDisks: []infrav1.PersistentDisk{
 						{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] vm/disk-a.vmdk"},
 					},

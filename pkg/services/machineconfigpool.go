@@ -42,26 +42,43 @@ const (
 	diskReservedUnitNumber = 7
 )
 
-// ValidateSlotFields checks the structural validity of every slot's data disk
-// fields (unit number range, size, and intra-slot uniqueness of disk name, unit
-// number, and mount path). Persistent and ephemeral disks share one name and
-// mount-path namespace within a slot, so a name or mount path used by a
-// persistent disk cannot be reused by an ephemeral disk and vice versa.
-// Ephemeral disks have no user-declared unit number (it is controller-assigned),
-// so only persistent disks contribute to unit-number uniqueness; cross-kind
-// unit conflicts are prevented at clone time by the unitNumberAssigner. It is a
-// pure function shared by the pool reconciler (P1-2 MembersValid condition) and
-// the validating webhook (P1-3) so the two never drift. Hostname format is
-// validated separately.
+// ValidateSlotFields checks slot-level structural validity that must be shared
+// by the pool reconciler and validating webhook: the pool must define at least
+// one slot, every slot must declare a primary network, and every data disk must
+// have valid size/unit/name/mount fields.
+//
+// Persistent and ephemeral disks share one name and mount-path namespace within
+// a slot, so a name or mount path used by a persistent disk cannot be reused by
+// an ephemeral disk and vice versa. Ephemeral disks have no user-declared unit
+// number (it is controller-assigned), so only persistent disks contribute to
+// unit-number uniqueness; cross-kind unit conflicts are prevented at clone time
+// by the unitNumberAssigner.
+//
+// Keep this function pure: it is used by the pool reconciler to set the P1-2
+// MembersValid condition and by the P1-3 validating webhook as a hard admission
+// gate, so sharing the same implementation prevents status/admission drift.
+// Hostname format is validated separately.
 func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList {
 	var allErrs field.ErrorList
 	if pool == nil {
 		return allErrs
 	}
+	configsPath := field.NewPath("spec", "configs")
+	if len(pool.Spec.Configs) == 0 {
+		allErrs = append(allErrs, field.Required(configsPath, "must include at least one slot"))
+	}
 	for i := range pool.Spec.Configs {
 		slot := &pool.Spec.Configs[i]
-		pdPathBase := field.NewPath("spec", "configs").Index(i).Child("persistentDisks")
-		edPathBase := field.NewPath("spec", "configs").Index(i).Child("ephemeralDisks")
+		slotPath := configsPath.Index(i)
+		networkPath := slotPath.Child("network")
+		pdPathBase := slotPath.Child("persistentDisks")
+		edPathBase := slotPath.Child("ephemeralDisks")
+
+		if slot.Network == nil {
+			allErrs = append(allErrs, field.Required(networkPath, "must be set"))
+		} else if slot.Network.Primary.NetworkName == "" {
+			allErrs = append(allErrs, field.Required(networkPath.Child("primary", "networkName"), "must be set"))
+		}
 
 		seenNames := map[string]struct{}{}
 		seenUnits := map[int32]struct{}{}

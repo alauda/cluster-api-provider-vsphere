@@ -82,7 +82,6 @@ func (webhook *VSphereMachineConfigPool) ValidateDelete(_ context.Context, raw r
 func (webhook *VSphereMachineConfigPool) validate(ctx context.Context, oldObj, newObj *infrav1.VSphereMachineConfigPool) field.ErrorList {
 	allErrs := webhook.validateClusterRef(oldObj, newObj)
 	allErrs = append(allErrs, webhook.validateSlotHostnames(newObj)...)
-	allErrs = append(allErrs, webhook.validateSlotNetworks(newObj)...)
 
 	// Shared structural + intra-pool uniqueness validators. These also drive the
 	// P1-2 MembersValid / MembersUnique conditions; wiring them here promotes the
@@ -154,25 +153,6 @@ func (webhook *VSphereMachineConfigPool) validateClusterRef(oldObj, newObj *infr
 	// ClusterRef can only be changed when consumerRef (in status) is nil
 	if oldObj != nil && oldObj.Spec.ClusterRef.Name != newObj.Spec.ClusterRef.Name && oldObj.Status.ConsumerRef != nil {
 		allErrs = append(allErrs, field.Forbidden(clusterRefPath, "cannot change clusterRef while consumerRef is set"))
-	}
-
-	return allErrs
-}
-
-func (webhook *VSphereMachineConfigPool) validateSlotNetworks(pool *infrav1.VSphereMachineConfigPool) field.ErrorList {
-	var allErrs field.ErrorList
-	if pool == nil {
-		return allErrs
-	}
-
-	for i := range pool.Spec.Configs {
-		slotPath := field.NewPath("spec", "configs").Index(i).Child("network")
-		if pool.Spec.Configs[i].Network == nil {
-			continue
-		}
-		if pool.Spec.Configs[i].Network.Primary.NetworkName == "" {
-			allErrs = append(allErrs, field.Required(slotPath.Child("primary", "networkName"), "must be set when network is configured"))
-		}
 	}
 
 	return allErrs

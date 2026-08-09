@@ -36,6 +36,16 @@ func TestVSphereMachineConfigPoolValidateCreate(t *testing.T) {
 		g.Expect(err).To(HaveOccurred())
 	})
 
+	t.Run("reject missing network", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool()
+		pool.Spec.Configs[0].Network = nil
+		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		_, err := webhook.ValidateCreate(context.Background(), pool)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.configs[0].network"))
+	})
+
 	t.Run("reject network without primary networkName", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := newPool()
@@ -98,7 +108,10 @@ func TestVSphereMachineConfigPoolValidateSharedValidators(t *testing.T) {
 	t.Run("rejects duplicate hostname within the pool", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := newPool()
-		pool.Spec.Configs = append(pool.Spec.Configs, infrav1.MachineConfigSlot{Hostname: "slot-1"})
+		pool.Spec.Configs = append(pool.Spec.Configs, infrav1.MachineConfigSlot{
+			Hostname: "slot-1",
+			Network:  &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{NetworkName: "net-2"}},
+		})
 		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
 		_, err := webhook.ValidateCreate(context.Background(), pool)
 		g.Expect(err).To(HaveOccurred())
@@ -214,7 +227,10 @@ func newPool() *infrav1.VSphereMachineConfigPool {
 		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
 		Spec: infrav1.VSphereMachineConfigPoolSpec{
 			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
-			Configs:  []infrav1.MachineConfigSlot{{Hostname: "slot-1"}},
+			Configs: []infrav1.MachineConfigSlot{{
+				Hostname: "slot-1",
+				Network:  &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{NetworkName: "net"}},
+			}},
 		},
 	}
 }

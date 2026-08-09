@@ -325,7 +325,9 @@ spec:
                       type: array
                   required:
                   - hostname
+                  - network
                   type: object
+                minItems: 1
                 type: array
               datacenter:
                 description: |-
