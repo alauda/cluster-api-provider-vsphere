@@ -33,6 +33,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"path"
 	"regexp"
 	"strings"
 	"text/template"
@@ -746,6 +747,27 @@ func ValidateEphemeralDiskBackfill(ephemeralDisks []infrav1.EphemeralDisk) error
 	return nil
 }
 
+// NormalizeGuestMountPath normalizes a Linux guest mount path before it is used in
+// validation or written to the disk table consumed by capv-persistent-disk-reconcile.sh.
+// Empty means "do not mount" and is left unchanged.
+func NormalizeGuestMountPath(raw string) (string, error) {
+	mountPath := strings.TrimSpace(raw)
+	if mountPath == "" {
+		return "", nil
+	}
+	if strings.ContainsAny(mountPath, "\t\n\r") {
+		return "", errors.New("must not contain tab or newline characters")
+	}
+	if !path.IsAbs(mountPath) {
+		return "", errors.New("must be an absolute Linux path")
+	}
+	mountPath = path.Clean(mountPath)
+	if mountPath == "/" {
+		return "", errors.New("must not be the root path")
+	}
+	return mountPath, nil
+}
+
 // GetPersistentDiskCloudConfig builds the cloud-init config that provisions the
 // slot's data disks inside the guest. Persistent and ephemeral disks share the
 // same reconcile script and disk table (/etc/capv/persistent-disks.tsv): each
@@ -768,7 +790,11 @@ func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk, ephe
 	// writeDiskRow emits one /etc/capv/persistent-disks.tsv row. Persistent and
 	// ephemeral disks share the row format; they differ only in the disk-UUID and
 	// wipe columns, passed in by the caller.
-	writeDiskRow := func(name string, unit int32, mountPath, fsFormat string, mountOptions []string, diskUUID string, wipe bool) {
+	writeDiskRow := func(name string, unit int32, mountPath, fsFormat string, mountOptions []string, diskUUID string, wipe bool) error {
+		mountPath, err := NormalizeGuestMountPath(mountPath)
+		if err != nil {
+			return errors.Wrapf(err, "invalid mountPath for disk %q", name)
+		}
 		if fsFormat == "" && mountPath != "" {
 			fsFormat = "ext4"
 		}
@@ -785,19 +811,24 @@ func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk, ephe
 			"%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			name, unit, mountPath, fsFormat, options, diskUUID, wipeFs,
 		)
+		return nil
 	}
 
 	for i := range persistentDisks {
 		disk := persistentDisks[i]
 		wipe := disk.WipeFilesystem != nil && *disk.WipeFilesystem
-		writeDiskRow(disk.Name, *disk.UnitNumber, disk.MountPath, disk.FSFormat, disk.MountOptions, disk.DiskUUID, wipe)
+		if err := writeDiskRow(disk.Name, *disk.UnitNumber, disk.MountPath, disk.FSFormat, disk.MountOptions, disk.DiskUUID, wipe); err != nil {
+			return nil, err
+		}
 	}
 	// Ephemeral disks use two fixed columns: an empty disk-UUID (so the guest
 	// script's UUID lookup fails and it addresses the disk by SCSI unit) and
 	// wipe=false (a freshly created disk is always empty).
 	for i := range ephemeralDisks {
 		disk := ephemeralDisks[i]
-		writeDiskRow(disk.Name, *disk.UnitNumber, disk.MountPath, disk.FSFormat, disk.MountOptions, "", false)
+		if err := writeDiskRow(disk.Name, *disk.UnitNumber, disk.MountPath, disk.FSFormat, disk.MountOptions, "", false); err != nil {
+			return nil, err
+		}
 	}
 
 	reconcileScript := persistentDiskReconcileScript()

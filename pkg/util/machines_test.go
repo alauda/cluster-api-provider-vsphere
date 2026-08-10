@@ -1100,7 +1100,7 @@ func Test_GetPersistentDiskCloudConfigCreatesPodLogSymlinkForPersistentContainer
 	actual, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
 		Name:       "containerd-data",
 		UnitNumber: toInt32Ptr(2),
-		MountPath:  "/var/lib/containerd",
+		MountPath:  "/var/lib/containerd/",
 		VolumePath: "[ds] vm/containerd-data.vmdk",
 		DiskUUID:   "6000C29d-45cb-2787-e901-a2a0131b2e82",
 	}}, nil)
@@ -1257,6 +1257,68 @@ func Test_GetPersistentDiskCloudConfigEphemeralRequiresUnit(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cache-1") || !strings.Contains(err.Error(), "unitNumber") {
 		t.Fatalf("expected error to mention disk and unitNumber, got: %v", err)
+	}
+}
+
+func Test_GetPersistentDiskCloudConfigRejectsInvalidMountPath(t *testing.T) {
+	testCases := []struct {
+		name      string
+		mountPath string
+		expected  string
+	}{
+		{name: "relative path", mountPath: "var/lib/data", expected: "absolute Linux path"},
+		{name: "tab in path", mountPath: "/var/lib/\tdata", expected: "tab or newline"},
+		{name: "newline in path", mountPath: "/var/lib/\ndata", expected: "tab or newline"},
+		{name: "root path", mountPath: "/", expected: "root path"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+				Name:       "data-1",
+				UnitNumber: toInt32Ptr(2),
+				MountPath:  tc.mountPath,
+				VolumePath: "[ds] vm/data-1.vmdk",
+				DiskUUID:   "6000C29d-45cb-2787-e901-a2a0131b2e82",
+			}}, nil)
+			if err == nil {
+				t.Fatal("expected invalid mountPath to fail")
+			}
+			if !strings.Contains(err.Error(), "data-1") || !strings.Contains(err.Error(), tc.expected) {
+				t.Fatalf("expected error to mention disk and %q, got: %v", tc.expected, err)
+			}
+		})
+	}
+}
+
+func Test_NormalizeGuestMountPath(t *testing.T) {
+	testCases := []struct {
+		name      string
+		input     string
+		expected  string
+		wantError string
+	}{
+		{name: "empty", input: "", expected: ""},
+		{name: "trim and clean", input: " /data//logs/ ", expected: "/data/logs"},
+		{name: "relative path", input: "data", wantError: "absolute Linux path"},
+		{name: "newline", input: "/data\nlogs", wantError: "tab or newline"},
+		{name: "root", input: "/", wantError: "root path"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := util.NormalizeGuestMountPath(tc.input)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("expected error containing %q, got path=%q err=%v", tc.wantError, actual, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+			if actual != tc.expected {
+				t.Fatalf("normalized path = %q, want %q", actual, tc.expected)
+			}
+		})
 	}
 }
 
@@ -1850,7 +1912,7 @@ write_files:
 	if !strings.Contains(actualStr, "name: worker-01") {
 		t.Fatalf("expected kubeadm join nodeRegistration name to be updated, got: %s", actualStr)
 	}
-	if !strings.Contains(actualStr, "node-ip: 192.168.130.220") {
+	if !strings.Contains(actualStr, "name: node-ip") || !strings.Contains(actualStr, "value: 192.168.130.220") {
 		t.Fatalf("expected kubeadm join kubeletExtraArgs.node-ip to be updated, got: %s", actualStr)
 	}
 	if strings.Contains(actualStr, "worker-01-os") {

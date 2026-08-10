@@ -1000,6 +1000,89 @@ func Test_reconcile(t *testing.T) {
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(vsphereVM.Status.VMRef).To(Equal("VirtualMachine:vm-129"))
 		})
+
+		t.Run("ready VM is polled for out-of-band power changes", func(t *testing.T) {
+			readyVM := vsphereVM.DeepCopy()
+			fakeVMSvc := new(fake_svc.VMService)
+			fakeVMSvc.On("ReconcileVM", mock.Anything).Return(infrav1.VirtualMachine{
+				Name:     readyVM.Name,
+				BiosUUID: "265104de-1472-547c-b873-6dc7883fb6cb",
+				State:    infrav1.VirtualMachineStateReady,
+				Network: []infrav1.NetworkStatus{{
+					Connected:   true,
+					IPAddrs:     []string{"192.168.1.10"},
+					MACAddr:     "00:50:56:aa:bb:cc",
+					NetworkName: "nw-1",
+				}},
+			}, nil)
+
+			r := setupReconciler(fakeVMSvc, vsphereCluster, machine, readyVM)
+			result, err := r.reconcileNormal(ctx, &capvcontext.VMContext{
+				ControllerManagerContext: r.ControllerManagerContext,
+				VSphereVM:                readyVM,
+			})
+
+			g := NewWithT(t)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(result.RequeueAfter).To(Equal(vmPowerStatePollInterval))
+			g.Expect(readyVM.Status.Ready).To(BeTrue())
+		})
+
+		t.Run("machine config slot owner lookup error is returned", func(t *testing.T) {
+			readyVM := vsphereVM.DeepCopy()
+			fakeVMSvc := new(fake_svc.VMService)
+			fakeVMSvc.On("ReconcileVM", mock.Anything).Return(infrav1.VirtualMachine{
+				Name:     readyVM.Name,
+				BiosUUID: "265104de-1472-547c-b873-6dc7883fb6cb",
+				State:    infrav1.VirtualMachineStateReady,
+				Network: []infrav1.NetworkStatus{{
+					Connected:   true,
+					IPAddrs:     []string{"192.168.1.10"},
+					MACAddr:     "00:50:56:aa:bb:cc",
+					NetworkName: "nw-1",
+				}},
+			}, nil)
+
+			r := setupReconciler(fakeVMSvc, vsphereCluster, machine, readyVM)
+			result, err := r.reconcileNormal(ctx, &capvcontext.VMContext{
+				ControllerManagerContext: r.ControllerManagerContext,
+				VSphereVM:                readyVM,
+				MachineConfigSlot:        &infrav1.MachineConfigSlot{Hostname: "host-1"},
+			})
+
+			g := NewWithT(t)
+			g.Expect(err).To(HaveOccurred())
+			g.Expect(err.Error()).To(ContainSubstring("failed to get VSphereMachine owner"))
+			g.Expect(result.RequeueAfter).To(BeZero())
+		})
+
+		t.Run("powered-off VM after initial power-on keeps polling", func(t *testing.T) {
+			poweredOffVM := vsphereVM.DeepCopy()
+			poweredOffVM.Status.Ready = false
+			conditions.MarkFalse(poweredOffVM, infrav1.PoweredOnCondition, infrav1.PoweredOffReason, clusterv1.ConditionSeverityInfo, "")
+			v1beta2conditions.Set(poweredOffVM, metav1.Condition{
+				Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+				Status: metav1.ConditionFalse,
+				Reason: infrav1.VSphereVMPoweredOffV1Beta2Reason,
+			})
+			fakeVMSvc := new(fake_svc.VMService)
+			fakeVMSvc.On("ReconcileVM", mock.Anything).Return(infrav1.VirtualMachine{
+				Name:  poweredOffVM.Name,
+				State: infrav1.VirtualMachineStatePending,
+			}, nil)
+
+			r := setupReconciler(fakeVMSvc, vsphereCluster, machine, poweredOffVM)
+			result, err := r.reconcileNormal(ctx, &capvcontext.VMContext{
+				ControllerManagerContext: r.ControllerManagerContext,
+				VSphereVM:                poweredOffVM,
+			})
+
+			g := NewWithT(t)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(result.RequeueAfter).To(Equal(vmPowerStatePollInterval))
+			g.Expect(poweredOffVM.Status.Ready).To(BeFalse())
+			g.Expect(v1beta2conditions.Get(poweredOffVM, infrav1.VSphereVMPoweredOnV1Beta2Condition).Status).To(Equal(metav1.ConditionFalse))
+		})
 	})
 
 	t.Run("during VM deletion", func(t *testing.T) {

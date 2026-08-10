@@ -76,8 +76,15 @@ func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList 
 
 		if slot.Network == nil {
 			allErrs = append(allErrs, field.Required(networkPath, "must be set"))
-		} else if slot.Network.Primary.NetworkName == "" {
-			allErrs = append(allErrs, field.Required(networkPath.Child("primary", "networkName"), "must be set"))
+		} else {
+			if slot.Network.Primary.NetworkName == "" {
+				allErrs = append(allErrs, field.Required(networkPath.Child("primary", "networkName"), "must be set"))
+			}
+			for j := range slot.Network.Additional {
+				if slot.Network.Additional[j].NetworkName == "" {
+					allErrs = append(allErrs, field.Required(networkPath.Child("additional").Index(j).Child("networkName"), "must be set"))
+				}
+			}
 		}
 
 		seenNames := map[string]struct{}{}
@@ -116,10 +123,13 @@ func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList 
 			}
 
 			if pd.MountPath != "" {
-				if _, dup := seenMounts[pd.MountPath]; dup {
-					allErrs = append(allErrs, field.Duplicate(diskPath.Child("mountPath"), pd.MountPath))
+				mountPath, err := infrautil.NormalizeGuestMountPath(pd.MountPath)
+				if err != nil {
+					allErrs = append(allErrs, field.Invalid(diskPath.Child("mountPath"), pd.MountPath, err.Error()))
+				} else if _, dup := seenMounts[mountPath]; dup {
+					allErrs = append(allErrs, field.Duplicate(diskPath.Child("mountPath"), mountPath))
 				} else {
-					seenMounts[pd.MountPath] = struct{}{}
+					seenMounts[mountPath] = struct{}{}
 				}
 			}
 		}
@@ -141,10 +151,13 @@ func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList 
 			}
 
 			if ed.MountPath != "" {
-				if _, dup := seenMounts[ed.MountPath]; dup {
-					allErrs = append(allErrs, field.Duplicate(diskPath.Child("mountPath"), ed.MountPath))
+				mountPath, err := infrautil.NormalizeGuestMountPath(ed.MountPath)
+				if err != nil {
+					allErrs = append(allErrs, field.Invalid(diskPath.Child("mountPath"), ed.MountPath, err.Error()))
+				} else if _, dup := seenMounts[mountPath]; dup {
+					allErrs = append(allErrs, field.Duplicate(diskPath.Child("mountPath"), mountPath))
 				} else {
-					seenMounts[ed.MountPath] = struct{}{}
+					seenMounts[mountPath] = struct{}{}
 				}
 			}
 		}
@@ -378,7 +391,9 @@ func validateSlotImmutable(slotPath *field.Path, oldSlot, newSlot *infrav1.Machi
 			allErrs = append(allErrs, field.Forbidden(diskBase.Child("sizeGiB"),
 				fmt.Sprintf("sizeGiB is immutable for disk %q on allocated slot %q: %d → %d", oldDisk.Name, hostname, oldDisk.SizeGiB, newDisk.SizeGiB)))
 		}
-		if oldDisk.MountPath != newDisk.MountPath {
+		oldMountPath, oldMountErr := infrautil.NormalizeGuestMountPath(oldDisk.MountPath)
+		newMountPath, newMountErr := infrautil.NormalizeGuestMountPath(newDisk.MountPath)
+		if oldMountErr == nil && newMountErr == nil && oldMountPath != newMountPath {
 			allErrs = append(allErrs, field.Forbidden(diskBase.Child("mountPath"),
 				fmt.Sprintf("mountPath is immutable for disk %q on allocated slot %q: %q → %q", oldDisk.Name, hostname, oldDisk.MountPath, newDisk.MountPath)))
 		}

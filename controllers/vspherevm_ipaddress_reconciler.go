@@ -101,7 +101,7 @@ func (r vmReconciler) reconcileIPAddressClaims(ctx context.Context, vmCtx *capvc
 			infrav1.IPAddressClaimedCondition,
 			infrav1.IPAddressClaimNotFoundReason,
 			clusterv1.ConditionSeverityError,
-			aggregatedErr.Error())
+			"%s", aggregatedErr.Error())
 		v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
 			Type:    infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
 			Status:  metav1.ConditionFalse,

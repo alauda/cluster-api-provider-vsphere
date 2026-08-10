@@ -132,6 +132,8 @@ func AddVMControllerToManager(ctx context.Context, controllerManagerCtx *capvcon
 		))
 }
 
+const vmPowerStatePollInterval = 30 * time.Second
+
 type vmReconciler struct {
 	Recorder record.EventRecorder
 	*capvcontext.ControllerManagerContext
@@ -277,7 +279,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 
 	authSession, err := r.retrieveVcenterSession(ctx, vsphereVM)
 	if err != nil {
-		conditions.MarkFalse(vsphereVM, infrav1.VCenterAvailableCondition, infrav1.VCenterUnreachableReason, clusterv1.ConditionSeverityError, err.Error())
+		conditions.MarkFalse(vsphereVM, infrav1.VCenterAvailableCondition, infrav1.VCenterUnreachableReason, clusterv1.ConditionSeverityError, "%s", err.Error())
 		v1beta2conditions.Set(vsphereVM, metav1.Condition{
 			Type:    infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
 			Status:  metav1.ConditionFalse,
@@ -453,7 +455,7 @@ func (r vmReconciler) reconcileDelete(ctx context.Context, vmCtx *capvcontext.VM
 	})
 	result, vm, err := r.VMService.DestroyVM(ctx, vmCtx)
 	if err != nil {
-		conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, "DeletionFailed", clusterv1.ConditionSeverityWarning, err.Error())
+		conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, "DeletionFailed", clusterv1.ConditionSeverityWarning, "%s", err.Error())
 		v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
 			Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
 			Status:  metav1.ConditionFalse,
@@ -608,7 +610,17 @@ func (r vmReconciler) deleteNode(ctx context.Context, vmCtx *capvcontext.VMConte
 	return clusterClient.Delete(ctx, node)
 }
 
-func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VMContext) (reconcile.Result, error) {
+func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VMContext) (result reconcile.Result, retErr error) {
+	defer func() {
+		if retErr != nil {
+			return
+		}
+		if result.Requeue || result.RequeueAfter != 0 {
+			return
+		}
+		result.RequeueAfter = vmPowerStatePollInterval
+	}()
+
 	log := ctrl.LoggerFrom(ctx)
 
 	if vmCtx.VSphereVM.Status.FailureReason != nil || vmCtx.VSphereVM.Status.FailureMessage != nil {
@@ -693,7 +705,10 @@ func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VM
 	// Persist discovered paths back to the pool
 	if vmCtx.MachineConfigSlot != nil {
 		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
-		if err == nil && machine != nil && machine.Spec.MachineConfigPoolRef != nil {
+		if err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to get VSphereMachine owner for vm %s", vmCtx.VSphereVM.Name)
+		}
+		if machine != nil && machine.Spec.MachineConfigPoolRef != nil {
 			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.MachineConfigPoolRef, vmCtx.MachineConfigSlot, machine.Name, string(machine.UID)); err != nil {
 				return reconcile.Result{}, errors.Wrapf(err, "failed to persist slot changes for vm %s", vmCtx.VSphereVM.Name)
 			}

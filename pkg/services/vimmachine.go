@@ -183,6 +183,7 @@ func (v *VimMachineService) ReconcileNormal(ctx context.Context, machineCtx capv
 	// Waits the VM's ready state.
 	if !vm.Status.Ready {
 		log.Info("Waiting for VSphereVM to become ready")
+		vimMachineCtx.VSphereMachine.Status.Ready = false
 		// VSphereMachine wraps a VMSphereVM, so we are mirroring status from the underlying VMSphereVM
 		// in order to provide evidences about machine provisioning while provisioning is actually happening.
 		conditions.SetMirror(vimMachineCtx.VSphereMachine, infrav1.VMProvisionedCondition, vm)
@@ -196,6 +197,7 @@ func (v *VimMachineService) ReconcileNormal(ctx context.Context, machineCtx capv
 		if err != nil {
 			return false, errors.Wrapf(err, "unexpected error while reconciling provider ID for %s", vimMachineCtx)
 		}
+		vimMachineCtx.VSphereMachine.Status.Ready = false
 		return true, nil
 	}
 
@@ -204,6 +206,7 @@ func (v *VimMachineService) ReconcileNormal(ctx context.Context, machineCtx capv
 		if err != nil {
 			return false, errors.Wrapf(err, "unexpected error while reconciling network for %s", vimMachineCtx)
 		}
+		vimMachineCtx.VSphereMachine.Status.Ready = false
 		conditions.MarkFalse(vimMachineCtx.VSphereMachine, infrav1.VMProvisionedCondition, infrav1.WaitingForNetworkAddressesReason, clusterv1.ConditionSeverityInfo, "")
 		v1beta2conditions.Set(vimMachineCtx.VSphereMachine, metav1.Condition{
 			Type:   infrav1.VSphereMachineVirtualMachineProvisionedV1Beta2Condition,
