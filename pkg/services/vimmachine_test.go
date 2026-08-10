@@ -1119,24 +1119,37 @@ func Test_VimMachineService_ReconcileNormal(t *testing.T) {
 		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
 		machineCtx.Machine.SetName(fakeLongClusterName)
 		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
+		machineCtx.VSphereMachine.Status.Ready = true
 		vimMachineService := &VimMachineService{controllerManagerContext.Client}
 
 		requeue, err := vimMachineService.ReconcileNormal(ctx, machineCtx)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(requeue).To(BeTrue())
+		g.Expect(machineCtx.VSphereMachine.Status.Ready).To(BeFalse())
 	})
 	t.Run("requeues when VSphereVM is not ready", func(t *testing.T) {
 		g := NewWithT(t)
 		vsphereVM := getVSphereVM(hostAddr, corev1.ConditionFalse, nil, nil)
+		v1beta2conditions.Set(vsphereVM, metav1.Condition{
+			Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+			Status: metav1.ConditionFalse,
+			Reason: infrav1.VSphereVMPoweredOffV1Beta2Reason,
+		})
 		controllerManagerContext := fake.NewControllerManagerContext(vsphereVM)
 		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
 		machineCtx.Machine.SetName(fakeLongClusterName)
 		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
+		machineCtx.VSphereMachine.Status.Ready = true
 		vimMachineService := &VimMachineService{controllerManagerContext.Client}
 
 		requeue, err := vimMachineService.ReconcileNormal(ctx, machineCtx)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(requeue).To(BeTrue())
+		g.Expect(machineCtx.VSphereMachine.Status.Ready).To(BeFalse())
+		g.Expect(conditions.Get(machineCtx.VSphereMachine, infrav1.VMProvisionedCondition).Status).To(Equal(corev1.ConditionFalse))
+		poweredOn := v1beta2conditions.Get(machineCtx.VSphereMachine, infrav1.VSphereMachinePoweredOnV1Beta2Condition)
+		g.Expect(poweredOn).NotTo(BeNil())
+		g.Expect(poweredOn.Status).To(Equal(metav1.ConditionFalse))
 	})
 }
 

@@ -245,7 +245,7 @@ func (r *ClusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *vmw
 	// Reconciling the ResourcePolicy early potentially saves us the extra relocate operation.
 	resourcePolicyName, err := r.ResourcePolicyService.ReconcileResourcePolicy(ctx, clusterCtx)
 	if err != nil {
-		conditions.MarkFalse(clusterCtx.VSphereCluster, vmwarev1.ResourcePolicyReadyCondition, vmwarev1.ResourcePolicyCreationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+		conditions.MarkFalse(clusterCtx.VSphereCluster, vmwarev1.ResourcePolicyReadyCondition, vmwarev1.ResourcePolicyCreationFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 		v1beta2conditions.Set(clusterCtx.VSphereCluster, metav1.Condition{
 			Type:    vmwarev1.VSphereClusterResourcePolicyReadyV1Beta2Condition,
 			Status:  metav1.ConditionFalse,

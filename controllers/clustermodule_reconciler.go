@@ -176,7 +176,7 @@ func (r Reconciler) Reconcile(ctx context.Context, clusterCtx *capvcontext.Clust
 			err = errors.New(generateClusterModuleErrorMessage(modErrs))
 		}
 		conditions.MarkFalse(clusterCtx.VSphereCluster, infrav1.ClusterModulesAvailableCondition, infrav1.ClusterModuleSetupFailedReason,
-			clusterv1.ConditionSeverityWarning, generateClusterModuleErrorMessage(modErrs))
+			clusterv1.ConditionSeverityWarning, "%s", generateClusterModuleErrorMessage(modErrs))
 		v1beta2conditions.Set(clusterCtx.VSphereCluster, metav1.Condition{
 			Type:    infrav1.VSphereClusterClusterModulesReadyV1Beta2Condition,
 			Status:  metav1.ConditionFalse,

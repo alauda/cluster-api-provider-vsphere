@@ -590,8 +590,8 @@ func TestReconcilePoolHealthConditions(t *testing.T) {
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
 				ClusterRef: corev1.ObjectReference{Name: "c1"},
 				Configs: []infrav1.MachineConfigSlot{
-					{Hostname: "host-1"},
-					{Hostname: "host-2"},
+					{Hostname: "host-1", Network: &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{NetworkName: "net"}}},
+					{Hostname: "host-2", Network: &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{NetworkName: "net"}}},
 				},
 			},
 			Status: infrav1.VSphereMachineConfigPoolStatus{

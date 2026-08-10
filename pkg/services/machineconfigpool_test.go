@@ -1027,6 +1027,24 @@ func TestValidateSlotFields(t *testing.T) {
 		g.Expect(errs[0].Field).To(Equal("spec.configs[0].network.primary.networkName"))
 	})
 
+	t.Run("rejects additional network without networkName", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					Network: &infrav1.MachineConfigSlotNetwork{
+						Primary:    infrav1.NetworkConfig{NetworkName: "net"},
+						Additional: []infrav1.NetworkConfig{{}},
+					},
+				}},
+			},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(1))
+		g.Expect(errs[0].Field).To(Equal("spec.configs[0].network.additional[0].networkName"))
+	})
+
 	t.Run("valid pool has no errors", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := &infrav1.VSphereMachineConfigPool{
@@ -1078,6 +1096,56 @@ func TestValidateSlotFields(t *testing.T) {
 		}
 		errs := ValidateSlotFields(pool)
 		g.Expect(errs).To(HaveLen(3)) // duplicate name, unitNumber, mountPath
+	})
+
+	t.Run("flags normalized duplicate mountPath", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := &infrav1.VSphereMachineConfigPool{
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: "host-1",
+					Network:  validNetwork,
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "data-1", SizeGiB: 10, UnitNumber: int32Ptr(1), MountPath: "/data"},
+						{Name: "data-2", SizeGiB: 10, UnitNumber: int32Ptr(2), MountPath: "/data/"},
+					},
+				}},
+			},
+		}
+		errs := ValidateSlotFields(pool)
+		g.Expect(errs).To(HaveLen(1))
+		g.Expect(errs[0].Field).To(Equal("spec.configs[0].persistentDisks[1].mountPath"))
+	})
+
+	t.Run("rejects invalid mountPath values", func(t *testing.T) {
+		testCases := []struct {
+			name      string
+			mountPath string
+		}{
+			{name: "relative", mountPath: "data"},
+			{name: "tab", mountPath: "/data\tlogs"},
+			{name: "newline", mountPath: "/data\nlogs"},
+			{name: "root", mountPath: "/"},
+		}
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				g := NewWithT(t)
+				pool := &infrav1.VSphereMachineConfigPool{
+					Spec: infrav1.VSphereMachineConfigPoolSpec{
+						Configs: []infrav1.MachineConfigSlot{{
+							Hostname: "host-1",
+							Network:  validNetwork,
+							PersistentDisks: []infrav1.PersistentDisk{
+								{Name: "data", SizeGiB: 10, UnitNumber: int32Ptr(1), MountPath: tc.mountPath},
+							},
+						}},
+					},
+				}
+				errs := ValidateSlotFields(pool)
+				g.Expect(errs).To(HaveLen(1))
+				g.Expect(errs[0].Field).To(Equal("spec.configs[0].persistentDisks[0].mountPath"))
+			})
+		}
 	})
 
 	t.Run("valid ephemeral disks alongside persistent disks have no errors", func(t *testing.T) {
@@ -1222,6 +1290,14 @@ func TestValidateAllocatedSlotsImmutable(t *testing.T) {
 		g := NewWithT(t)
 		oldPool := allocatedPool()
 		g.Expect(ValidateAllocatedSlotsImmutable(oldPool, oldPool.DeepCopy())).To(BeEmpty())
+	})
+
+	t.Run("allows normalized equivalent mountPath on allocated disk", func(t *testing.T) {
+		g := NewWithT(t)
+		oldPool := allocatedPool()
+		newPool := oldPool.DeepCopy()
+		newPool.Spec.Configs[0].PersistentDisks[0].MountPath = "/var/lib/etcd/"
+		g.Expect(ValidateAllocatedSlotsImmutable(oldPool, newPool)).To(BeEmpty())
 	})
 
 	t.Run("rejects removing an allocated slot", func(t *testing.T) {

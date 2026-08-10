@@ -58,6 +58,19 @@ func TestVSphereMachineConfigPoolValidateCreate(t *testing.T) {
 		g.Expect(err.Error()).To(ContainSubstring("primary"))
 	})
 
+	t.Run("reject additional network without networkName", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool()
+		pool.Spec.Configs[0].Network = &infrav1.MachineConfigSlotNetwork{
+			Primary:    infrav1.NetworkConfig{NetworkName: "net"},
+			Additional: []infrav1.NetworkConfig{{}},
+		}
+		webhook := &VSphereMachineConfigPool{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()}
+		_, err := webhook.ValidateCreate(context.Background(), pool)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("additional"))
+	})
+
 	t.Run("reject invalid hostname for kubernetes node name", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := newPool()
