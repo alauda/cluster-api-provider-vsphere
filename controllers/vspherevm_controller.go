@@ -173,10 +173,6 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereVM); err != nil || isPaused || requeue {
-		return ctrl.Result{}, err
-	}
-
 	originalTaskRef := vsphereVM.Status.TaskRef
 	// Always issue a patch when exiting this function so changes to the
 	// resource are patched back to the API server, even on early returns.
@@ -206,6 +202,8 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 				infrav1.VCenterAvailableCondition,
 				infrav1.IPAddressClaimedCondition,
 				infrav1.VMProvisionedCondition,
+				infrav1.BootstrapReadyCondition,
+				infrav1.PoweredOnCondition,
 			),
 		)
 
@@ -213,11 +211,15 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 			v1beta2conditions.ForConditionTypes{
 				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
 				infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+				infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+				infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			},
 			v1beta2conditions.IgnoreTypesIfMissing{
 				infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
+				infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 				infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+				infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			},
 			// Using a custom merge strategy to override reasons applied during merge.
 			v1beta2conditions.CustomMergeStrategy{
@@ -239,7 +241,9 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 			infrav1.VSphereVMReadyV1Beta2Condition,
 			infrav1.VSphereVMVCenterAvailableV1Beta2Condition,
 			infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+			infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 			infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Condition,
+			infrav1.VSphereVMPoweredOnV1Beta2Condition,
 			infrav1.VSphereVMGuestSoftPowerOffSucceededV1Beta2Condition,
 			infrav1.VSphereVMPCIDevicesDetachedV1Beta2Condition,
 			clusterv1.PausedV1Beta2Condition,
@@ -264,6 +268,12 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 			reterr = kerrors.NewAggregate([]error{reterr, err})
 		}
 	}()
+
+	if vsphereVM.DeletionTimestamp.IsZero() {
+		if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereVM); err != nil || isPaused || requeue {
+			return ctrl.Result{}, err
+		}
+	}
 
 	authSession, err := r.retrieveVcenterSession(ctx, vsphereVM)
 	if err != nil {
@@ -381,7 +391,11 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 				}
 				for i := range pool.Spec.Configs {
 					if pool.Spec.Configs[i].Hostname == hostname {
-						slot = &pool.Spec.Configs[i]
+						slotCopy := pool.Spec.Configs[i]
+						slotCopy.PersistentDisks = append([]infrav1.PersistentDisk(nil), pool.Spec.Configs[i].PersistentDisks...)
+						slotCopy.EphemeralDisks = append([]infrav1.EphemeralDisk(nil), pool.Spec.Configs[i].EphemeralDisks...)
+						services.HydrateSlotFromStatus(pool, &slotCopy)
+						slot = &slotCopy
 						break
 					}
 				}
@@ -680,7 +694,7 @@ func (r vmReconciler) reconcileNormal(ctx context.Context, vmCtx *capvcontext.VM
 	if vmCtx.MachineConfigSlot != nil {
 		machine, err := util.GetOwnerVSphereMachine(ctx, r.Client, vmCtx.VSphereVM.ObjectMeta)
 		if err == nil && machine != nil && machine.Spec.MachineConfigPoolRef != nil {
-			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.MachineConfigPoolRef, vmCtx.MachineConfigSlot); err != nil {
+			if err := services.PersistSlotChanges(ctx, r.Client, machine.Spec.MachineConfigPoolRef, vmCtx.MachineConfigSlot, machine.Name, string(machine.UID)); err != nil {
 				return reconcile.Result{}, errors.Wrapf(err, "failed to persist slot changes for vm %s", vmCtx.VSphereVM.Name)
 			}
 		}

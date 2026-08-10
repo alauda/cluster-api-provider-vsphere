@@ -28,6 +28,7 @@ import (
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -996,6 +997,24 @@ func Test_VimMachineService_reconcileNetwork(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(ok).To(BeTrue())
 	})
+	t.Run("returns false when VSphereVM has no IP addresses", func(t *testing.T) {
+		g := NewWithT(t)
+		vsphereVM := getVSphereVM(hostAddr, corev1.ConditionTrue, nil, networkStatus)
+		controllerManagerContext := fake.NewControllerManagerContext(vsphereVM)
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.Machine.SetName(fakeLongClusterName)
+		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		ok, err := vimMachineService.reconcileNetwork(ctx, machineCtx, vsphereVM)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(ok).To(BeFalse())
+		g.Expect(machineCtx.VSphereMachine.Status.Addresses).To(ContainElement(clusterv1.MachineAddress{
+			Type:    clusterv1.MachineInternalDNS,
+			Address: vsphereVM.Name,
+		}))
+		g.Expect(hasMachineIPAddress(machineCtx.VSphereMachine.Status.Addresses)).To(BeFalse())
+	})
 }
 
 func Test_VimMachineService_ReconcileNormal(t *testing.T) {
@@ -1048,6 +1067,23 @@ func Test_VimMachineService_ReconcileNormal(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(requeue).To(BeFalse())
 		g.Expect(machineCtx.VSphereMachine.Status.Ready).To(BeTrue())
+	})
+	t.Run("requeues when VSphereVM is ready but has no IP addresses", func(t *testing.T) {
+		g := NewWithT(t)
+		vsphereVM := getVSphereVM(hostAddr, corev1.ConditionTrue, nil, networkStatus)
+		vsphereVM.Spec.BiosUUID = biosUUID
+		controllerManagerContext := fake.NewControllerManagerContext(vsphereVM)
+		machineCtx := fake.NewMachineContext(ctx, fake.NewClusterContext(ctx, controllerManagerContext), controllerManagerContext)
+		machineCtx.Machine.SetName(fakeLongClusterName)
+		machineCtx.Machine.SetLabels(map[string]string{clusterv1.MachineControlPlaneLabel: "fake-control-plane"})
+		vimMachineService := &VimMachineService{controllerManagerContext.Client}
+
+		requeue, err := vimMachineService.ReconcileNormal(ctx, machineCtx)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(requeue).To(BeTrue())
+		g.Expect(machineCtx.VSphereMachine.Status.Ready).To(BeFalse())
+		g.Expect(conditions.Get(machineCtx.VSphereMachine, infrav1.VMProvisionedCondition).Reason).To(Equal(infrav1.WaitingForNetworkAddressesReason))
+		g.Expect(hasMachineIPAddress(machineCtx.VSphereMachine.Status.Addresses)).To(BeFalse())
 	})
 	t.Run("creates the VSphereVM when no resource found", func(t *testing.T) {
 		g := NewWithT(t)
@@ -1351,4 +1387,54 @@ func Test_GenerateVSphereVMName(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_reconcilePoweredOnCondition(t *testing.T) {
+	newVM := func(set func(*infrav1.VSphereVM)) *infrav1.VSphereVM {
+		vm := &infrav1.VSphereVM{ObjectMeta: metav1.ObjectMeta{Name: "vm", Namespace: "default"}}
+		if set != nil {
+			set(vm)
+		}
+		return vm
+	}
+
+	t.Run("VM has not reported PoweredOn yet: machine condition stays unset", func(t *testing.T) {
+		g := NewWithT(t)
+		machine := &infrav1.VSphereMachine{}
+		reconcilePoweredOnCondition(machine, newVM(nil))
+		g.Expect(v1beta2conditions.Get(machine, infrav1.VSphereMachinePoweredOnV1Beta2Condition)).To(BeNil())
+	})
+
+	t.Run("VM powered off out of band: machine mirrors PoweredOn=False", func(t *testing.T) {
+		g := NewWithT(t)
+		machine := &infrav1.VSphereMachine{}
+		vm := newVM(func(vm *infrav1.VSphereVM) {
+			v1beta2conditions.Set(vm, metav1.Condition{
+				Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+				Status: metav1.ConditionFalse,
+				Reason: infrav1.VSphereVMPoweredOffV1Beta2Reason,
+			})
+		})
+		reconcilePoweredOnCondition(machine, vm)
+		c := v1beta2conditions.Get(machine, infrav1.VSphereMachinePoweredOnV1Beta2Condition)
+		g.Expect(c).ToNot(BeNil())
+		g.Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(c.Reason).To(Equal(infrav1.VSphereVMPoweredOffV1Beta2Reason))
+	})
+
+	t.Run("VM powered on: machine mirrors PoweredOn=True", func(t *testing.T) {
+		g := NewWithT(t)
+		machine := &infrav1.VSphereMachine{}
+		vm := newVM(func(vm *infrav1.VSphereVM) {
+			v1beta2conditions.Set(vm, metav1.Condition{
+				Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+				Status: metav1.ConditionTrue,
+				Reason: infrav1.VSphereVMPoweredOnV1Beta2Reason,
+			})
+		})
+		reconcilePoweredOnCondition(machine, vm)
+		c := v1beta2conditions.Get(machine, infrav1.VSphereMachinePoweredOnV1Beta2Condition)
+		g.Expect(c).ToNot(BeNil())
+		g.Expect(c.Status).To(Equal(metav1.ConditionTrue))
+	})
 }

@@ -97,6 +97,13 @@ const (
 	VSphereClusterClusterModulesDeletingV1Beta2Reason = clusterv1.DeletingV1Beta2Reason
 )
 
+// VSphereCluster's KubeOvnAppReleaseReady condition that will be used in v1Beta2 API version.
+const (
+	// VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition documents kube-ovn AppRelease readiness.
+	// This condition does not contribute to VSphereClusterReadyV1Beta2Condition or VSphereCluster.Status.Ready.
+	VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition = "KubeOvnAppReleaseReady"
+)
+
 // VCenterVersion conveys the API version of the vCenter instance.
 type VCenterVersion string
 
@@ -183,7 +190,7 @@ type VSphereClusterStatus struct {
 // See https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more context.
 type VSphereClusterV1Beta2Status struct {
 	// conditions represents the observations of a VSphereCluster's current state.
-	// Known condition types are Ready, FailureDomainsReady, VCenterAvailable, ClusterModulesReady and Paused.
+	// Known condition types are Ready, FailureDomainsReady, VCenterAvailable, ClusterModulesReady, KubeOvnAppReleaseReady and Paused.
 	// +optional
 	// +listType=map
 	// +listMapKey=type

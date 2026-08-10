@@ -18,7 +18,24 @@ spec:
     singular: vspheremachineconfigpool
   scope: Namespaced
   versions:
-  - name: v1beta1
+  - additionalPrinterColumns:
+    - description: Total configuration slots in the pool
+      jsonPath: .status.total
+      name: Total
+      type: integer
+    - description: Slots free for allocation
+      jsonPath: .status.available
+      name: Available
+      type: integer
+    - description: Slots bound to a machine
+      jsonPath: .status.allocated
+      name: Allocated
+      type: integer
+    - description: Time duration since creation
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1beta1
     schema:
       openAPIV3Schema:
         description: VSphereMachineConfigPool is the Schema for the vspheremachineconfigpools
@@ -107,6 +124,60 @@ spec:
                         If set, it takes precedence over VSphereMachineConfigPool.spec.datacenter.
                         If unset, the pool-level Datacenter acts as the default.
                       type: string
+                    ephemeralDisks:
+                      description: |-
+                        EphemeralDisks are non-persistent data disks. Unlike PersistentDisks they
+                        are created fresh (as empty disks) whenever the slot's VM is (re)created
+                        and deleted together with the VM: they do not participate in detach
+                        preservation, reclaim, or slot-release gating. Their SCSI unit number is
+                        assigned by the controller at clone time and observed in
+                        status.ephemeralDiskStatuses; it is not user-declared.
+                      items:
+                        description: |-
+                          EphemeralDisk defines a non-persistent data disk that is created empty with
+                          the slot's VM and deleted together with it. It mirrors the guest-facing
+                          fields of PersistentDisk (size, placement, mount, format) but omits all
+                          persistence semantics: there is no UnitNumber spec field (the SCSI unit is
+                          controller-assigned at clone time and observed in
+                          status.ephemeralDiskStatuses), no VolumePath/DiskUUID backfill (the backing
+                          vmdk is always newly created), and no WipeFilesystem (a fresh disk is always
+                          empty and formatted from scratch).
+                        properties:
+                          datastore:
+                            description: Datastore is the vSphere datastore name.
+                            type: string
+                          fsFormat:
+                            description: FSFormat is the filesystem format (default
+                              "ext4").
+                            type: string
+                          mountOptions:
+                            description: MountOptions for the filesystem mount.
+                            items:
+                              type: string
+                            type: array
+                          mountPath:
+                            description: MountPath is the mount path inside the VM
+                              guest OS (e.g., "/var/lib/containerd").
+                            type: string
+                          name:
+                            description: |-
+                              Name is the disk name. It shares a namespace with the slot's persistent
+                              disks: a name must be unique across both lists within the slot.
+                            type: string
+                          sizeGiB:
+                            description: SizeGiB is the disk size.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          storagePolicy:
+                            description: StoragePolicy is the vSphere storage policy
+                              name.
+                            type: string
+                        required:
+                        - name
+                        - sizeGiB
+                        type: object
+                      type: array
                     hostname:
                       description: |-
                         Hostname is the unique identifier for this slot and will be assigned to the VM.
@@ -218,6 +289,7 @@ spec:
                           sizeGiB:
                             description: SizeGiB is the disk size.
                             format: int32
+                            minimum: 1
                             type: integer
                           storagePolicy:
                             description: StoragePolicy is the vSphere storage policy
@@ -228,7 +300,12 @@ spec:
                               UnitNumber is the SCSI unit number for the disk (0-15, excluding 7).
                               This ensures consistent disk ordering across VM recreations.
                             format: int32
+                            maximum: 15
+                            minimum: 0
                             type: integer
+                            x-kubernetes-validations:
+                            - message: unit number 7 is reserved for the SCSI controller
+                              rule: self != 7
                           volumePath:
                             description: |-
                               VolumePath is backfilled by the controller after the disk is created.
@@ -248,7 +325,9 @@ spec:
                       type: array
                   required:
                   - hostname
+                  - network
                   type: object
+                minItems: 1
                 type: array
               datacenter:
                 description: |-
@@ -269,6 +348,18 @@ spec:
             description: VSphereMachineConfigPoolStatus defines the observed state
               of VSphereMachineConfigPool.
             properties:
+              allocated:
+                description: |-
+                  Allocated is the number of slots currently bound to a VSphereMachine
+                  (slots in the InUse state).
+                format: int32
+                type: integer
+              available:
+                description: |-
+                  Available is the number of slots currently free for allocation
+                  (slots in the Available state).
+                format: int32
+                type: integer
               conditions:
                 description: Conditions defines current state of the machine config
                   pool.
@@ -466,6 +557,214 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              ephemeralDiskStatuses:
+                description: |-
+                  EphemeralDiskStatuses records the controller-observed SCSI unit number of
+                  each non-persistent disk, keyed by (hostname, disk name). The unit is
+                  assigned at clone time and reused (hydrated back onto the in-memory slot)
+                  on the next reconcile so the guest disk table can address the disk. Unlike
+                  PersistentDiskStatuses this carries no VolumePath/DiskUUID/Phase: ephemeral
+                  disks are recreated with the VM and never reclaimed.
+                items:
+                  description: |-
+                    EphemeralDiskStatus records the controller-observed SCSI unit number of a
+                    single non-persistent disk, keyed by (Hostname, Name). It deliberately omits
+                    VolumePath/DiskUUID/Phase: an ephemeral disk's backing vmdk is always newly
+                    created and deleted with the VM, so there is nothing to reclaim and no
+                    lifecycle to track. The recorded UnitNumber is hydrated back onto the
+                    in-memory slot each reconcile so the guest disk table can address the disk.
+                  properties:
+                    hostname:
+                      description: Hostname is the slot this disk belongs to (matches
+                        MachineConfigSlot.Hostname).
+                      type: string
+                    name:
+                      description: Name is the disk name (matches EphemeralDisk.Name
+                        within the slot).
+                      type: string
+                    unitNumber:
+                      description: |-
+                        UnitNumber is the SCSI unit number the disk was attached at, assigned by
+                        the controller at clone time and reused on the next VM recreation to keep
+                        guest disk addressing stable.
+                      format: int32
+                      type: integer
+                  required:
+                  - hostname
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - hostname
+                - name
+                x-kubernetes-list-type: map
+              persistentDiskStatuses:
+                description: |-
+                  PersistentDiskStatuses tracks the observed state of each persistent disk,
+                  keyed by (hostname, disk name). The controller backfills the vmdk path,
+                  disk UUID, and actually-assigned SCSI unit here instead of writing them
+                  back onto spec, and drives reclaim through the per-disk Phase.
+                items:
+                  description: |-
+                    PersistentDiskStatus tracks the observed state of a single persistent disk.
+                    It replaces the controller-backfilled VolumePath/DiskUUID on spec and the
+                    per-slot ReclaimStatus, keyed by (Hostname, Name).
+                  properties:
+                    diskUUID:
+                      description: |-
+                        DiskUUID is the disk UUID, backfilled after the disk is created. The guest
+                        uses it to identify and mount the disk.
+                      type: string
+                    hostname:
+                      description: Hostname is the slot this disk belongs to (matches
+                        MachineConfigSlot.Hostname).
+                      type: string
+                    lastError:
+                      description: LastError stores the latest reclaim failure, surfaced
+                        when Phase is Error.
+                      type: string
+                    lastTransitionTime:
+                      description: LastTransitionTime is the time Phase last changed.
+                      format: date-time
+                      type: string
+                    name:
+                      description: Name is the disk name (matches PersistentDisk.Name
+                        within the slot).
+                      type: string
+                    ownerMachineName:
+                      description: OwnerMachineName is the name of the Machine currently
+                        owning the disk.
+                      type: string
+                    ownerMachineUID:
+                      description: |-
+                        OwnerMachineUID is the UID of the Machine currently owning the disk. It is
+                        preserved across VM delete/recreate so a rolling upgrade re-attaches the
+                        disk to the rebuilt machine.
+                      type: string
+                    phase:
+                      description: |-
+                        Phase is the observed lifecycle of the disk: Creating -> Attached while in
+                        use, Attached -> Available when the VM is released, and
+                        Available -> Reclaiming -> Reclaimed as the backing is deleted (Error on a
+                        failed reclaim, retried after RetryAfter). Reclaimed is a terminal tombstone:
+                        the backing is gone but the record is kept so the release-1 migration does not
+                        re-seed the disk from spec's frozen VolumePath.
+                      enum:
+                      - Creating
+                      - Attached
+                      - Available
+                      - Reclaiming
+                      - Reclaimed
+                      - Error
+                      type: string
+                    retryAfter:
+                      description: RetryAfter prevents tight retry loops after a failed
+                        reclaim task.
+                      format: date-time
+                      type: string
+                    taskRef:
+                      description: |-
+                        TaskRef tracks the in-flight vCenter reclaim task for this disk. CAPV
+                        reclaims disks asynchronously, so the task moniker is polled across
+                        reconciles (DCS/HCS call their SDKs synchronously and have no equivalent).
+                      type: string
+                    unitNumber:
+                      description: |-
+                        UnitNumber is the SCSI unit number the disk was actually attached at. When
+                        spec does not pin a UnitNumber, this observed value is reused on the next
+                        VM recreation to keep disk ordering stable.
+                      format: int32
+                      type: integer
+                    volumePath:
+                      description: |-
+                        VolumePath is the datastore path to the backing .vmdk, backfilled after
+                        the disk is created.
+                      type: string
+                  required:
+                  - hostname
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - hostname
+                - name
+                x-kubernetes-list-type: map
+              total:
+                description: Total is the total number of configuration slots defined
+                  in the pool.
+                format: int32
+                type: integer
+              v1beta2:
+                description: |-
+                  v1beta2 groups all the fields that will be added or modified in
+                  VSphereMachineConfigPool's status with the V1Beta2 version.
+                properties:
+                  conditions:
+                    description: |-
+                      conditions represents the observations of a VSphereMachineConfigPool's current state.
+                      Known condition types are Ready, MembersValid, MembersUnique, SlotAvailable,
+                      PersistentDisksReady, ClusterRefReady and VCenterAvailable.
+                    items:
+                      description: Condition contains details for one aspect of the
+                        current state of this API Resource.
+                      properties:
+                        lastTransitionTime:
+                          description: |-
+                            lastTransitionTime is the last time the condition transitioned from one status to another.
+                            This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                          format: date-time
+                          type: string
+                        message:
+                          description: |-
+                            message is a human readable message indicating details about the transition.
+                            This may be an empty string.
+                          maxLength: 32768
+                          type: string
+                        observedGeneration:
+                          description: |-
+                            observedGeneration represents the .metadata.generation that the condition was set based upon.
+                            For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                            with respect to the current state of the instance.
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        reason:
+                          description: |-
+                            reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                            Producers of specific condition types may define expected values and meanings for this field,
+                            and whether the values are considered a guaranteed API.
+                            The value should be a CamelCase string.
+                            This field may not be empty.
+                          maxLength: 1024
+                          minLength: 1
+                          pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                          type: string
+                        status:
+                          description: status of the condition, one of True, False,
+                            Unknown.
+                          enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                          type: string
+                        type:
+                          description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                          maxLength: 316
+                          pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                          type: string
+                      required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - type
+                    x-kubernetes-list-type: map
+                type: object
             type: object
         type: object
     served: true

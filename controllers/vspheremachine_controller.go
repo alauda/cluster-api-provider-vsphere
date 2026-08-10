@@ -265,10 +265,6 @@ func (r *machineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		return reconcile.Result{}, err
 	}
 
-	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, machineContext.GetVSphereMachine()); err != nil || isPaused || requeue {
-		return ctrl.Result{}, err
-	}
-
 	machineContext.SetBaseMachineContext(&capvcontext.BaseMachineContext{
 		Cluster:     cluster,
 		Machine:     machine,
@@ -305,6 +301,14 @@ func (r *machineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		if err := v1beta2conditions.SetSummaryCondition(machineContext.GetVSphereMachine(), machineContext.GetVSphereMachine(), infrav1.VSphereMachineReadyV1Beta2Condition,
 			v1beta2conditions.ForConditionTypes{
 				infrav1.VSphereMachineVirtualMachineProvisionedV1Beta2Condition,
+				infrav1.VSphereMachineBootstrapReadyV1Beta2Condition,
+				infrav1.VSphereMachinePoweredOnV1Beta2Condition,
+			},
+			// BootstrapReady and PoweredOn are only mirrored once the underlying VSphereVM reports them; ignore
+			// them while missing so they do not drag the Ready condition to Unknown during provisioning.
+			v1beta2conditions.IgnoreTypesIfMissing{
+				infrav1.VSphereMachineBootstrapReadyV1Beta2Condition,
+				infrav1.VSphereMachinePoweredOnV1Beta2Condition,
 			},
 			// Using a custom merge strategy to override reasons applied during merge.
 			v1beta2conditions.CustomMergeStrategy{
@@ -330,6 +334,10 @@ func (r *machineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 
 	if !machineContext.GetObjectMeta().DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, machineContext)
+	}
+
+	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, machineContext.GetVSphereMachine()); err != nil || isPaused || requeue {
+		return ctrl.Result{}, err
 	}
 
 	// Checking whether cluster is nil here as we still want to run reconcileDelete above even if cluster is not found.

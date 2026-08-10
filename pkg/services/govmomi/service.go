@@ -21,7 +21,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -134,11 +133,20 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 		log.Info("Preparing bootstrap data for new VM create")
 		bootstrapData, format, err := vms.getBootstrapData(ctx, vmCtx)
 		if err != nil {
-			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.VMProvisionedCondition, infrav1.CloningFailedReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
+			// Attribute a precise BootstrapReady reason instead of misreporting these bootstrap-delivery
+			// failures as a clone failure. VMProvisioned stays at CloningReason (provisioning is in progress
+			// but blocked); BootstrapReady carries the real cause and pulls the Ready condition down.
+			reason := infrav1.BootstrapSecretGetFailedReason
+			v1beta2Reason := infrav1.VSphereVMBootstrapSecretGetFailedV1Beta2Reason
+			if _, ok := err.(*bootstrapSecretContentError); ok {
+				reason = infrav1.BootstrapSecretContentInvalidReason
+				v1beta2Reason = infrav1.VSphereVMBootstrapSecretContentInvalidV1Beta2Reason
+			}
+			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.BootstrapReadyCondition, reason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 			v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
-				Type:    infrav1.VSphereVMVirtualMachineProvisionedV1Beta2Condition,
+				Type:    infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
-				Reason:  infrav1.VSphereVMVirtualMachineNotProvisionedV1Beta2Reason,
+				Reason:  v1beta2Reason,
 				Message: err.Error(),
 			})
 			return vm, err
@@ -158,6 +166,13 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 			})
 			return vm, err
 		}
+		// The bootstrap data was delivered to the VM as part of the clone request.
+		conditions.MarkTrue(vmCtx.VSphereVM, infrav1.BootstrapReadyCondition)
+		v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
+			Type:   infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
+			Status: metav1.ConditionTrue,
+			Reason: infrav1.VSphereVMBootstrapReadyV1Beta2Reason,
+		})
 		if err := persistMachineConfigSlotBackfill(ctx, vmCtx); err != nil {
 			return vm, err
 		}
@@ -444,6 +459,21 @@ func (vms *VMService) reconcilePowerState(ctx context.Context, virtualMachineCtx
 	}
 	switch powerState {
 	case infrav1.VirtualMachinePowerStatePoweredOff:
+		// Once the VM has completed its initial power-on, a subsequent powered-off state is treated as an
+		// out-of-band operator action (e.g. stopping the node for maintenance). The controller must not
+		// power it back on; it only reflects the powered-off state and leaves the VM to the operator.
+		if conditions.IsTrue(virtualMachineCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition) {
+			log.Info("VM is powered off after initial power-on; leaving it powered off for out-of-band operation")
+			conditions.MarkFalse(virtualMachineCtx.VSphereVM, infrav1.PoweredOnCondition, infrav1.PoweredOffReason, clusterv1.ConditionSeverityInfo, "VM was powered off out of band after initial power-on")
+			v1beta2conditions.Set(virtualMachineCtx.VSphereVM, metav1.Condition{
+				Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+				Status: metav1.ConditionFalse,
+				Reason: infrav1.VSphereVMPoweredOffV1Beta2Reason,
+			})
+			virtualMachineCtx.VSphereVM.Status.Ready = false
+			return false, nil
+		}
+
 		log.Info("Powering on VM")
 		task, err := virtualMachineCtx.Obj.PowerOn(ctx)
 		if err != nil {
@@ -477,6 +507,16 @@ func (vms *VMService) reconcilePowerState(ctx context.Context, virtualMachineCtx
 		return false, nil
 	case infrav1.VirtualMachinePowerStatePoweredOn:
 		log.Info("VM is powered on")
+		// Latch the initial power-on: once set to True this condition never changes and gates whether a
+		// later powered-off VM is powered back on (it is not).
+		conditions.MarkTrue(virtualMachineCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)
+		// Reflect the real-time power state; this is aggregated into the Ready condition.
+		conditions.MarkTrue(virtualMachineCtx.VSphereVM, infrav1.PoweredOnCondition)
+		v1beta2conditions.Set(virtualMachineCtx.VSphereVM, metav1.Condition{
+			Type:   infrav1.VSphereVMPoweredOnV1Beta2Condition,
+			Status: metav1.ConditionTrue,
+			Reason: infrav1.VSphereVMPoweredOnV1Beta2Reason,
+		})
 		return true, nil
 	default:
 		return false, errors.Errorf("unexpected power state %q for vm %s", powerState, virtualMachineCtx)
@@ -787,8 +827,12 @@ func (vms *VMService) reconcileBootstrapUserData(ctx context.Context, virtualMac
 		return false, err
 	}
 
-	if virtualMachineCtx.MachineConfigSlot != nil && len(virtualMachineCtx.MachineConfigSlot.PersistentDisks) > 0 {
-		diskConfig, err := util.GetPersistentDiskCloudConfig(virtualMachineCtx.MachineConfigSlot.PersistentDisks)
+	if virtualMachineCtx.MachineConfigSlot != nil &&
+		(len(virtualMachineCtx.MachineConfigSlot.PersistentDisks) > 0 || len(virtualMachineCtx.MachineConfigSlot.EphemeralDisks) > 0) {
+		diskConfig, err := util.GetPersistentDiskCloudConfig(
+			virtualMachineCtx.MachineConfigSlot.PersistentDisks,
+			virtualMachineCtx.MachineConfigSlot.EphemeralDisks,
+		)
 		if err != nil {
 			return false, err
 		}
@@ -861,14 +905,27 @@ func (vms *VMService) getNetworkStatus(ctx context.Context, virtualMachineCtx *v
 	return apiNetStatus, nil
 }
 
+// bootstrapSecretGetError wraps a failure to read the bootstrap data Secret so the caller can surface a
+// BootstrapSecretGetFailed reason distinct from a genuine clone failure.
+type bootstrapSecretGetError struct{ err error }
+
+func (e *bootstrapSecretGetError) Error() string { return e.err.Error() }
+func (e *bootstrapSecretGetError) Unwrap() error { return e.err }
+
+// bootstrapSecretContentError indicates the bootstrap data Secret was read but is missing required content.
+type bootstrapSecretContentError struct{ msg string }
+
+func (e *bootstrapSecretContentError) Error() string { return e.msg }
+
 // getBootstrapData obtains a machine's bootstrap data from the relevant k8s secret and returns the
-// data and its format.
+// data and its format. Failures are returned as typed errors (bootstrapSecretGetError,
+// bootstrapSecretContentError) so callers can attribute a precise BootstrapReady reason.
 func (vms *VMService) getBootstrapData(ctx context.Context, vmCtx *capvcontext.VMContext) ([]byte, bootstrapv1.Format, error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	secret, err := vms.getBootstrapSecret(ctx, vmCtx)
 	if err != nil {
-		return nil, "", err
+		return nil, "", &bootstrapSecretGetError{err: err}
 	}
 	if secret == nil {
 		log.Info("VM has no bootstrap data")
@@ -883,7 +940,7 @@ func (vms *VMService) getBootstrapData(ctx context.Context, vmCtx *capvcontext.V
 
 	value, ok := secret.Data["value"]
 	if !ok {
-		return nil, "", errors.New("error retrieving bootstrap data: secret value key is missing")
+		return nil, "", &bootstrapSecretContentError{msg: "error retrieving bootstrap data: secret value key is missing"}
 	}
 
 	log.Info("Loaded bootstrap data", "format", string(format), "bytes", len(value), "hasMachineConfigSlot", vmCtx.MachineConfigSlot != nil)
@@ -1190,11 +1247,18 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 	scsiKeys := findSCSIControllerKeys(devices)
 	updated := false
 	usedDiskKeys := map[int32]struct{}{}
-	referencedDiskKeys := findReferencedPersistentDiskKeys(virtualMachineCtx.MachineConfigSlot.PersistentDisks, disks, scsiKeys)
 
 	for i := range virtualMachineCtx.MachineConfigSlot.PersistentDisks {
 		pd := &virtualMachineCtx.MachineConfigSlot.PersistentDisks[i]
-		disk := findPersistentDiskDevice(pd, disks, usedDiskKeys, referencedDiskKeys, scsiKeys)
+		// For a freshly created disk whose status write was lost, VolumePath is
+		// empty; re-derive the deterministic path assigned at clone time so Tier 1
+		// can still self-heal. Existing disks carry a recorded VolumePath and never
+		// reach this derivation.
+		expectedPath := ""
+		if pd.VolumePath == "" {
+			expectedPath = util.DeterministicDiskPath(virtualMachineCtx.VSphereVM.Name, pd.Datastore, pd.Name)
+		}
+		disk := findPersistentDiskDevice(pd, expectedPath, disks, usedDiskKeys, scsiKeys)
 		if disk == nil {
 			continue
 		}
@@ -1241,30 +1305,42 @@ func findSCSIControllerKeys(devices object.VirtualDeviceList) map[int32]struct{}
 }
 
 // findPersistentDiskDevice locates the VM disk that corresponds to a persistent
-// disk spec. It uses a three-tier match strategy:
-//  1. VolumePath (exact VMDK file path — globally unique, most reliable)
-//  2. UnitNumber on a SCSI controller (stable across VM recreations when the
-//     same unit is reused)
-//  3. Capacity on a SCSI controller (last resort; chooses the first deterministic
-//     unused and unreferenced candidate)
+// disk spec. It uses a two-tier match strategy:
+//  1. VolumePath (exact VMDK file path — globally unique, most reliable). The
+//     recorded VolumePath is preferred; for a freshly created disk whose status
+//     write was lost, expectedPath (the deterministic path re-derived by the
+//     caller) is used as a self-healing fallback. Both compare against the disk's
+//     backing file name, so a false match is not possible.
+//  2. UnitNumber on a SCSI controller (fallback for disks on an unnamed datastore;
+//     stable across VM recreations when the same unit is reused).
 //
-// Tiers 2 and 3 are restricted to SCSI controllers because CAPV always places
-// persistent data disks on SCSI. This prevents false matches against the OS
-// disk when it lives on an IDE or SATA controller.
-func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDeviceList, usedDiskKeys, referencedDiskKeys map[int32]struct{}, scsiKeys map[int32]struct{}) *types.VirtualDisk {
+// There is deliberately no capacity-based tier: identity comes from the path or
+// the unit, both of which are exact. If neither matches, the disk cannot be
+// safely identified — returning nil lets ValidatePersistentDiskBackfill refuse
+// power-on rather than silently attach the wrong same-size disk.
+//
+// Tier 2 is restricted to SCSI controllers because CAPV always places persistent
+// data disks on SCSI. This prevents false matches against the OS disk when it
+// lives on an IDE or SATA controller.
+func findPersistentDiskDevice(pd *infrav1.PersistentDisk, expectedPath string, disks object.VirtualDeviceList, usedDiskKeys, scsiKeys map[int32]struct{}) *types.VirtualDisk {
 	if pd == nil {
 		return nil
 	}
 
-	// Tier 1: match by VolumePath (any controller — the path is unique).
-	if pd.VolumePath != "" {
+	// Tier 1: match by VolumePath (any controller — the path is unique). Prefer the
+	// recorded path; fall back to the deterministic path re-derived at clone time.
+	matchPath := pd.VolumePath
+	if matchPath == "" {
+		matchPath = expectedPath
+	}
+	if matchPath != "" {
 		for _, d := range disks {
 			disk := d.(*types.VirtualDisk)
 			if _, used := usedDiskKeys[disk.Key]; used {
 				continue
 			}
 			if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
-				if backing.FileName == pd.VolumePath {
+				if backing.FileName == matchPath {
 					return disk
 				}
 			}
@@ -1288,104 +1364,7 @@ func findPersistentDiskDevice(pd *infrav1.PersistentDisk, disks object.VirtualDe
 		}
 	}
 
-	expectedCapacityKB := int64(pd.SizeGiB) * 1024 * 1024
-	candidates := []*types.VirtualDisk{}
-	for _, d := range disks {
-		disk := d.(*types.VirtualDisk)
-		if _, onSCSI := scsiKeys[disk.GetVirtualDevice().ControllerKey]; !onSCSI {
-			continue
-		}
-		if _, used := usedDiskKeys[disk.Key]; used {
-			continue
-		}
-		if _, referenced := referencedDiskKeys[disk.Key]; referenced {
-			continue
-		}
-		if disk.CapacityInKB != expectedCapacityKB {
-			continue
-		}
-		candidates = append(candidates, disk)
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return compareVirtualDisks(candidates[i], candidates[j]) < 0
-	})
-	return candidates[0]
-}
-
-func findReferencedPersistentDiskKeys(persistentDisks []infrav1.PersistentDisk, disks object.VirtualDeviceList, scsiKeys map[int32]struct{}) map[int32]struct{} {
-	referenced := map[int32]struct{}{}
-	for i := range persistentDisks {
-		pd := &persistentDisks[i]
-		if pd.VolumePath != "" {
-			for _, d := range disks {
-				disk := d.(*types.VirtualDisk)
-				if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok && backing.FileName == pd.VolumePath {
-					referenced[disk.Key] = struct{}{}
-				}
-			}
-		}
-		if pd.UnitNumber != nil {
-			for _, d := range disks {
-				disk := d.(*types.VirtualDisk)
-				if _, onSCSI := scsiKeys[disk.GetVirtualDevice().ControllerKey]; !onSCSI {
-					continue
-				}
-				if disk.UnitNumber != nil && *disk.UnitNumber == *pd.UnitNumber {
-					referenced[disk.Key] = struct{}{}
-				}
-			}
-		}
-	}
-	return referenced
-}
-
-func compareVirtualDisks(a, b *types.VirtualDisk) int {
-	if a.GetVirtualDevice().ControllerKey != b.GetVirtualDevice().ControllerKey {
-		if a.GetVirtualDevice().ControllerKey < b.GetVirtualDevice().ControllerKey {
-			return -1
-		}
-		return 1
-	}
-	if compareUnitNumber(a.UnitNumber, b.UnitNumber) != 0 {
-		return compareUnitNumber(a.UnitNumber, b.UnitNumber)
-	}
-	if a.Key != b.Key {
-		if a.Key < b.Key {
-			return -1
-		}
-		return 1
-	}
-	aPath := diskBackingFileName(a)
-	bPath := diskBackingFileName(b)
-	if aPath < bPath {
-		return -1
-	}
-	if aPath > bPath {
-		return 1
-	}
-	return 0
-}
-
-func compareUnitNumber(a, b *int32) int {
-	if a == nil && b == nil {
-		return 0
-	}
-	if a == nil {
-		return 1
-	}
-	if b == nil {
-		return -1
-	}
-	if *a < *b {
-		return -1
-	}
-	if *a > *b {
-		return 1
-	}
-	return 0
+	return nil
 }
 
 func diskBackingFileName(disk *types.VirtualDisk) string {
@@ -1416,11 +1395,11 @@ func persistMachineConfigSlotBackfill(ctx context.Context, vmCtx *capvcontext.VM
 			return errors.Wrapf(err, "failed to get machine config pool for vm %s", vmCtx.VSphereVM.Name)
 		}
 
-		if !services.ApplyDiskBackfill(pool, vmCtx.MachineConfigSlot) {
+		if !services.ApplyDiskBackfill(pool, vmCtx.MachineConfigSlot, machine.Name, string(machine.UID)) {
 			return nil
 		}
 
-		if err := vmCtx.Client.Update(ctx, pool); err != nil {
+		if err := vmCtx.Client.Status().Update(ctx, pool); err != nil {
 			if apierrors.IsConflict(err) {
 				continue
 			}

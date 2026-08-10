@@ -37,8 +37,11 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -389,6 +392,100 @@ func TestResolveNodeIdentityAllowsMissingNodeIP(t *testing.T) {
 	})
 }
 
+func TestReconcilePowerStateInitialPowerOnLatch(t *testing.T) {
+	newVSphereVM := func() *infrav1.VSphereVM {
+		return &infrav1.VSphereVM{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vspherevm1",
+				Namespace: "default",
+			},
+		}
+	}
+
+	t.Run("powered-on VM latches InitialPowerOnCompleted and reflects PoweredOn", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			finder := find.NewFinder(c)
+			vm, err := finder.VirtualMachine(ctx, "DC0_H0_VM0") // powered on by default
+			g.Expect(err).ToNot(HaveOccurred())
+
+			vmCtx := emptyVirtualMachineContext()
+			vmCtx.Obj = vm
+			vmCtx.VSphereVM = newVSphereVM()
+
+			ok, err := (&VMService{}).reconcilePowerState(ctx, vmCtx)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(ok).To(BeTrue())
+			g.Expect(conditions.IsTrue(vmCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)).To(BeTrue())
+			g.Expect(conditions.IsTrue(vmCtx.VSphereVM, infrav1.PoweredOnCondition)).To(BeTrue())
+			return nil
+		})
+	})
+
+	t.Run("once latched a powered-off VM is not powered back on and surfaces not ready", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			vm, err := getPoweredoffVM(ctx, c)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			vmCtx := emptyVirtualMachineContext()
+			vmCtx.Obj = vm
+			vmCtx.VSphereVM = newVSphereVM()
+			// Simulate a VM that has already completed its initial power-on and is now
+			// stopped out of band by an operator.
+			conditions.MarkTrue(vmCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)
+			vmCtx.VSphereVM.Status.Ready = true
+
+			ok, err := (&VMService{}).reconcilePowerState(ctx, vmCtx)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(ok).To(BeFalse())
+
+			// The controller must not power the VM back on.
+			powerState, err := vm.PowerState(ctx)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(powerState).To(Equal(types.VirtualMachinePowerStatePoweredOff))
+
+			// The powered-off state is reflected and drags Ready down.
+			g.Expect(conditions.IsFalse(vmCtx.VSphereVM, infrav1.PoweredOnCondition)).To(BeTrue())
+			g.Expect(conditions.GetReason(vmCtx.VSphereVM, infrav1.PoweredOnCondition)).To(Equal(infrav1.PoweredOffReason))
+			g.Expect(vmCtx.VSphereVM.Status.Ready).To(BeFalse())
+			// The latch itself is never cleared.
+			g.Expect(conditions.IsTrue(vmCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)).To(BeTrue())
+			return nil
+		})
+	})
+
+	t.Run("before the latch a powered-off VM is powered on as part of provisioning", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			vm, err := getPoweredoffVM(ctx, c)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			scheme := runtime.NewScheme()
+			g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+			vsphereVM := newVSphereVM()
+			cl := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(vsphereVM).WithStatusSubresource(vsphereVM).Build()
+			helper, err := patch.NewHelper(vsphereVM, cl)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			vmCtx := emptyVirtualMachineContext()
+			vmCtx.Obj = vm
+			vmCtx.VSphereVM = vsphereVM
+			vmCtx.PatchHelper = helper
+
+			ok, err := (&VMService{}).reconcilePowerState(ctx, vmCtx)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(ok).To(BeFalse())
+			// A power-on task was triggered and the latch is not set yet: it only latches
+			// once the VM is actually observed powered on.
+			g.Expect(vmCtx.VSphereVM.Status.TaskRef).ToNot(BeEmpty())
+			g.Expect(conditions.IsTrue(vmCtx.VSphereVM, infrav1.InitialPowerOnCompletedCondition)).To(BeFalse())
+			return nil
+		})
+	})
+}
+
 func getAuthSession(ctx context.Context, server string) (*session.Session, error) {
 	password, _ := simulator.DefaultLogin.Password()
 	return session.GetOrCreate(
@@ -438,6 +535,80 @@ func getPoweredoffVM(ctx context.Context, c *vim25.Client) (*object.VirtualMachi
 
 	_, err = vm.PowerOff(ctx)
 	return vm, err
+}
+
+func TestDetachPersistentDisksIgnoresEphemeralDisks(t *testing.T) {
+	vms := &VMService{}
+
+	dataDiskCount := func(ctx context.Context, vm *object.VirtualMachine) (int, int32) {
+		devices, err := vm.Device(ctx)
+		if err != nil {
+			return -1, 0
+		}
+		disks := devices.SelectByType((*types.VirtualDisk)(nil))
+		var unit int32
+		if len(disks) > 0 {
+			if u := disks[0].(*types.VirtualDisk).UnitNumber; u != nil {
+				unit = *u
+			}
+		}
+		return len(disks), unit
+	}
+
+	newVMCtx := func(vm *object.VirtualMachine, slot *infrav1.MachineConfigSlot) *virtualMachineContext {
+		vmCtx := emptyVirtualMachineContext()
+		vmCtx.Obj = vm
+		vmCtx.VSphereVM = &infrav1.VSphereVM{
+			ObjectMeta: metav1.ObjectMeta{Name: "vspherevm1", Namespace: "default"},
+		}
+		vmCtx.MachineConfigSlot = slot
+		return vmCtx
+	}
+
+	t.Run("a slot with only ephemeral disks detaches nothing", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			vm, err := getPoweredoffVM(ctx, c)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			before, unit := dataDiskCount(ctx, vm)
+			g.Expect(before).To(BeNumerically(">", 0))
+
+			// The ephemeral disk even names the attached disk's unit; detach must
+			// still leave it in place because it only ever operates on persistent
+			// disks.
+			slot := &infrav1.MachineConfigSlot{
+				Hostname:       "worker-01",
+				EphemeralDisks: []infrav1.EphemeralDisk{{Name: "cache-1", SizeGiB: 10, UnitNumber: ptr.To(unit)}},
+			}
+			g.Expect(vms.detachPersistentDisks(ctx, newVMCtx(vm, slot))).To(Succeed())
+
+			after, _ := dataDiskCount(ctx, vm)
+			g.Expect(after).To(Equal(before), "ephemeral disks must not be detached")
+			return nil
+		})
+	})
+
+	t.Run("control: a persistent disk at the same unit is detached", func(t *testing.T) {
+		g := NewWithT(t)
+		simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+			vm, err := getPoweredoffVM(ctx, c)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			before, unit := dataDiskCount(ctx, vm)
+			g.Expect(before).To(BeNumerically(">", 0))
+
+			slot := &infrav1.MachineConfigSlot{
+				Hostname:        "worker-01",
+				PersistentDisks: []infrav1.PersistentDisk{{Name: "data-1", SizeGiB: 10, UnitNumber: ptr.To(unit)}},
+			}
+			g.Expect(vms.detachPersistentDisks(ctx, newVMCtx(vm, slot))).To(Succeed())
+
+			after, _ := dataDiskCount(ctx, vm)
+			g.Expect(after).To(Equal(before-1), "the persistent disk at the matched unit should be detached")
+			return nil
+		})
+	})
 }
 
 func storagePolicyModel() (*simulator.Model, error) {
@@ -548,7 +719,30 @@ func TestFindPersistentDiskDevice(t *testing.T) {
 		disk := newDisk(1, ideKey, int32Ptr(0), 20, "[ds] vm/data.vmdk")
 		disks := object.VirtualDeviceList{disk}
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, VolumePath: "[ds] vm/data.vmdk"}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).NotTo(BeNil())
+		g.Expect(result.Key).To(Equal(int32(1)))
+	})
+
+	t.Run("tier1 self-heal: match by derived expectedPath when VolumePath lost", func(t *testing.T) {
+		g := NewWithT(t)
+		// Status write was lost so pd.VolumePath is empty, but the disk was created
+		// at the deterministic path; expectedPath re-derives it and matches.
+		disk := newDisk(1, scsiKey, int32Ptr(3), 20, "[ds] vm/data.vmdk")
+		disks := object.VirtualDeviceList{disk}
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
+		result := findPersistentDiskDevice(pd, "[ds] vm/data.vmdk", disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).NotTo(BeNil())
+		g.Expect(result.Key).To(Equal(int32(1)))
+	})
+
+	t.Run("tier1: recorded VolumePath takes precedence over expectedPath", func(t *testing.T) {
+		g := NewWithT(t)
+		recorded := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/recorded.vmdk")
+		derived := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/derived.vmdk")
+		disks := object.VirtualDeviceList{recorded, derived}
+		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, VolumePath: "[ds] vm/recorded.vmdk"}
+		result := findPersistentDiskDevice(pd, "[ds] vm/derived.vmdk", disks, map[int32]struct{}{}, scsiKeys)
 		g.Expect(result).NotTo(BeNil())
 		g.Expect(result.Key).To(Equal(int32(1)))
 	})
@@ -560,7 +754,7 @@ func TestFindPersistentDiskDevice(t *testing.T) {
 		disks := object.VirtualDeviceList{osDisk, dataDisk}
 
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, UnitNumber: int32Ptr(0)}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
 		g.Expect(result).NotTo(BeNil())
 		g.Expect(result.Key).To(Equal(int32(2)), "should match SCSI disk, not IDE OS disk")
 	})
@@ -571,77 +765,39 @@ func TestFindPersistentDiskDevice(t *testing.T) {
 		disks := object.VirtualDeviceList{osDisk}
 
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20, UnitNumber: int32Ptr(1)}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
 		g.Expect(result).To(BeNil(), "should not match IDE disk by unit number")
 	})
 
-	t.Run("tier3: capacity match on SCSI only", func(t *testing.T) {
+	t.Run("no capacity fallback: same-size SCSI disks without path or unit return nil", func(t *testing.T) {
 		g := NewWithT(t)
-		osDisk := newDisk(1, ideKey, int32Ptr(0), 20, "[ds] vm/os.vmdk")
-		dataDisk := newDisk(2, scsiKey, int32Ptr(0), 20, "[ds] vm/data.vmdk")
-		disks := object.VirtualDeviceList{osDisk, dataDisk}
-
-		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
-		g.Expect(result).NotTo(BeNil())
-		g.Expect(result.Key).To(Equal(int32(2)), "should match SCSI disk by capacity, not IDE")
-	})
-
-	t.Run("tier3: duplicate capacity chooses first deterministic unused candidate", func(t *testing.T) {
-		g := NewWithT(t)
-		d1 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
-		d2 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
-		disks := object.VirtualDeviceList{d1, d2}
-
-		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
-		g.Expect(result).NotTo(BeNil())
-		g.Expect(result.Key).To(Equal(int32(1)))
-	})
-
-	t.Run("tier3: skips used duplicate capacity candidates", func(t *testing.T) {
-		g := NewWithT(t)
+		// Two same-capacity SCSI disks, but pd carries neither a path nor a unit —
+		// the removed tier 3 would have guessed one; now the match must fail so
+		// ValidatePersistentDiskBackfill refuses power-on instead of guessing.
 		d1 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
 		d2 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
 		disks := object.VirtualDeviceList{d1, d2}
 
-		used := map[int32]struct{}{1: {}}
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-		result := findPersistentDiskDevice(pd, disks, used, map[int32]struct{}{}, scsiKeys)
-		g.Expect(result).NotTo(BeNil())
-		g.Expect(result.Key).To(Equal(int32(2)))
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).To(BeNil())
 	})
 
-	t.Run("tier3: skips referenced duplicate capacity candidates", func(t *testing.T) {
+	t.Run("no capacity fallback: single same-size candidate still returns nil", func(t *testing.T) {
 		g := NewWithT(t)
-		d1 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
-		d2 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
-		disks := object.VirtualDeviceList{d1, d2}
+		// Even a lone same-size candidate is not enough: identity must come from
+		// path or unit, not capacity.
+		only := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
+		disks := object.VirtualDeviceList{only}
 
-		referenced := findReferencedPersistentDiskKeys([]infrav1.PersistentDisk{{Name: "other", UnitNumber: int32Ptr(0)}}, disks, scsiKeys)
 		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-		result := findPersistentDiskDevice(pd, disks, map[int32]struct{}{}, referenced, scsiKeys)
-		g.Expect(result).NotTo(BeNil())
-		g.Expect(result.Key).To(Equal(int32(2)))
-	})
-
-	t.Run("tier3: input device order does not affect deterministic selection", func(t *testing.T) {
-		g := NewWithT(t)
-		d1 := newDisk(1, scsiKey, int32Ptr(0), 20, "[ds] vm/d1.vmdk")
-		d2 := newDisk(2, scsiKey, int32Ptr(1), 20, "[ds] vm/d2.vmdk")
-		pd := &infrav1.PersistentDisk{Name: "d", SizeGiB: 20}
-
-		resultA := findPersistentDiskDevice(pd, object.VirtualDeviceList{d1, d2}, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
-		resultB := findPersistentDiskDevice(pd, object.VirtualDeviceList{d2, d1}, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
-		g.Expect(resultA).NotTo(BeNil())
-		g.Expect(resultB).NotTo(BeNil())
-		g.Expect(resultA.Key).To(Equal(int32(1)))
-		g.Expect(resultB.Key).To(Equal(int32(1)))
+		result := findPersistentDiskDevice(pd, "", disks, map[int32]struct{}{}, scsiKeys)
+		g.Expect(result).To(BeNil())
 	})
 
 	t.Run("nil pd returns nil", func(t *testing.T) {
 		g := NewWithT(t)
-		result := findPersistentDiskDevice(nil, object.VirtualDeviceList{}, map[int32]struct{}{}, map[int32]struct{}{}, scsiKeys)
+		result := findPersistentDiskDevice(nil, "", object.VirtualDeviceList{}, map[int32]struct{}{}, scsiKeys)
 		g.Expect(result).To(BeNil())
 	})
 }

@@ -38,6 +38,22 @@ const (
 	// FailureDomainsExhaustedByMachineConfigPoolReason (Severity=Warning) documents that all failure domains
 	// were excluded because their datacenters have no available machine config pool slots.
 	FailureDomainsExhaustedByMachineConfigPoolReason = "FailureDomainsExhaustedByMachineConfigPool"
+
+	// KubeOvnAppReleaseReadyCondition documents kube-ovn AppRelease readiness.
+	// It does not gate VSphereCluster.Status.Ready.
+	KubeOvnAppReleaseReadyCondition clusterv1.ConditionType = "KubeOvnAppReleaseReady"
+
+	// KubeOvnAppReleaseReadyReason documents that the kube-ovn AppRelease is synced and healthy.
+	KubeOvnAppReleaseReadyReason = "AppReleaseReady"
+
+	// KubeOvnAppReleaseReconcilingReason documents that the kube-ovn AppRelease is being created, updated, or waiting for status.
+	KubeOvnAppReleaseReconcilingReason = "AppReleaseReconciling"
+
+	// KubeOvnAppReleaseNotReadyReason documents that the kube-ovn AppRelease is observed but not ready.
+	KubeOvnAppReleaseNotReadyReason = "AppReleaseNotReady"
+
+	// KubeOvnAppReleaseInvalidConfigurationReason documents invalid kube-ovn AppRelease input configuration.
+	KubeOvnAppReleaseInvalidConfigurationReason = "InvalidKubeOvnConfiguration"
 )
 
 // Conditions and condition Reasons for the VSphereMachine and the VSphereVM object.
@@ -115,6 +131,43 @@ const (
 	// NotFoundReason (Severity=Warning) documents the VSphereVM not having the PCI device attached during VM startup.
 	// This would indicate that the PCI devices were removed out of band by an external entity.
 	NotFoundReason = "NotFound"
+
+	// InitialPowerOnCompletedCondition is a one-way latch documenting that the VSphereVM has completed its
+	// initial power-on. Once the VM is first observed powered on it is set to True and never changes again.
+	// The controller uses it to decide whether to power on a VM found powered off: while unset the VM is
+	// powered on as part of provisioning; once set, a powered-off VM is treated as an out-of-band operator
+	// action (e.g. maintenance) and is not powered back on.
+	//
+	// NOTE: This condition is internal to VSphereVM and is not aggregated into the Ready condition.
+	InitialPowerOnCompletedCondition clusterv1.ConditionType = "InitialPowerOnCompleted"
+
+	// PoweredOnCondition reflects the real-time power state of the underlying VM. It is aggregated into the
+	// VSphereVM Ready condition; the owning VSphereMachine in turn mirrors the VSphereVM Ready condition, so a
+	// VM that was powered off out of band after its initial power-on surfaces as not ready on both objects.
+	PoweredOnCondition clusterv1.ConditionType = "PoweredOn"
+
+	// PoweredOffReason (Severity=Info) documents that the VM is powered off after its initial power-on
+	// completed, i.e. it was stopped out of band and the controller intentionally does not power it back on.
+	PoweredOffReason = "PoweredOff"
+
+	// BootstrapReadyCondition documents whether the bootstrap data for a VSphereVM was successfully
+	// retrieved from its referenced Secret and delivered to the underlying VM. It is defined on VSphereVM
+	// (where the bootstrap Secret is resolved and delivered as part of the clone) and aggregated into the
+	// VSphereVM Ready condition; the owning VSphereMachine mirrors it. It exists to give bootstrap-delivery
+	// failures a reason distinct from CloningReason/CloningFailedReason.
+	//
+	// NOTE: This condition is set on VSphereVM. The "waiting for the CAPI bootstrap Secret to be produced"
+	// case happens before the VSphereVM exists and is surfaced on VSphereMachine as
+	// VMProvisioned=WaitingForBootstrapData.
+	BootstrapReadyCondition clusterv1.ConditionType = "BootstrapReady"
+
+	// BootstrapSecretGetFailedReason (Severity=Warning) documents that the bootstrap data Secret referenced
+	// by the VSphereVM could not be read (e.g. not found or an API error).
+	BootstrapSecretGetFailedReason = "BootstrapSecretGetFailed"
+
+	// BootstrapSecretContentInvalidReason (Severity=Warning) documents that the bootstrap data Secret was
+	// read but is missing its required "value" key.
+	BootstrapSecretContentInvalidReason = "BootstrapSecretContentInvalid"
 )
 
 // Conditions and Reasons related to utilizing a VSphereIdentity to make connections to a VCenter.
@@ -250,6 +303,68 @@ const (
 	// IdentityCredentialsUnavailableReason (Severity=Warning) documents that the
 	// vCenter credentials could not be resolved from the VSphereCluster's IdentityRef.
 	IdentityCredentialsUnavailableReason = "IdentityCredentialsUnavailable"
+)
+
+// Pool-level health conditions for the VSphereMachineConfigPool object. The
+// pool's Ready condition summarizes the health conditions below (MembersValid,
+// MembersUnique, PersistentDisksReady) together with ClusterRefReady and
+// VCenterAvailable. SlotAvailable is a capacity signal and deliberately does
+// NOT contribute to Ready — a fully-allocated fixed-IP pool is a healthy,
+// expected state.
+const (
+	// MachineConfigPoolMembersValidCondition reports whether every slot's fields
+	// are structurally valid (persistent disk unit numbers, sizes, and intra-slot
+	// disk uniqueness).
+	MachineConfigPoolMembersValidCondition clusterv1.ConditionType = "MembersValid"
+
+	// MachineConfigPoolInvalidMemberConfigReason (Severity=Warning) documents that
+	// at least one slot has invalid field values.
+	MachineConfigPoolInvalidMemberConfigReason = "InvalidMemberConfig"
+
+	// MachineConfigPoolMembersUniqueCondition reports whether hostname and primary
+	// IP/IPv6 are unique within the pool and across pools bound to the same cluster.
+	MachineConfigPoolMembersUniqueCondition clusterv1.ConditionType = "MembersUnique"
+
+	// MachineConfigPoolDuplicateHostnameReason (Severity=Warning) documents that a
+	// hostname is used by more than one slot.
+	MachineConfigPoolDuplicateHostnameReason = "DuplicateHostname"
+
+	// MachineConfigPoolDuplicateIPAddressReason (Severity=Warning) documents that a
+	// primary IP/IPv6 is used by more than one slot.
+	MachineConfigPoolDuplicateIPAddressReason = "DuplicateIPAddress"
+
+	// MachineConfigPoolSlotAvailableCondition reports whether the pool has at least
+	// one Available slot. Capacity signal only; does not contribute to Ready.
+	MachineConfigPoolSlotAvailableCondition clusterv1.ConditionType = "SlotAvailable"
+
+	// MachineConfigPoolAllSlotsInUseReason (Severity=Info) documents that every slot
+	// is currently allocated.
+	MachineConfigPoolAllSlotsInUseReason = "AllSlotsInUse"
+
+	// MachineConfigPoolWaitingForReclaimReason (Severity=Info) documents that free
+	// capacity is pending release/reclaim of one or more slots.
+	MachineConfigPoolWaitingForReclaimReason = "WaitingForReclaim"
+
+	// MachineConfigPoolPersistentDisksReadyCondition reports whether every
+	// persistent disk is in a settled healthy state: idle on an available slot,
+	// or fully provisioned on an in-use slot. It is False while an in-use slot's
+	// disks are still being provisioned, or when a disk is stuck in a failed
+	// reclaim or an attachment-blocked state. Slots being reclaimed normally
+	// (not yet failed) do not pull this condition down.
+	MachineConfigPoolPersistentDisksReadyCondition clusterv1.ConditionType = "PersistentDisksReady"
+
+	// MachineConfigPoolDisksProvisioningReason (Severity=Info) documents that an
+	// in-use slot's persistent disks have not yet been created in vCenter
+	// (VolumePath not backfilled), i.e. the slot is still preparing.
+	MachineConfigPoolDisksProvisioningReason = "DisksProvisioning"
+
+	// MachineConfigPoolReclaimFailedReason (Severity=Warning) documents that a
+	// persistent disk reclaim task failed.
+	MachineConfigPoolReclaimFailedReason = "ReclaimFailed"
+
+	// MachineConfigPoolDiskStillAttachedReason (Severity=Warning) documents that a
+	// persistent disk cannot be reclaimed because it is still attached to a VM.
+	MachineConfigPoolDiskStillAttachedReason = "DiskStillAttached"
 )
 
 // Conditions and condition Reasons for VSphereMachine machine config pool allocation.

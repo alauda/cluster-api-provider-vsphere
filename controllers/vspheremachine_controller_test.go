@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -214,6 +215,34 @@ var _ = Describe("VsphereMachineReconciler", func() {
 		Eventually(func() bool {
 			return isPresentAndFalseWithReason(infraMachine, infrav1.VMProvisionedCondition, infrav1.WaitingForClusterInfrastructureReason)
 		}, timeout).Should(BeFalse())
+	})
+
+	It("deletes a paused VSphereMachine", func() {
+		Eventually(func() bool {
+			if err := testEnv.Get(ctx, key, infraMachine); err != nil {
+				return false
+			}
+			return ctrlutil.ContainsFinalizer(infraMachine, infrav1.MachineFinalizer)
+		}, timeout).Should(BeTrue())
+
+		By("pausing the owning Cluster")
+		Eventually(func() error {
+			ph, err := patch.NewHelper(capiCluster, testEnv)
+			Expect(err).ShouldNot(HaveOccurred())
+			capiCluster.Annotations = map[string]string{clusterv1.PausedAnnotation: "true"}
+			return ph.Patch(ctx, capiCluster, patch.WithStatusObservedGeneration{})
+		}, timeout).Should(BeNil())
+
+		By("deleting the paused VSphereMachine")
+		Eventually(func() bool {
+			err := testEnv.Delete(ctx, infraMachine)
+			return err == nil || apierrors.IsNotFound(err)
+		}, timeout).Should(BeTrue())
+
+		Eventually(func() bool {
+			err := testEnv.Get(ctx, key, infraMachine)
+			return apierrors.IsNotFound(err)
+		}, timeout).Should(BeTrue())
 	})
 
 	Context("With Cluster Infrastructure status ready", func() {

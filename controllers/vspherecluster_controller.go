@@ -52,6 +52,7 @@ import (
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;patch;update
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vsphereclusteridentities,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vsphereclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=vsphereclusters/status,verbs=get;update;patch
@@ -111,6 +112,7 @@ func AddClusterControllerToManager(ctx context.Context, controllerManagerCtx *ca
 	reconciler := &clusterReconciler{
 		ControllerManagerContext: controllerManagerCtx,
 		Client:                   controllerManagerCtx.Client,
+		Recorder:                 mgr.GetEventRecorderFor("vspherecluster-controller"),
 		clusterModuleReconciler:  NewReconciler(controllerManagerCtx),
 		vmService:                services.VimMachineService{Client: controllerManagerCtx.Client},
 	}

@@ -349,7 +349,7 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 		g.Expect(ipClaimsCondition.Reason).To(Equal(infrav1.VSphereVMIPAddressClaimsFulfilledV1Beta2Reason))
 	})
 
-	t.Run("Deleting a VM with IPAddressClaims", func(t *testing.T) {
+	t.Run("Deleting a paused VM with IPAddressClaims", func(t *testing.T) {
 		create(infrav1.NetworkSpec{
 			Devices: []infrav1.NetworkDeviceSpec{
 				{
@@ -364,6 +364,7 @@ func TestReconcileNormal_WaitingForIPAddrAllocation(t *testing.T) {
 				},
 			},
 		})()
+		cluster.Annotations = map[string]string{clusterv1.PausedAnnotation: "true"}
 		vsphereVM.ObjectMeta.Finalizers = []string{infrav1.VMFinalizer}
 		vsphereVM.ObjectMeta.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 
