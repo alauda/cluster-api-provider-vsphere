@@ -1,7 +1,7 @@
 # 持久盘状态匹配加固：用确定 vmdk 路径替代容量猜盘
 
 对 G / P2-1(持久盘观测态迁入 pool status,commit `554f8d152`)的一处修正。背景与验收标准见
-[`20260725-acp-provider-standard-gap-analysis.md`](20260725-acp-provider-standard-gap-analysis.md)。
+[`requirements-and-research.md`](requirements-and-research.md)。
 本设计只改「更新 status 时如何把实盘认回声明盘」这一段,不改盘的生命周期语义。
 
 ## 结论
@@ -131,7 +131,7 @@ vmdk 名由 `DeterministicDiskName(hostname, 盘名)` 幂等算出(同输入恒�
   可接受;后续可在此处改为「探测到同路径已存在则转 attach 或先删孤儿盘」,不在本次范围。
 - **非持久盘不走确定路径认盘**:ephemeral 盘恒新建、不记录 VolumePath,靠 clone 分配并落到
   `status.ephemeralDiskStatuses` 的 SCSI unit 跨轮匹配(与持久盘的路径匹配是两条独立机制),详见
-  [`20260730-p1-7-pool-ephemeral-disks.md`](20260730-p1-7-pool-ephemeral-disks.md)。`DeterministicDiskName`
+  [`design-pool-ephemeral-disks.md`](design-pool-ephemeral-disks.md)。`DeterministicDiskName`
   只服务持久盘的确定路径命名。
 
 ## 相关但不在本次范围
@@ -161,15 +161,4 @@ vmdk 名由 `DeterministicDiskName(hostname, 盘名)` 幂等算出(同输入恒�
 
 ## 测试
 
-- `pkg/services/govmomi/vcenter/clone_test.go`:新建持久盘(有数据存储)的 `backing.FileName` 为确定路径、
-  仍带 `FileOperationCreate`,且 `pd.VolumePath` 被写回;无数据存储时维持现状、只回填 unit;复用盘
-  (`slotVolumePath != ""`)不受影响仍走 attach。
-- `pkg/services/machineconfigpool_test.go`:带确定路径的新盘经 `ApplyDiskBackfill` 直接记 `Attached`;
-  仅带 unit 的兜底盘记 `Creating`,观测到 VolumePath 后翻 `Attached`;`Attached`/`Available`/`Reclaiming`
-  不被降级;`Reclaimed` 墓碑可被 `Creating` 覆盖。
-- `pkg/services/govmomi/service_test.go`:有实际路径记录走 Tier 1;`Creating`+unit 走 Tier 2;首次新建盘两者
-  皆空但能推导路径时按推导路径自愈命中;两级都认不出时返回 nil(含同规格多盘、以及只剩单一同规格候选——
-  Tier 3 已删除,不再按容量猜)。
-
-命令:`go test -vet=off ./...`;controllers 包带
-`KUBEBUILDER_ASSETS=/home/vscode/.local/share/kubebuilder-envtest/k8s/1.32.0-linux-amd64`。
+环境验收见 [test-cases.md](test-cases.md) TC-CAPV-ACP-12,单测清单见同文第 3 章。
