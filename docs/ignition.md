@@ -152,7 +152,6 @@ kube-system   kube-controller-manager-my-cluster-7nkns   1/1     Running        
 kube-system   kube-proxy-6lvkt                           1/1     Running            0             5m17s
 kube-system   kube-proxy-sxp96                           1/1     Running            0             7m56s
 kube-system   kube-scheduler-my-cluster-7nkns            1/1     Running            0             8m5s
-kube-system   kube-vip-my-cluster-7nkns                  1/1     Running            0             8m4s
 kube-system   vsphere-cloud-controller-manager-6snb2     1/1     Running            0             5m17s
 kube-system   vsphere-cloud-controller-manager-f5kjv     1/1     Running            0             7m53s
 kube-system   vsphere-csi-controller-bc4676cd9-8zpwd     5/5     Running            0             7m56s

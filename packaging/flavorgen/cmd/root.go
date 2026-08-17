@@ -134,7 +134,7 @@ func generateSingle(flavor string) (string, error) {
 	switch flavor {
 	case flavors.VIP:
 		var err error
-		objs, err = flavors.MultiNodeTemplateWithKubeVIP()
+		objs, err = flavors.MultiNodeTemplateGovmomi()
 		if err != nil {
 			return "", err
 		}
@@ -145,10 +145,10 @@ func generateSingle(flavor string) (string, error) {
 			return "", err
 		}
 	case flavors.ClusterClass:
-		objs = flavors.ClusterClassTemplateWithKubeVIP()
+		objs = flavors.ClusterClassTemplateGovmomi()
 	case flavors.ClusterTopology:
 		var err error
-		objs, err = flavors.ClusterTopologyTemplateKubeVIP()
+		objs, err = flavors.ClusterTopologyTemplateGovmomi()
 		if err != nil {
 			return "", err
 		}
@@ -160,13 +160,13 @@ func generateSingle(flavor string) (string, error) {
 		})
 	case flavors.Ignition:
 		var err error
-		objs, err = flavors.MultiNodeTemplateWithKubeVIPIgnition()
+		objs, err = flavors.MultiNodeTemplateIgnition()
 		if err != nil {
 			return "", err
 		}
 	case flavors.NodeIPAM:
 		var err error
-		objs, err = flavors.MultiNodeTemplateWithKubeVIPNodeIPAM()
+		objs, err = flavors.MultiNodeTemplateNodeIPAM()
 		if err != nil {
 			return "", err
 		}

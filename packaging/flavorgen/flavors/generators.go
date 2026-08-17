@@ -34,7 +34,6 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	vmwarev1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/vmware/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-vsphere/packaging/flavorgen/flavors/env"
-	"sigs.k8s.io/cluster-api-provider-vsphere/packaging/flavorgen/flavors/kubevip"
 	"sigs.k8s.io/cluster-api-provider-vsphere/packaging/flavorgen/flavors/util"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
 )
@@ -152,11 +151,6 @@ func clusterTopologyVariables(supervisorMode bool) ([]clusterv1.ClusterVariable,
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to json-encode variable ControlPlaneEndpointPortVar: %q", env.ControlPlaneEndpointPortVar)
 	}
-	kubeVipVariable, err := kubevip.TopologyVariable()
-	if err != nil {
-		return nil, err
-	}
-
 	variables := []clusterv1.ClusterVariable{
 		{
 			Name: "sshKey",
@@ -164,7 +158,6 @@ func clusterTopologyVariables(supervisorMode bool) ([]clusterv1.ClusterVariable,
 				Raw: sshKey,
 			},
 		},
-		*kubeVipVariable,
 		{
 			Name: "controlPlaneIpAddr",
 			Value: apiextensionsv1.JSON{

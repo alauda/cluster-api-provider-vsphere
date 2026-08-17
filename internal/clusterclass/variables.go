@@ -55,16 +55,6 @@ func GetClusterClassVariables(govmomiMode bool) []clusterv1.ClusterClassVariable
 				},
 			},
 		},
-		{
-			Name:     "kubeVipPodManifest",
-			Required: true,
-			Schema: clusterv1.VariableSchema{
-				OpenAPIV3Schema: clusterv1.JSONSchemaProps{
-					Type:        "string",
-					Description: "kube-vip manifest for the control plane.",
-				},
-			},
-		},
 	}
 
 	if govmomiMode {

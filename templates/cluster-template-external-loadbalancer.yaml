@@ -92,10 +92,6 @@ metadata:
   name: '${CLUSTER_NAME}'
   namespace: '${NAMESPACE}'
 spec:
-  machineTemplate:
-    metadata:
-      labels:
-        node-role.kubernetes.io/control-plane: ""
   kubeadmConfigSpec:
     clusterConfiguration:
       controllerManager:

@@ -50,8 +50,6 @@ const (
 	VSphereMachineClassVar        = "${VSPHERE_MACHINE_CLASS_NAME}"
 	VSphereMachineStorageClassVar = "${VSPHERE_STORAGE_CLASS}"
 	VSphereMachinePowerOffModeVar = "${VSPHERE_POWER_OFF_MODE:=trySoft}"
-	// VipNetworkInterfaceVar defaults to an empty string to let kube-vip autodetect the interface.
-	VipNetworkInterfaceVar = "${VIP_NETWORK_INTERFACE:=\"\"}"
 	VSphereUsername        = "${VSPHERE_USERNAME}"
 	// VSpherePassword is the password for the VSphere Server.
 	VSpherePassword              = "${VSPHERE_PASSWORD}" //nolint:gosec // Password is not hardcoded here.
