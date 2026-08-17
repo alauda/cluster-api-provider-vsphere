@@ -54,6 +54,24 @@ const (
 
 	// KubeOvnAppReleaseInvalidConfigurationReason documents invalid kube-ovn AppRelease input configuration.
 	KubeOvnAppReleaseInvalidConfigurationReason = "InvalidKubeOvnConfiguration"
+
+	// SelfBuiltLoadBalancerReadyCondition documents the readiness of the provider-managed
+	// control plane load balancer (alive) requested via spec.controlPlaneLoadBalancer.
+	// It does not gate VSphereCluster.Status.Ready.
+	SelfBuiltLoadBalancerReadyCondition clusterv1.ConditionType = "SelfBuiltLoadBalancerReady"
+
+	// SelfBuiltLoadBalancerReadyReason documents that alive is installed and the VIP serves the apiserver.
+	SelfBuiltLoadBalancerReadyReason = "SelfBuiltLoadBalancerReady"
+
+	// SelfBuiltLoadBalancerReconcilingReason documents that the self-built load balancer is being
+	// created, updated, or waiting for status.
+	SelfBuiltLoadBalancerReconcilingReason = "SelfBuiltLoadBalancerReconciling"
+
+	// SelfBuiltLoadBalancerNotReadyReason documents that the self-built load balancer is observed but not ready.
+	SelfBuiltLoadBalancerNotReadyReason = "SelfBuiltLoadBalancerNotReady"
+
+	// SelfBuiltLoadBalancerInvalidConfigurationReason documents invalid self-built load balancer input configuration.
+	SelfBuiltLoadBalancerInvalidConfigurationReason = "InvalidSelfBuiltLoadBalancerConfiguration"
 )
 
 // Conditions and condition Reasons for the VSphereMachine and the VSphereVM object.

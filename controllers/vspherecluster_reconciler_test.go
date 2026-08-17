@@ -515,7 +515,7 @@ var _ = Describe("VIM based VSphere ClusterReconciler", func() {
 	})
 })
 
-func TestClusterReconciler_ControlPlaneNodesAvailableForKubeOvnReconcile(t *testing.T) {
+func TestClusterReconciler_ControlPlaneNodesRegistered(t *testing.T) {
 	tests := []struct {
 		name          string
 		desired       int32
@@ -589,7 +589,7 @@ func TestClusterReconciler_ControlPlaneNodesAvailableForKubeOvnReconcile(t *test
 				})
 			}
 			r := clusterReconciler{Client: controllerManagerContext.Client}
-			controlPlaneNodes, ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, workloadClient)
+			controlPlaneNodes, ready, err := r.controlPlaneNodesRegistered(ctx, cluster, workloadClient)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(ready).To(Equal(tt.wantReady))
 			if tt.wantReady {

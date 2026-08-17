@@ -278,25 +278,9 @@ func UpdateKubeadmNodeRegistration(userData []byte, nodeName, nodeIP string) ([]
 		return userData, nil
 	}
 
-	lines := strings.Split(string(userData), "\n")
-	header := make([]string, 0, 2)
-	bodyStart := 0
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if len(header) == 0 && trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "## template:") || trimmed == "#cloud-config" {
-			header = append(header, line)
-			bodyStart = i + 1
-			continue
-		}
-		break
-	}
-
-	body := strings.Join(lines[bodyStart:], "\n")
+	header, body := splitCloudConfigHeader(userData)
 	config := map[interface{}]interface{}{}
-	if err := yaml.Unmarshal([]byte(body), &config); err != nil {
+	if err := yaml.Unmarshal(body, &config); err != nil {
 		return nil, errors.Wrap(err, "failed to parse bootstrap cloud-config")
 	}
 
@@ -313,7 +297,7 @@ func UpdateKubeadmNodeRegistration(userData []byte, nodeName, nodeIP string) ([]
 		}
 		path, _ := entry["path"].(string)
 		switch path {
-		case "/run/kubeadm/kubeadm.yaml":
+		case kubeadmInitConfigPath:
 			content, err := decodeCloudConfigWriteFileContent(entry)
 			if err != nil {
 				return nil, err
@@ -324,7 +308,7 @@ func UpdateKubeadmNodeRegistration(userData []byte, nodeName, nodeIP string) ([]
 			}
 			encodeCloudConfigWriteFileContent(entry, newContent)
 			updated = true
-		case "/run/kubeadm/kubeadm-join-config.yaml":
+		case kubeadmJoinConfigPath:
 			content, err := decodeCloudConfigWriteFileContent(entry)
 			if err != nil {
 				return nil, err
@@ -354,6 +338,71 @@ func UpdateKubeadmNodeRegistration(userData []byte, nodeName, nodeIP string) ([]
 	}
 	out.Write(outBody)
 	return []byte(out.String()), nil
+}
+
+// splitCloudConfigHeader separates the leading `## template:`/`#cloud-config`
+// lines from the YAML body. The header must survive verbatim: cloud-init only
+// treats user-data as cloud-config when it starts with the `#cloud-config`
+// marker, and re-marshalling the parsed body would drop it.
+func splitCloudConfigHeader(userData []byte) ([]string, []byte) {
+	lines := strings.Split(string(userData), "\n")
+	header := make([]string, 0, 2)
+	bodyStart := 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if len(header) == 0 && trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "## template:") || trimmed == "#cloud-config" {
+			header = append(header, line)
+			bodyStart = i + 1
+			continue
+		}
+		break
+	}
+	return header, []byte(strings.Join(lines[bodyStart:], "\n"))
+}
+
+// kubeadm write_files paths that identify how a node joins the cluster. CABPK
+// emits exactly one of them per machine.
+const (
+	kubeadmInitConfigPath = "/run/kubeadm/kubeadm.yaml"
+	kubeadmJoinConfigPath = "/run/kubeadm/kubeadm-join-config.yaml"
+)
+
+// IsKubeadmInitUserData reports whether the bootstrap data provisions the first
+// control plane node (kubeadm init) as opposed to a joining node. This is the
+// same signal UpdateKubeadmNodeRegistration branches on: CABPK writes the init
+// configuration only for the machine that runs `kubeadm init`.
+//
+// Unparsable or non-kubeadm user-data reports false, so callers default to the
+// safer "not the init node" answer rather than injecting one-off bootstrap
+// state onto an arbitrary machine.
+func IsKubeadmInitUserData(userData []byte) bool {
+	if len(userData) == 0 {
+		return false
+	}
+
+	_, body := splitCloudConfigHeader(userData)
+	config := map[interface{}]interface{}{}
+	if err := yaml.Unmarshal(body, &config); err != nil {
+		return false
+	}
+
+	writeFiles, ok := config["write_files"].([]interface{})
+	if !ok {
+		return false
+	}
+	for i := range writeFiles {
+		entry, ok := writeFiles[i].(map[interface{}]interface{})
+		if !ok {
+			continue
+		}
+		if path, _ := entry["path"].(string); path == kubeadmInitConfigPath {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeCloudConfigWriteFileContent(entry map[interface{}]interface{}) (string, error) {
@@ -889,29 +938,200 @@ func GetPersistentDiskCloudConfig(persistentDisks []infrav1.PersistentDisk, ephe
 	return yaml.Marshal(config)
 }
 
+// Guest paths for the bootstrap VIP scaffolding.
+const (
+	bootstrapVIPScriptPath = "/etc/capv/bootstrap-vip.sh"
+	bootstrapVIPUnitName   = "capv-bootstrap-vip.service"
+	bootstrapVIPUnitPath   = "/etc/systemd/system/" + bootstrapVIPUnitName
+)
+
+// GetBootstrapVIPCloudConfig builds the cloud-init config that puts the control
+// plane VIP on the first control plane node before kubeadm runs.
+//
+// This solves a chicken-and-egg problem: `kubeadm init` needs
+// controlPlaneEndpoint to answer immediately, but the component that actually
+// serves the VIP (alive/keepalived) is installed *into* the cluster and cannot
+// exist yet. So the VIP is added by hand once, and alive's installer takes it
+// over (its clear_vip() removes this address before writing the keepalived
+// manifest).
+//
+// The VIP must never come back on its own: once keepalived owns the address, a
+// second holder on the same node is a split brain. The unit therefore carries no
+// [Install] section — without a WantedBy it cannot be enabled, so systemd has no
+// path to start it at boot. The address is added exactly once, by the explicit
+// `systemctl start` in runcmd.
+//
+// The unit exists (rather than a bare `ip addr add` in runcmd) for failure
+// semantics and observability: a Type=oneshot `systemctl start` blocks until the
+// script exits and propagates its exit code, which drives the `|| exit 1` that
+// aborts the rest of runcmd — including kubeadm — and the run is recorded in the
+// journal.
+//
+// nodeIP is the node's primary address and may be empty (DHCP without a machine
+// config slot); the guest script then falls back to the default route interface.
+func GetBootstrapVIPCloudConfig(vip, nodeIP, networkInterface string) ([]byte, error) {
+	if vip == "" {
+		return nil, errors.New("bootstrap VIP must not be empty")
+	}
+	if net.ParseIP(vip) == nil {
+		return nil, errors.Errorf("bootstrap VIP %q is not a valid IP address", vip)
+	}
+
+	script := bootstrapVIPScript(vip, nodeIP, networkInterface)
+	unit := bootstrapVIPServiceUnit()
+
+	config := map[interface{}]interface{}{
+		"write_files": []interface{}{
+			map[interface{}]interface{}{
+				"path":        bootstrapVIPScriptPath,
+				"permissions": "0755",
+				"owner":       "root:root",
+				"encoding":    "b64",
+				"content":     base64.StdEncoding.EncodeToString([]byte(script)),
+			},
+			map[interface{}]interface{}{
+				"path":        bootstrapVIPUnitPath,
+				"permissions": "0644",
+				"owner":       "root:root",
+				"encoding":    "b64",
+				"content":     base64.StdEncoding.EncodeToString([]byte(unit)),
+			},
+		},
+		// mergeCloudConfigBodies prepends runcmd entries, so these land ahead of
+		// the kubeadm command CABPK generated. cloud-init concatenates every
+		// runcmd entry into a single shell script, which is what makes the
+		// `|| exit 1` below abort kubeadm instead of merely failing this step.
+		"runcmd": []interface{}{
+			[]interface{}{"systemctl", "daemon-reload"},
+			"systemctl start " + bootstrapVIPUnitName + " || exit 1",
+		},
+	}
+	return yaml.Marshal(config)
+}
+
+func bootstrapVIPServiceUnit() string {
+	// Deliberately no [Install] section: see GetBootstrapVIPCloudConfig.
+	return `[Unit]
+Description=CAPV Bootstrap Control Plane VIP
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=` + bootstrapVIPScriptPath + `
+`
+}
+
+func bootstrapVIPScript(vip, nodeIP, networkInterface string) string {
+	return `#!/bin/sh
+set -u
+
+VIP="` + vip + `"
+NODE_IP="` + nodeIP + `"
+PREFERRED_INTERFACE="` + networkInterface + `"
+WAIT_SECONDS=120
+
+log() {
+  echo "capv-bootstrap-vip: $*" >&2
+}
+
+# The VIP is added as a /32 host route so it never widens the node's subnet and
+# alive's clear_vip() can match and remove exactly this address later.
+vip_present() {
+  ip -4 -o addr show 2>/dev/null | awk '{print $4}' | grep -qx "${VIP}/32"
+}
+
+interface_holds_node_ip() {
+  ip -4 -o addr show dev "$1" 2>/dev/null |
+    awk '{split($4, parts, "/"); print parts[1]}' |
+    grep -qx "${NODE_IP}"
+}
+
+interface_by_node_ip() {
+  ip -4 -o addr show 2>/dev/null |
+    awk -v want="${NODE_IP}" '{split($4, parts, "/"); if (parts[1] == want) {print $2; exit}}'
+}
+
+default_route_interface() {
+  ip -4 route show default 2>/dev/null |
+    awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
+
+# Networking may not be up yet when cloud-init reaches runcmd, so keep looking
+# until the interface appears rather than failing the whole bootstrap on a race.
+resolve_interface() {
+  elapsed=0
+  while [ "${elapsed}" -lt "${WAIT_SECONDS}" ]; do
+    if [ -n "${PREFERRED_INTERFACE}" ]; then
+      if ip link show "${PREFERRED_INTERFACE}" >/dev/null 2>&1; then
+        if [ -z "${NODE_IP}" ] || interface_holds_node_ip "${PREFERRED_INTERFACE}"; then
+          printf '%s' "${PREFERRED_INTERFACE}"
+          return 0
+        fi
+      fi
+    elif [ -n "${NODE_IP}" ]; then
+      found="$(interface_by_node_ip)"
+      if [ -n "${found}" ]; then
+        printf '%s' "${found}"
+        return 0
+      fi
+    else
+      found="$(default_route_interface)"
+      if [ -n "${found}" ]; then
+        printf '%s' "${found}"
+        return 0
+      fi
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
+if vip_present; then
+  log "VIP ${VIP} is already configured, nothing to do"
+  exit 0
+fi
+
+INTERFACE="$(resolve_interface)"
+if [ -z "${INTERFACE}" ]; then
+  if [ -n "${PREFERRED_INTERFACE}" ]; then
+    log "interface ${PREFERRED_INTERFACE} did not come up holding node IP ${NODE_IP} within ${WAIT_SECONDS}s"
+  else
+    log "could not find an interface for node IP ${NODE_IP} within ${WAIT_SECONDS}s"
+  fi
+  exit 1
+fi
+
+if ! ip addr add "${VIP}/32" dev "${INTERFACE}"; then
+  # Lost a race with a concurrent run: the address being there is the goal.
+  if vip_present; then
+    log "VIP ${VIP} appeared concurrently, treating as success"
+    exit 0
+  fi
+  log "failed to add VIP ${VIP} to ${INTERFACE}"
+  exit 1
+fi
+
+# Announce the new owner so switches and peers update their ARP caches without
+# waiting for entries to expire. Best effort: arping is not always installed.
+if command -v arping >/dev/null 2>&1; then
+  arping -c 3 -A -I "${INTERFACE}" "${VIP}" >/dev/null 2>&1 || true
+fi
+
+log "added VIP ${VIP} to ${INTERFACE}"
+exit 0
+`
+}
+
 func MergeCloudConfigUserData(userData []byte, extraConfig []byte) ([]byte, error) {
 	if len(extraConfig) == 0 {
 		return userData, nil
 	}
 
-	lines := strings.Split(string(userData), "\n")
-	header := make([]string, 0, 2)
-	bodyStart := 0
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if len(header) == 0 && trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "## template:") || trimmed == "#cloud-config" {
-			header = append(header, line)
-			bodyStart = i + 1
-			continue
-		}
-		break
-	}
-
-	body := strings.Join(lines[bodyStart:], "\n")
-	mergedBody, err := mergeCloudConfigBodies([]byte(body), extraConfig)
+	header, body := splitCloudConfigHeader(userData)
+	mergedBody, err := mergeCloudConfigBodies(body, extraConfig)
 	if err != nil {
 		return nil, err
 	}

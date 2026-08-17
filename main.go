@@ -187,6 +187,9 @@ func InitFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&managerOpts.WatchFilterValue, "watch-filter", "",
 		fmt.Sprintf("Label value that the controller watches to reconcile cluster-api objects. Label key is always %s. If unspecified, the controller watches for all cluster-api objects.", clusterv1.WatchLabel))
 
+	fs.StringVar(&managerOpts.PluginAliveVersion, "plugin-alive-version", "",
+		"Pin the alive plugin version used for self-built control plane load balancers, overriding the version advertised by the alive ModulePlugin. Applies to every cluster this provider manages. It only overrides version selection; the corresponding ModuleConfig must still exist and be ready.")
+
 	fs.StringVar(&managerOpts.PprofBindAddress, "profiler-address", defaultProfilerAddr,
 		"Bind address to expose the pprof profiler (e.g. localhost:6060)")
 
@@ -424,6 +427,10 @@ func main() {
 }
 
 func setupVAPIControllers(ctx context.Context, controllerCtx *capvcontext.ControllerManagerContext, mgr ctrlmgr.Manager, clusterCache clustercache.ClusterCache) error {
+	if err := (&webhooks.VSphereCluster{}).SetupWebhookWithManager(mgr); err != nil {
+		return err
+	}
+
 	if err := (&webhooks.VSphereClusterTemplate{}).SetupWebhookWithManager(mgr); err != nil {
 		return err
 	}

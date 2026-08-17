@@ -827,6 +827,24 @@ func (vms *VMService) reconcileBootstrapUserData(ctx context.Context, virtualMac
 		return false, err
 	}
 
+	// The bootstrap VIP has to exist before kubeadm runs, and only on the node
+	// that runs `kubeadm init` — joining nodes reach the endpoint through the VIP
+	// the init node (or, later, alive) already holds.
+	if virtualMachineCtx.SelfBuiltLB != nil && util.IsKubeadmInitUserData(mergedUserData) {
+		bootstrapVIPConfig, err := util.GetBootstrapVIPCloudConfig(
+			virtualMachineCtx.SelfBuiltLB.VIP,
+			identity.NodeIP,
+			virtualMachineCtx.SelfBuiltLB.Interface,
+		)
+		if err != nil {
+			return false, err
+		}
+		mergedUserData, err = util.MergeCloudConfigUserData(mergedUserData, bootstrapVIPConfig)
+		if err != nil {
+			return false, err
+		}
+	}
+
 	if virtualMachineCtx.MachineConfigSlot != nil &&
 		(len(virtualMachineCtx.MachineConfigSlot.PersistentDisks) > 0 || len(virtualMachineCtx.MachineConfigSlot.EphemeralDisks) > 0) {
 		diskConfig, err := util.GetPersistentDiskCloudConfig(

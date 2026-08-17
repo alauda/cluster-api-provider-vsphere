@@ -72,6 +72,12 @@ type ControllerManagerContext struct {
 	// WatchFilterValue is used to filter incoming objects by label.
 	WatchFilterValue string
 
+	// PluginAliveVersion pins the alive plugin version used for self-built control
+	// plane load balancers. Empty means the version is resolved from the platform's
+	// ModulePlugin. It only overrides version selection: the corresponding
+	// ModuleConfig must still exist and be ready.
+	PluginAliveVersion string
+
 	genericEventCache sync.Map
 }
 

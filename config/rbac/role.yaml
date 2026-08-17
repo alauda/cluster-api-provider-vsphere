@@ -108,6 +108,33 @@ rules:
   verbs:
   - create
 - apiGroups:
+  - cluster.alauda.io
+  resources:
+  - clustermodules
+  - moduleconfigs
+  - moduleplugins
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - cluster.alauda.io
+  resources:
+  - moduleinfoes
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cluster.alauda.io
+  resources:
+  - moduleinfoes/status
+  verbs:
+  - get
+- apiGroups:
   - cluster.x-k8s.io
   resources:
   - clusters
@@ -127,6 +154,15 @@ rules:
   - get
   - list
   - patch
+  - watch
+- apiGroups:
+  - clusterregistry.k8s.io
+  - platform.tkestack.io
+  resources:
+  - clusters
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - controlplane.cluster.x-k8s.io

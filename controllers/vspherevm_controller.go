@@ -406,6 +406,16 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		vmContext.MachineConfigSlot = slot
 	}
 
+	// Only control plane machines can be the one that runs `kubeadm init`; the VM
+	// service narrows this further to the init node itself before injecting.
+	if lb := vsphereCluster.Spec.ControlPlaneLoadBalancer; lb.IsInternal() && util.IsControlPlaneMachine(machine) {
+		vmContext.SelfBuiltLB = &capvcontext.SelfBuiltLBBootstrap{
+			VIP:       lb.Host,
+			Port:      lb.Port,
+			Interface: lb.Interface,
+		}
+	}
+
 	// Print the task-ref upon entry and upon exit.
 	log.V(4).Info("VSphereVM.Status.TaskRef OnEntry", "taskRef", vmContext.VSphereVM.Status.TaskRef)
 	defer func() {

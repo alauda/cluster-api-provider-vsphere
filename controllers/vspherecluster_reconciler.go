@@ -196,6 +196,7 @@ func (r *clusterReconciler) patch(ctx context.Context, clusterCtx *capvcontext.C
 			infrav1.VSphereClusterVCenterAvailableV1Beta2Condition,
 			infrav1.VSphereClusterClusterModulesReadyV1Beta2Condition,
 			infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
+			infrav1.VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition,
 		}},
 	)
 }
@@ -280,6 +281,12 @@ func (r *clusterReconciler) reconcileDelete(ctx context.Context, clusterCtx *cap
 
 func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
+
+	// The control plane endpoint has to be settled before anything else: every
+	// downstream consumer, from the bootstrap data to the workload client, reads it.
+	if err := reconcileControlPlaneEndpoint(clusterCtx); err != nil {
+		return reconcile.Result{}, err
+	}
 
 	// Configure CoreDNS before the infrastructure cluster becomes Ready so
 	// kubeadm uses the selected repository during initial bootstrap.
@@ -373,6 +380,13 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 		return result, err
 	}
 
+	// alive pods need a working CNI to be scheduled, so the self-built load
+	// balancer comes after the CNI AppRelease.
+	result, err = r.ensureSelfBuiltLB(ctx, clusterCtx)
+	if err != nil || !result.IsZero() {
+		return result, err
+	}
+
 	return r.reconcileWorkloadSystemComponentRepositories(ctx, clusterCtx)
 }
 
@@ -436,7 +450,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	controlPlaneNodes, ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, clientset)
+	controlPlaneNodes, ready, err := r.controlPlaneNodesRegistered(ctx, cluster, clientset)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -495,14 +509,44 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-type kubeOvnAppReleaseStatus struct {
+type appReleaseStatus struct {
 	ready   bool
 	reason  string
 	message string
 }
 
+// appReleaseReasons names the condition reasons a caller wants an AppRelease
+// readiness verdict expressed in, so the shared readiness logic can be used by
+// features that own different condition types.
+type appReleaseReasons struct {
+	ready       string
+	reconciling string
+	notReady    string
+}
+
 func (r *clusterReconciler) setKubeOvnAppReleaseCondition(vsphereCluster *infrav1.VSphereCluster, status corev1.ConditionStatus, reason string, severity clusterv1.ConditionSeverity, message string) {
-	oldCondition := v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition)
+	r.setDualCondition(vsphereCluster,
+		infrav1.KubeOvnAppReleaseReadyCondition,
+		infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
+		"kube-ovn AppRelease",
+		status, reason, severity, message)
+}
+
+// setDualCondition writes the same verdict to both the v1beta1 and the v1beta2
+// form of a condition, and emits an event whenever the verdict actually changed.
+// subject names the thing the condition is about, for the event emitted when the
+// caller has no message of its own.
+func (r *clusterReconciler) setDualCondition(
+	vsphereCluster *infrav1.VSphereCluster,
+	v1beta1Type clusterv1.ConditionType,
+	v1beta2Type string,
+	subject string,
+	status corev1.ConditionStatus,
+	reason string,
+	severity clusterv1.ConditionSeverity,
+	message string,
+) {
+	oldCondition := v1beta2conditions.Get(vsphereCluster, v1beta2Type)
 	var oldStatus metav1.ConditionStatus
 	var oldReason, oldMessage string
 	if oldCondition != nil {
@@ -513,15 +557,15 @@ func (r *clusterReconciler) setKubeOvnAppReleaseCondition(vsphereCluster *infrav
 
 	switch status {
 	case corev1.ConditionTrue:
-		conditions.MarkTrue(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition)
+		conditions.MarkTrue(vsphereCluster, v1beta1Type)
 	case corev1.ConditionUnknown:
-		conditions.MarkUnknown(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition, reason, "%s", message)
+		conditions.MarkUnknown(vsphereCluster, v1beta1Type, reason, "%s", message)
 	default:
-		conditions.MarkFalse(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition, reason, severity, "%s", message)
+		conditions.MarkFalse(vsphereCluster, v1beta1Type, reason, severity, "%s", message)
 	}
 
 	newCondition := metav1.Condition{
-		Type:    infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
+		Type:    v1beta2Type,
 		Status:  metav1.ConditionStatus(status),
 		Reason:  reason,
 		Message: message,
@@ -536,42 +580,53 @@ func (r *clusterReconciler) setKubeOvnAppReleaseCondition(vsphereCluster *infrav
 		eventType = corev1.EventTypeWarning
 	}
 	if message == "" {
-		message = fmt.Sprintf("kube-ovn AppRelease condition is %s", reason)
+		message = fmt.Sprintf("%s condition is %s", subject, reason)
 	}
 	r.Recorder.Event(vsphereCluster, eventType, reason, message)
 }
 
-func kubeOvnAppReleaseReadiness(appRelease *unstructured.Unstructured) kubeOvnAppReleaseStatus {
+func kubeOvnAppReleaseReadiness(appRelease *unstructured.Unstructured) appReleaseStatus {
+	return appReleaseReadiness(appRelease, "kube-ovn", appReleaseReasons{
+		ready:       infrav1.KubeOvnAppReleaseReadyReason,
+		reconciling: infrav1.KubeOvnAppReleaseReconcilingReason,
+		notReady:    infrav1.KubeOvnAppReleaseNotReadyReason,
+	})
+}
+
+// appReleaseReadiness reports whether an AppRelease is both synced and healthy
+// for the generation currently on the object. releaseLabel only names the
+// release in the messages surfaced to the user.
+func appReleaseReadiness(appRelease *unstructured.Unstructured, releaseLabel string, reasons appReleaseReasons) appReleaseStatus {
 	syncCondition, found, err := appReleaseCondition(appRelease, "Sync")
 	if err != nil {
-		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: err.Error()}
+		return appReleaseStatus{reason: reasons.reconciling, message: err.Error()}
 	}
 	if !found {
-		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: "waiting for kube-ovn AppRelease Sync condition"}
+		return appReleaseStatus{reason: reasons.reconciling, message: fmt.Sprintf("waiting for %s AppRelease Sync condition", releaseLabel)}
 	}
 	healthCondition, found, err := appReleaseCondition(appRelease, "Health")
 	if err != nil {
-		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: err.Error()}
+		return appReleaseStatus{reason: reasons.reconciling, message: err.Error()}
 	}
 	if !found {
-		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: "waiting for kube-ovn AppRelease Health condition"}
+		return appReleaseStatus{reason: reasons.reconciling, message: fmt.Sprintf("waiting for %s AppRelease Health condition", releaseLabel)}
 	}
 
-	if stale, message := appReleaseConditionStale(appRelease, syncCondition, "Sync"); stale {
-		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: message}
+	if stale, message := appReleaseConditionStale(appRelease, syncCondition, "Sync", releaseLabel); stale {
+		return appReleaseStatus{reason: reasons.reconciling, message: message}
 	}
-	if stale, message := appReleaseConditionStale(appRelease, healthCondition, "Health"); stale {
-		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseReconcilingReason, message: message}
+	if stale, message := appReleaseConditionStale(appRelease, healthCondition, "Health", releaseLabel); stale {
+		return appReleaseStatus{reason: reasons.reconciling, message: message}
 	}
 
 	if status := conditionString(syncCondition, "status"); status != string(corev1.ConditionTrue) {
-		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseNotReadyReason, message: appReleaseConditionMessage("Sync", syncCondition, status)}
+		return appReleaseStatus{reason: reasons.notReady, message: appReleaseConditionMessage(releaseLabel, "Sync", syncCondition, status)}
 	}
 	if status := conditionString(healthCondition, "status"); status != string(corev1.ConditionTrue) {
-		return kubeOvnAppReleaseStatus{reason: infrav1.KubeOvnAppReleaseNotReadyReason, message: appReleaseConditionMessage("Health", healthCondition, status)}
+		return appReleaseStatus{reason: reasons.notReady, message: appReleaseConditionMessage(releaseLabel, "Health", healthCondition, status)}
 	}
 
-	return kubeOvnAppReleaseStatus{ready: true, reason: infrav1.KubeOvnAppReleaseReadyReason}
+	return appReleaseStatus{ready: true, reason: reasons.ready}
 }
 
 func appReleaseCondition(appRelease *unstructured.Unstructured, conditionType string) (map[string]any, bool, error) {
@@ -591,31 +646,31 @@ func appReleaseCondition(appRelease *unstructured.Unstructured, conditionType st
 	return nil, false, nil
 }
 
-func appReleaseConditionStale(appRelease *unstructured.Unstructured, condition map[string]any, conditionType string) (bool, string) {
+func appReleaseConditionStale(appRelease *unstructured.Unstructured, condition map[string]any, conditionType, releaseLabel string) (bool, string) {
 	generation := appRelease.GetGeneration()
 	observedGeneration, ok := conditionInt64(condition, "observedGeneration")
 	if !ok {
-		return true, fmt.Sprintf("waiting for kube-ovn AppRelease %s condition observedGeneration", conditionType)
+		return true, fmt.Sprintf("waiting for %s AppRelease %s condition observedGeneration", releaseLabel, conditionType)
 	}
 	if observedGeneration != generation {
-		return true, fmt.Sprintf("waiting for kube-ovn AppRelease %s condition to observe generation %d", conditionType, generation)
+		return true, fmt.Sprintf("waiting for %s AppRelease %s condition to observe generation %d", releaseLabel, conditionType, generation)
 	}
 	return false, ""
 }
 
-func appReleaseConditionMessage(conditionType string, condition map[string]any, status string) string {
+func appReleaseConditionMessage(releaseLabel, conditionType string, condition map[string]any, status string) string {
 	reason := conditionString(condition, "reason")
 	message := conditionString(condition, "message")
 	if reason == "" && message == "" {
-		return fmt.Sprintf("kube-ovn AppRelease %s condition status is %s", conditionType, status)
+		return fmt.Sprintf("%s AppRelease %s condition status is %s", releaseLabel, conditionType, status)
 	}
 	if message == "" {
-		return fmt.Sprintf("kube-ovn AppRelease %s condition is %s", conditionType, reason)
+		return fmt.Sprintf("%s AppRelease %s condition is %s", releaseLabel, conditionType, reason)
 	}
 	if reason == "" {
-		return fmt.Sprintf("kube-ovn AppRelease %s condition: %s", conditionType, message)
+		return fmt.Sprintf("%s AppRelease %s condition: %s", releaseLabel, conditionType, message)
 	}
-	return fmt.Sprintf("kube-ovn AppRelease %s condition is %s: %s", conditionType, reason, message)
+	return fmt.Sprintf("%s AppRelease %s condition is %s: %s", releaseLabel, conditionType, reason, message)
 }
 
 func conditionString(condition map[string]any, field string) string {
@@ -638,7 +693,11 @@ func conditionInt64(condition map[string]any, field string) (int64, bool) {
 	}
 }
 
-func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx context.Context, cluster *clusterv1.Cluster, workloadClient kubernetes.Interface) ([]string, bool, error) {
+// controlPlaneNodesRegistered lists the workload cluster's control plane Node
+// names and reports whether the whole expected set has registered. Callers that
+// need a complete view of the control plane (kube-ovn, the self-built load
+// balancer) use it to hold off until then.
+func (r *clusterReconciler) controlPlaneNodesRegistered(ctx context.Context, cluster *clusterv1.Cluster, workloadClient kubernetes.Interface) ([]string, bool, error) {
 	log := ctrl.LoggerFrom(ctx)
 	if cluster.Spec.ControlPlaneRef == nil || cluster.Spec.ControlPlaneRef.Kind != kubeadmControlPlaneKind || cluster.Spec.ControlPlaneRef.APIVersion != controlplanev1.GroupVersion.String() {
 		return nil, true, nil
@@ -650,7 +709,7 @@ func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx co
 		}).String(),
 	})
 	if err != nil {
-		log.Error(err, "Skipping kube-ovn AppRelease reconcile because control plane Nodes cannot be listed")
+		log.Error(err, "Control plane Nodes cannot be listed")
 		return nil, false, nil
 	}
 
@@ -665,11 +724,11 @@ func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx co
 		return controlPlaneNodes, false, err
 	}
 	if kcp == nil {
-		log.Info("Skipping kube-ovn AppRelease reconcile until KubeadmControlPlane is available")
+		log.Info("Waiting for the KubeadmControlPlane to be available")
 		return controlPlaneNodes, false, nil
 	}
 	if !kcp.DeletionTimestamp.IsZero() {
-		log.Info("Skipping kube-ovn AppRelease reconcile while KubeadmControlPlane is deleting", "KubeadmControlPlane", klog.KObj(kcp))
+		log.Info("Waiting while the KubeadmControlPlane is deleting", "KubeadmControlPlane", klog.KObj(kcp))
 		return controlPlaneNodes, false, nil
 	}
 	if kcp.Spec.Replicas == nil {
@@ -677,7 +736,7 @@ func (r *clusterReconciler) controlPlaneNodesAvailableForKubeOvnReconcile(ctx co
 	}
 
 	if int32(len(controlPlaneNodes)) < *kcp.Spec.Replicas {
-		log.Info("Skipping kube-ovn AppRelease reconcile until all control plane Nodes are registered", "controlPlaneNodes", len(controlPlaneNodes), "desiredControlPlaneReplicas", *kcp.Spec.Replicas)
+		log.Info("Waiting for all control plane Nodes to register", "controlPlaneNodes", len(controlPlaneNodes), "desiredControlPlaneReplicas", *kcp.Spec.Replicas)
 		return controlPlaneNodes, false, nil
 	}
 	return controlPlaneNodes, true, nil

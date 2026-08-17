@@ -104,6 +104,14 @@ const (
 	VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition = "KubeOvnAppReleaseReady"
 )
 
+// VSphereCluster's SelfBuiltLoadBalancerReady condition that will be used in v1Beta2 API version.
+const (
+	// VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition documents the readiness of the
+	// provider-managed control plane load balancer requested via spec.controlPlaneLoadBalancer.
+	// This condition does not contribute to VSphereClusterReadyV1Beta2Condition or VSphereCluster.Status.Ready.
+	VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition = "SelfBuiltLoadBalancerReady"
+)
+
 // VCenterVersion conveys the API version of the vCenter instance.
 type VCenterVersion string
 
@@ -148,6 +156,64 @@ type VSphereClusterSpec struct {
 	// A valid selector will select all failure domains which match the selector.
 	// +optional
 	FailureDomainSelector *metav1.LabelSelector `json:"failureDomainSelector,omitempty"`
+
+	// ControlPlaneLoadBalancer describes the control plane endpoint's load balancer.
+	// When nil, the control plane endpoint is provided by the cluster template or an
+	// external load balancer and the provider does not manage any VIP.
+	//
+	// The field may be backfilled once while it is nil. Once set, every field is
+	// immutable: the endpoint, the apiserver serving certificate and the guest
+	// runtime are all derived from it and cannot be changed in place.
+	// +optional
+	ControlPlaneLoadBalancer *ControlPlaneLoadBalancer `json:"controlPlaneLoadBalancer,omitempty"`
+}
+
+// ControlPlaneLoadBalancerType selects who owns the control plane VIP.
+type ControlPlaneLoadBalancerType string
+
+const (
+	// ControlPlaneLoadBalancerTypeInternal means the provider installs and manages the
+	// control plane VIP (alive: keepalived + IPVS) inside the workload cluster.
+	ControlPlaneLoadBalancerTypeInternal ControlPlaneLoadBalancerType = "internal"
+
+	// ControlPlaneLoadBalancerTypeExternal means the control plane endpoint is provided
+	// by the user. The provider only validates it against spec.controlPlaneEndpoint.
+	ControlPlaneLoadBalancerTypeExternal ControlPlaneLoadBalancerType = "external"
+)
+
+// ControlPlaneLoadBalancer describes the control plane endpoint's load balancer.
+type ControlPlaneLoadBalancer struct {
+	// Type selects who owns the control plane VIP.
+	// +kubebuilder:validation:Enum=internal;external
+	// +kubebuilder:default=external
+	// +optional
+	Type ControlPlaneLoadBalancerType `json:"type,omitempty"`
+
+	// Host is the control plane endpoint address. For type=internal it is the IPv4 VIP.
+	Host string `json:"host"`
+
+	// Port is the control plane endpoint port.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+
+	// VRID is the keepalived VRRP router ID. Only used when type=internal.
+	// The 1-255 range is validated by the webhook, not by the CRD schema, so that
+	// type=external objects are not rejected for leaving it at zero.
+	// +optional
+	VRID int32 `json:"vrid,omitempty"`
+
+	// Interface pins the guest NIC that holds the VIP. Empty means auto-detect
+	// by matching the node's primary IP.
+	// +kubebuilder:validation:MaxLength=15
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:-]*$`
+	// +optional
+	Interface string `json:"interface,omitempty"`
+}
+
+// IsInternal returns true when the provider is responsible for the control plane VIP.
+func (lb *ControlPlaneLoadBalancer) IsInternal() bool {
+	return lb != nil && lb.Type == ControlPlaneLoadBalancerTypeInternal
 }
 
 // ClusterModule holds the anti affinity construct `ClusterModule` identifier
@@ -190,7 +256,8 @@ type VSphereClusterStatus struct {
 // See https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more context.
 type VSphereClusterV1Beta2Status struct {
 	// conditions represents the observations of a VSphereCluster's current state.
-	// Known condition types are Ready, FailureDomainsReady, VCenterAvailable, ClusterModulesReady, KubeOvnAppReleaseReady and Paused.
+	// Known condition types are Ready, FailureDomainsReady, VCenterAvailable, ClusterModulesReady,
+	// KubeOvnAppReleaseReady, SelfBuiltLoadBalancerReady and Paused.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
