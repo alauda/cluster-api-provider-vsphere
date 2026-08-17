@@ -138,6 +138,9 @@ spec:
       apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
       kind: VSphereMachineTemplate
       name: '${CLUSTER_NAME}'
+    metadata:
+      labels:
+        node-role.kubernetes.io/control-plane: ""
   replicas: ${CONTROL_PLANE_MACHINE_COUNT}
   version: '${KUBERNETES_VERSION}'
 ---

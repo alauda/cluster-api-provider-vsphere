@@ -56,6 +56,16 @@ var (
 			Value:     map[string]interface{}{},
 			FieldPath: []string{"spec", "selector", "matchLabels"},
 		},
+		// Labels the Machines the KubeadmControlPlane creates; CAPI propagates
+		// node-role.kubernetes.io/* from the Machine to the Node. It is applied here
+		// rather than on the typed object because the label's value is the empty
+		// string, and deleteZeroValues would prune the whole labels map away.
+		{
+			Kind:      "KubeadmControlPlane",
+			Name:      "${CLUSTER_NAME}",
+			Value:     map[string]interface{}{"node-role.kubernetes.io/control-plane": ""},
+			FieldPath: []string{"spec", "machineTemplate", "metadata", "labels"},
+		},
 		{
 			Kind:      "VSphereClusterTemplate",
 			Name:      "${CLUSTER_CLASS_NAME}",
