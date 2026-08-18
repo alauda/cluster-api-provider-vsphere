@@ -612,10 +612,7 @@ func appReleaseReadiness(appRelease *unstructured.Unstructured, releaseLabel str
 		return appReleaseStatus{reason: reasons.reconciling, message: fmt.Sprintf("waiting for %s AppRelease Health condition", releaseLabel)}
 	}
 
-	if stale, message := appReleaseConditionStale(appRelease, syncCondition, "Sync", releaseLabel); stale {
-		return appReleaseStatus{reason: reasons.reconciling, message: message}
-	}
-	if stale, message := appReleaseConditionStale(appRelease, healthCondition, "Health", releaseLabel); stale {
+	if stale, message := appReleaseStale(appRelease, releaseLabel); stale {
 		return appReleaseStatus{reason: reasons.reconciling, message: message}
 	}
 
@@ -646,14 +643,17 @@ func appReleaseCondition(appRelease *unstructured.Unstructured, conditionType st
 	return nil, false, nil
 }
 
-func appReleaseConditionStale(appRelease *unstructured.Unstructured, condition map[string]any, conditionType, releaseLabel string) (bool, string) {
+func appReleaseStale(appRelease *unstructured.Unstructured, releaseLabel string) (bool, string) {
 	generation := appRelease.GetGeneration()
-	observedGeneration, ok := conditionInt64(condition, "observedGeneration")
-	if !ok {
-		return true, fmt.Sprintf("waiting for %s AppRelease %s condition observedGeneration", releaseLabel, conditionType)
+	observedGeneration, found, err := unstructured.NestedInt64(appRelease.Object, "status", "observedGeneration")
+	if err != nil {
+		return true, fmt.Sprintf("invalid %s AppRelease status observedGeneration: %v", releaseLabel, err)
+	}
+	if !found {
+		return true, fmt.Sprintf("waiting for %s AppRelease observedGeneration", releaseLabel)
 	}
 	if observedGeneration != generation {
-		return true, fmt.Sprintf("waiting for %s AppRelease %s condition to observe generation %d", releaseLabel, conditionType, generation)
+		return true, fmt.Sprintf("waiting for %s AppRelease to observe generation %d", releaseLabel, generation)
 	}
 	return false, ""
 }
@@ -676,21 +676,6 @@ func appReleaseConditionMessage(releaseLabel, conditionType string, condition ma
 func conditionString(condition map[string]any, field string) string {
 	value, _ := condition[field].(string)
 	return value
-}
-
-func conditionInt64(condition map[string]any, field string) (int64, bool) {
-	switch value := condition[field].(type) {
-	case int64:
-		return value, true
-	case int32:
-		return int64(value), true
-	case int:
-		return int64(value), true
-	case float64:
-		return int64(value), true
-	default:
-		return 0, false
-	}
 }
 
 // controlPlaneNodesRegistered lists the workload cluster's control plane Node

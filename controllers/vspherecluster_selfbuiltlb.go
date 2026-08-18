@@ -404,12 +404,24 @@ func aliveVersionFor(modulePlugin *unstructured.Unstructured, clusterModuleVersi
 	}
 
 	if clusterModuleVersion != "" {
-		targetVersions, found, err := unstructured.NestedStringMap(modulePlugin.Object, "status", "targetClusterVersions")
+		targetVersions, found, err := unstructured.NestedMap(modulePlugin.Object, "status", "targetClusterVersions")
 		if err != nil {
 			return "", pkgerrors.Wrap(err, "failed to read ModulePlugin alive status.targetClusterVersions")
 		}
 		if found {
-			if version, ok := targetVersions[clusterModuleVersion]; ok && version != "" {
+			target, ok := targetVersions[clusterModuleVersion]
+			if ok {
+				targetStatus, ok := target.(map[string]interface{})
+				if !ok {
+					return "", fmt.Errorf("invalid ModulePlugin alive status.targetClusterVersions[%q]: expected an object", clusterModuleVersion)
+				}
+				version, found, err := unstructured.NestedString(targetStatus, "version")
+				if err != nil {
+					return "", pkgerrors.Wrapf(err, "failed to read ModulePlugin alive status.targetClusterVersions[%q].version", clusterModuleVersion)
+				}
+				if !found || version == "" {
+					return "", fmt.Errorf("invalid ModulePlugin alive status.targetClusterVersions[%q]: missing version", clusterModuleVersion)
+				}
 				return version, nil
 			}
 		}

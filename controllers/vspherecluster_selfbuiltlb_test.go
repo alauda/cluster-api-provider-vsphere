@@ -165,26 +165,39 @@ func TestAliveVersionFor(t *testing.T) {
 		}
 		return &unstructured.Unstructured{Object: map[string]interface{}{"status": status}}
 	}
+	targetStatus := func(version string) map[string]interface{} {
+		return map[string]interface{}{
+			"version":        version,
+			"readyForDeploy": true,
+		}
+	}
 
 	t.Run("the provider override wins", func(t *testing.T) {
 		g := NewWithT(t)
-		version, err := aliveVersionFor(modulePlugin("v4.1.0", map[string]interface{}{"v1.31": "v4.0.0"}), "v1.31", "v3.9.0")
+		version, err := aliveVersionFor(modulePlugin("v4.1.0", map[string]interface{}{"v1.31": targetStatus("v4.0.0")}), "v1.31", "v3.9.0")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(version).To(Equal("v3.9.0"))
 	})
 
 	t.Run("the cluster version mapping beats latestVersion", func(t *testing.T) {
 		g := NewWithT(t)
-		version, err := aliveVersionFor(modulePlugin("v4.1.0", map[string]interface{}{"v1.31": "v4.0.0"}), "v1.31", "")
+		version, err := aliveVersionFor(modulePlugin("v4.1.0", map[string]interface{}{"v1.31": targetStatus("v4.0.0")}), "v1.31", "")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(version).To(Equal("v4.0.0"))
 	})
 
 	t.Run("falls back to latestVersion when the cluster version is unmapped", func(t *testing.T) {
 		g := NewWithT(t)
-		version, err := aliveVersionFor(modulePlugin("v4.1.0", map[string]interface{}{"v1.30": "v4.0.0"}), "v1.31", "")
+		version, err := aliveVersionFor(modulePlugin("v4.1.0", map[string]interface{}{"v1.30": targetStatus("v4.0.0")}), "v1.31", "")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(version).To(Equal("v4.1.0"))
+	})
+
+	t.Run("rejects a mapped target without a version", func(t *testing.T) {
+		g := NewWithT(t)
+		_, err := aliveVersionFor(modulePlugin("v4.1.0", map[string]interface{}{"v1.31": map[string]interface{}{"readyForDeploy": true}}), "v1.31", "")
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring(`targetClusterVersions["v1.31"]: missing version`))
 	})
 
 	t.Run("fails when nothing resolves", func(t *testing.T) {
