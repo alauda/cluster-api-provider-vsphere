@@ -37,6 +37,10 @@ type VMContext struct {
 	Session              *session.Session
 	VSphereFailureDomain *infrav1.VSphereFailureDomain
 	MachineConfigSlot    *infrav1.MachineConfigSlot
+	// InventoryMetadata contains the desired provider-owned vSphere custom
+	// attributes for this VM. A non-nil empty map means stale provider-owned
+	// values should be cleared.
+	InventoryMetadata map[string]string
 	// SelfBuiltLB carries the provider-managed control plane VIP that has to be
 	// present before kubeadm runs. It is nil unless the owning VSphereCluster
 	// declares spec.controlPlaneLoadBalancer.type=internal.

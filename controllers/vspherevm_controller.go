@@ -111,7 +111,8 @@ func AddVMControllerToManager(ctx context.Context, controllerManagerCtx *capvcon
 					UpdateFunc: func(e event.UpdateEvent) bool {
 						oldCluster := e.ObjectOld.(*infrav1.VSphereCluster)
 						newCluster := e.ObjectNew.(*infrav1.VSphereCluster)
-						return !clustermodule.Compare(oldCluster.Spec.ClusterModules, newCluster.Spec.ClusterModules)
+						return !clustermodule.Compare(oldCluster.Spec.ClusterModules, newCluster.Spec.ClusterModules) ||
+							inventoryMetadataChanged(oldCluster, newCluster)
 					},
 					CreateFunc:  func(event.CreateEvent) bool { return false },
 					DeleteFunc:  func(event.DeleteEvent) bool { return false },
@@ -371,6 +372,7 @@ func (r vmReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.R
 		VSphereFailureDomain:     vsphereFailureDomain,
 		Session:                  authSession,
 		PatchHelper:              patchHelper,
+		InventoryMetadata:        inventoryMetadataFromObjects(cluster, vsphereCluster),
 	}
 
 	if vsphereMachine.Spec.MachineConfigPoolRef != nil {

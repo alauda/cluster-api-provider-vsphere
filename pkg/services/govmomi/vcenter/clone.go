@@ -63,6 +63,7 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 		Session:                  vmCtx.Session,
 		PatchHelper:              vmCtx.PatchHelper,
 		MachineConfigSlot:        vmCtx.MachineConfigSlot,
+		InventoryMetadata:        vmCtx.InventoryMetadata,
 	}
 	log.Info("Starting clone process")
 	log.Info("Clone received bootstrap payload", "format", string(format), "bootstrapBytes", len(bootstrapData), "hasMachineConfigSlot", vmCtx.MachineConfigSlot != nil)

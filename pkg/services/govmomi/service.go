@@ -237,6 +237,10 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 		return vm, err
 	}
 
+	if err := reconcileInventoryMetadata(ctx, virtualMachineCtx); err != nil {
+		return vm, err
+	}
+
 	if ok, err := vms.reconcilePowerState(ctx, virtualMachineCtx); err != nil || !ok {
 		return vm, err
 	}
