@@ -78,6 +78,12 @@ type Options struct {
 	//
 	// Defaults to the empty string and by that not filter anything.
 	WatchFilterValue string
+
+	// PluginAliveVersion pins the alive plugin version used for self-built control
+	// plane load balancers, overriding the version the ModulePlugin advertises.
+	//
+	// Defaults to the empty string, which selects the version from the platform.
+	PluginAliveVersion string
 }
 
 func (o *Options) defaults() {

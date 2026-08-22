@@ -91,6 +91,7 @@ func New(ctx context.Context, opts Options) (Manager, error) {
 		Password:                opts.Password,
 		NetworkProvider:         opts.NetworkProvider,
 		WatchFilterValue:        opts.WatchFilterValue,
+		PluginAliveVersion:      opts.PluginAliveVersion,
 	}
 
 	// Add the requested items to the manager.

@@ -1113,6 +1113,7 @@ func autoConvert_v1beta1_VSphereClusterSpec_To_v1alpha4_VSphereClusterSpec(in *v
 	// WARNING: in.ClusterModules requires manual conversion: does not exist in peer-type
 	// WARNING: in.DisableClusterModule requires manual conversion: does not exist in peer-type
 	// WARNING: in.FailureDomainSelector requires manual conversion: does not exist in peer-type
+	// WARNING: in.ControlPlaneLoadBalancer requires manual conversion: does not exist in peer-type
 	return nil
 }
 
@@ -1598,6 +1599,7 @@ func autoConvert_v1beta1_VSphereMachineSpec_To_v1alpha4_VSphereMachineSpec(in *v
 	// WARNING: in.PowerOffMode requires manual conversion: does not exist in peer-type
 	// WARNING: in.GuestSoftPowerOffTimeout requires manual conversion: does not exist in peer-type
 	// WARNING: in.NamingStrategy requires manual conversion: does not exist in peer-type
+	// WARNING: in.MachineConfigPoolRef requires manual conversion: does not exist in peer-type
 	return nil
 }
 

@@ -1,11 +1,11 @@
 # P1-7　Pool 槽位非持久化数据盘（ephemeral disks）实现设计
 
 面向 K / 差距 #15 的落地设计，背景、动机与验收标准见
-[`20260725-acp-provider-standard-gap-analysis.md`](20260725-acp-provider-standard-gap-analysis.md)
+[`requirements-and-research.md`](requirements-and-research.md)
 的 P1-7 节与差距表，此处不重复。
 
 **依赖前提**：持久盘认盘加固（确定 vmdk 路径、删容量猜盘、`DeterministicDiskName` 命名）见
-[`20260730-persistent-disk-status-matching.md`](20260730-persistent-disk-status-matching.md)。非持久盘与持久盘
+[`design-persistent-disk-status-matching.md`](design-persistent-disk-status-matching.md)。非持久盘与持久盘
 共用建盘（`createDataDisks`）、并盘（`mergeSlot*Disks`）、盘表生成（`GetPersistentDiskCloudConfig`）与 guest 侧
 reconcile 脚本，仅在「如何认盘」与「生命周期」两处不同。
 
@@ -113,15 +113,4 @@ condition，`PersistentDisksReady` 语义不变，v1beta1/v1beta2 无联动。
 
 ## 测试
 
-- `pkg/services/govmomi/vcenter/clone_test.go`：非持久盘恒 `FileOperationCreate`、不记录 VolumePath、unit 回填；
-  与持久盘 unit 不冲突。
-- `pkg/services/machineconfigpool_test.go`：`ApplyDiskBackfill` 落 `ephemeralDiskStatuses`、`HydrateSlotFromStatus`
-  读回 unit；跨两类 name/mountPath 唯一性校验。
-- `pkg/util/machines_test.go`：盘表含非持久盘行（unit、空 UUID、wipe=false）；持久盘 + 非持久盘混合并盘
-  （`upsertDataDisk`）。
-- `DestroyVM` 断言不 detach 非持久盘。
-
-命令：`go test -vet=off ./...`；controllers 包带
-`KUBEBUILDER_ASSETS=/home/vscode/.local/share/kubebuilder-envtest/k8s/1.32.0-linux-amd64`。
-`apis/v1alpha3` fuzz 转换失败、`pkg/services/govmomi/metadata` 与
-`TestUpdateKubeadmNodeRegistrationJoinWithoutKubernetesVersion` 为既有问题，忽略。
+环境验收见 [test-cases.md](test-cases.md) TC-CAPV-ACP-07，单测清单见同文第 3 章。

@@ -33,7 +33,7 @@ The first step to running the e2e tests is setting up the required environment v
 | `VSPHERE_SSH_PRIVATE_KEY`    | The file path of the private key used to ssh into the CAPV VMs                                                    | `/home/foo/bar-ssh.key`                                                          |
 | `VSPHERE_SSH_AUTHORIZED_KEY` | The public key that is added to the CAPV VMs                                                                      | `ssh-rsa ABCDEF...XYZ=`                                                          |
 | `VSPHERE_TLS_THUMBPRINT`     | The TLS thumbprint of the vSphere server's certificate which should be trusted                                    | `2A:3F:BC:CA:C0:96:35:D4:B7:A2:AA:3C:C1:33:D9:D7:BE:EC:31:55`                    |
-| `CONTROL_PLANE_ENDPOINT_IP`  | The IP that kube-vip should use as a control plane endpoint. It will not be used if `E2E_VSPHERE_IP_POOL` is set. | `10.10.123.100`                                                                  |
+| `CONTROL_PLANE_ENDPOINT_IP`  | The IP used as the control plane endpoint. It will not be used if `E2E_VSPHERE_IP_POOL` is set. | `10.10.123.100`                                                                  |
 | `VSPHERE_STORAGE_POLICY`     | The name of an existing vSphere storage policy to be assigned to created VMs                                      | `my-test-sp`                                                                     |
 
 ### Flags

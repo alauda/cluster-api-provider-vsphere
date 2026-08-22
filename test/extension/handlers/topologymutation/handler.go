@@ -40,7 +40,6 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	vmwarev1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/vmware/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-vsphere/internal/clusterclass"
-	"sigs.k8s.io/cluster-api-provider-vsphere/internal/kubevip"
 )
 
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;patch;update;create
@@ -130,28 +129,6 @@ func patchKubeadmControlPlaneTemplate(_ context.Context, tpl *controlplanev1.Kub
 	// patch enableSSHIntoNodes
 	if err := patchUsers(&tpl.Spec.Template.Spec.KubeadmConfigSpec, templateVariables); err != nil {
 		return err
-	}
-
-	// patch kubeVipPodManifest
-	kubeVipPodManifest, err := topologymutation.GetStringVariable(templateVariables, "kubeVipPodManifest")
-	kubeVipPodManifestNotFound := topologymutation.IsNotFoundError(err)
-	if err != nil && !kubeVipPodManifestNotFound {
-		return err
-	}
-	// Skip patch if kubeVipPodManifest variable was not found / not set.
-	if !kubeVipPodManifestNotFound {
-		controlPlaneIPAddr, err := topologymutation.GetStringVariable(templateVariables, "controlPlaneIpAddr")
-		if err != nil {
-			return err
-		}
-		kubeVipPodManifestModified := regexp.MustCompile("(name: address\n +value:).*").ReplaceAllString(kubeVipPodManifest, fmt.Sprintf("$1 %s", controlPlaneIPAddr))
-
-		for _, file := range kubevip.Files() {
-			if file.Path == "/etc/kubernetes/manifests/kube-vip.yaml" {
-				file.Content = kubeVipPodManifestModified
-			}
-			tpl.Spec.Template.Spec.KubeadmConfigSpec.Files = append(tpl.Spec.Template.Spec.KubeadmConfigSpec.Files, file)
-		}
 	}
 
 	// patch preKubeadmScript

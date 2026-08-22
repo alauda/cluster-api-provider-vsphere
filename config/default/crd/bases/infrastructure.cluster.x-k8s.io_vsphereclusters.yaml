@@ -696,6 +696,51 @@ spec:
                 - host
                 - port
                 type: object
+              controlPlaneLoadBalancer:
+                description: |-
+                  ControlPlaneLoadBalancer describes the control plane endpoint's load balancer.
+                  When nil, the control plane endpoint is provided by the cluster template or an
+                  external load balancer and the provider does not manage any VIP.
+
+                  The field may be backfilled once while it is nil. Once set, every field is
+                  immutable: the endpoint, the apiserver serving certificate and the guest
+                  runtime are all derived from it and cannot be changed in place.
+                properties:
+                  host:
+                    description: Host is the control plane endpoint address. For type=internal
+                      it is the IPv4 VIP.
+                    type: string
+                  interface:
+                    description: |-
+                      Interface pins the guest NIC that holds the VIP. Empty means auto-detect
+                      by matching the node's primary IP.
+                    maxLength: 15
+                    pattern: ^[A-Za-z0-9_.:-]*$
+                    type: string
+                  port:
+                    description: Port is the control plane endpoint port.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  type:
+                    default: external
+                    description: Type selects who owns the control plane VIP.
+                    enum:
+                    - internal
+                    - external
+                    type: string
+                  vrid:
+                    description: |-
+                      VRID is the keepalived VRRP router ID. Only used when type=internal.
+                      The 1-255 range is validated by the webhook, not by the CRD schema, so that
+                      type=external objects are not rejected for leaving it at zero.
+                    format: int32
+                    type: integer
+                required:
+                - host
+                - port
+                type: object
               disableClusterModule:
                 description: |-
                   DisableClusterModule is used to explicitly turn off the ClusterModule feature.
@@ -865,7 +910,8 @@ spec:
                   conditions:
                     description: |-
                       conditions represents the observations of a VSphereCluster's current state.
-                      Known condition types are Ready, FailureDomainsReady, VCenterAvailable, ClusterModulesReady and Paused.
+                      Known condition types are Ready, FailureDomainsReady, VCenterAvailable, ClusterModulesReady,
+                      KubeOvnAppReleaseReady, SelfBuiltLoadBalancerReady and Paused.
                     items:
                       description: Condition contains details for one aspect of the
                         current state of this API Resource.

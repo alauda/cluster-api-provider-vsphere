@@ -40,6 +40,7 @@ func (src *VSphereCluster) ConvertTo(dstRaw conversion.Hub) error {
 		dst.Spec.IdentityRef = restored.Spec.IdentityRef
 	}
 	dst.Status.V1Beta2 = restored.Status.V1Beta2
+	dst.Spec.ControlPlaneLoadBalancer = restored.Spec.ControlPlaneLoadBalancer
 
 	return nil
 }

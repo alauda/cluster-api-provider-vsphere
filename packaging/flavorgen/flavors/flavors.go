@@ -24,7 +24,6 @@ import (
 
 	"sigs.k8s.io/cluster-api-provider-vsphere/packaging/flavorgen/flavors/crs"
 	"sigs.k8s.io/cluster-api-provider-vsphere/packaging/flavorgen/flavors/env"
-	"sigs.k8s.io/cluster-api-provider-vsphere/packaging/flavorgen/flavors/kubevip"
 )
 
 const (
@@ -41,7 +40,7 @@ const (
 	ClusterTopologySupervisor = "cluster-topology-supervisor"
 )
 
-func ClusterClassTemplateWithKubeVIP() []runtime.Object {
+func ClusterClassTemplateGovmomi() []runtime.Object {
 	vSphereClusterTemplate := newVSphereClusterTemplate()
 	clusterClass := newClusterClass()
 	machineTemplate := newVSphereMachineTemplate(fmt.Sprintf("%s-template", env.ClusterClassNameVar))
@@ -81,7 +80,7 @@ func ClusterClassTemplateSupervisor() []runtime.Object {
 	return ClusterClassTemplate
 }
 
-func ClusterTopologyTemplateKubeVIP() ([]runtime.Object, error) {
+func ClusterTopologyTemplateGovmomi() ([]runtime.Object, error) {
 	cluster, err := newClusterTopologyCluster(false)
 	if err != nil {
 		return nil, err
@@ -123,12 +122,11 @@ func ClusterTopologyTemplateSupervisor() ([]runtime.Object, error) {
 	return MultiNodeTemplate, nil
 }
 
-func MultiNodeTemplateWithKubeVIP() ([]runtime.Object, error) {
+func MultiNodeTemplateGovmomi() ([]runtime.Object, error) {
 	vsphereCluster := newVSphereCluster()
 	cpMachineTemplate := newVSphereMachineTemplate(env.ClusterNameVar)
 	workerMachineTemplate := newVSphereMachineTemplate(fmt.Sprintf("%s-worker", env.ClusterNameVar))
 	controlPlane := newKubeadmControlplane(&cpMachineTemplate, nil)
-	kubevip.PatchControlPlane(&controlPlane)
 
 	kubeadmJoinTemplate := newKubeadmConfigTemplate(fmt.Sprintf("%s%s", env.ClusterNameVar, env.MachineDeploymentNameSuffix), true)
 	cluster := newCluster(&vsphereCluster, &controlPlane)
@@ -165,7 +163,6 @@ func MultiNodeTemplateSupervisor() ([]runtime.Object, error) {
 	workerMachineTemplate := newVMWareMachineTemplate(fmt.Sprintf("%s-worker", env.ClusterNameVar))
 	controlPlane := newKubeadmControlplane(&cpMachineTemplate, nil)
 	controlPlane.Spec.KubeadmConfigSpec.PreKubeadmCommands = append([]string{"dhclient eth0"}, controlPlane.Spec.KubeadmConfigSpec.PreKubeadmCommands...)
-	kubevip.PatchControlPlane(&controlPlane)
 
 	kubeadmJoinTemplate := newKubeadmConfigTemplate(fmt.Sprintf("%s%s", env.ClusterNameVar, env.MachineDeploymentNameSuffix), true)
 	kubeadmJoinTemplate.Spec.Template.Spec.PreKubeadmCommands = append([]string{"dhclient eth0"}, kubeadmJoinTemplate.Spec.Template.Spec.PreKubeadmCommands...)
@@ -228,12 +225,11 @@ func MultiNodeTemplateWithExternalLoadBalancer() ([]runtime.Object, error) {
 	return MultiNodeTemplate, nil
 }
 
-func MultiNodeTemplateWithKubeVIPIgnition() ([]runtime.Object, error) {
+func MultiNodeTemplateIgnition() ([]runtime.Object, error) {
 	vsphereCluster := newVSphereCluster()
 	machineTemplate := newVSphereMachineTemplate(env.ClusterNameVar)
 
 	controlPlane := newIgnitionKubeadmControlplane(machineTemplate, nil)
-	kubevip.PatchControlPlane(&controlPlane)
 
 	// CABPK requires specifying file permissions in Ignition mode. Set a default value if not set.
 	for i := range controlPlane.Spec.KubeadmConfigSpec.Files {
@@ -270,12 +266,11 @@ func MultiNodeTemplateWithKubeVIPIgnition() ([]runtime.Object, error) {
 	return MultiNodeTemplate, nil
 }
 
-func MultiNodeTemplateWithKubeVIPNodeIPAM() ([]runtime.Object, error) {
+func MultiNodeTemplateNodeIPAM() ([]runtime.Object, error) {
 	vsphereCluster := newVSphereCluster()
 	cpMachineTemplate := newNodeIPAMVSphereMachineTemplate(env.ClusterNameVar)
 	workerMachineTemplate := newNodeIPAMVSphereMachineTemplate(fmt.Sprintf("%s-worker", env.ClusterNameVar))
 	controlPlane := newKubeadmControlplane(&cpMachineTemplate, nil)
-	kubevip.PatchControlPlane(&controlPlane)
 
 	kubeadmJoinTemplate := newKubeadmConfigTemplate(fmt.Sprintf("%s%s", env.ClusterNameVar, env.MachineDeploymentNameSuffix), true)
 	cluster := newCluster(&vsphereCluster, &controlPlane)

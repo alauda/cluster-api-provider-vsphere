@@ -237,6 +237,10 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 		return vm, err
 	}
 
+	if err := reconcileInventoryMetadata(ctx, virtualMachineCtx); err != nil {
+		return vm, err
+	}
+
 	if ok, err := vms.reconcilePowerState(ctx, virtualMachineCtx); err != nil || !ok {
 		return vm, err
 	}
@@ -825,6 +829,24 @@ func (vms *VMService) reconcileBootstrapUserData(ctx context.Context, virtualMac
 	mergedUserData, err = util.UpdateKubeadmNodeRegistration(mergedUserData, identity.Hostname, identity.NodeIP)
 	if err != nil {
 		return false, err
+	}
+
+	// The bootstrap VIP has to exist before kubeadm runs, and only on the node
+	// that runs `kubeadm init` — joining nodes reach the endpoint through the VIP
+	// the init node (or, later, alive) already holds.
+	if virtualMachineCtx.SelfBuiltLB != nil && util.IsKubeadmInitUserData(mergedUserData) {
+		bootstrapVIPConfig, err := util.GetBootstrapVIPCloudConfig(
+			virtualMachineCtx.SelfBuiltLB.VIP,
+			identity.NodeIP,
+			virtualMachineCtx.SelfBuiltLB.Interface,
+		)
+		if err != nil {
+			return false, err
+		}
+		mergedUserData, err = util.MergeCloudConfigUserData(mergedUserData, bootstrapVIPConfig)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	if virtualMachineCtx.MachineConfigSlot != nil &&

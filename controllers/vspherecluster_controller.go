@@ -61,6 +61,13 @@ import (
 // +kubebuilder:rbac:groups=topology.tanzu.vmware.com,resources=availabilityzones,verbs=get;list;watch
 // +kubebuilder:rbac:groups=topology.tanzu.vmware.com,resources=availabilityzones/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups=topology.tanzu.vmware.com,resources=zones,verbs=get;list;watch
+// Self-built control plane load balancer: the provider owns the alive ModuleInfo and
+// reads the platform objects the generic ModuleInfo rendering pipeline depends on.
+// +kubebuilder:rbac:groups=cluster.alauda.io,resources=moduleinfoes,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=cluster.alauda.io,resources=moduleinfoes/status,verbs=get
+// +kubebuilder:rbac:groups=cluster.alauda.io,resources=moduleplugins;moduleconfigs;clustermodules,verbs=get;list;watch
+// +kubebuilder:rbac:groups=platform.tkestack.io,resources=clusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups=clusterregistry.k8s.io,resources=clusters,verbs=get;list;watch
 
 // AddClusterControllerToManager adds the cluster controller to the provided
 // manager.

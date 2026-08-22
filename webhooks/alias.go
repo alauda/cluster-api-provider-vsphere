@@ -22,6 +22,14 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/internal/webhooks"
 )
 
+// VSphereCluster implements a validation webhook for VSphereCluster.
+type VSphereCluster struct{}
+
+// SetupWebhookWithManager sets up VSphereCluster webhooks.
+func (webhook *VSphereCluster) SetupWebhookWithManager(mgr ctrl.Manager) error {
+	return (&webhooks.VSphereCluster{}).SetupWebhookWithManager(mgr)
+}
+
 // VSphereClusterTemplate implements a validation webhook for VSphereClusterTemplate.
 type VSphereClusterTemplate struct{}
 

@@ -515,7 +515,7 @@ var _ = Describe("VIM based VSphere ClusterReconciler", func() {
 	})
 })
 
-func TestClusterReconciler_ControlPlaneNodesAvailableForKubeOvnReconcile(t *testing.T) {
+func TestClusterReconciler_ControlPlaneNodesRegistered(t *testing.T) {
 	tests := []struct {
 		name          string
 		desired       int32
@@ -589,7 +589,7 @@ func TestClusterReconciler_ControlPlaneNodesAvailableForKubeOvnReconcile(t *test
 				})
 			}
 			r := clusterReconciler{Client: controllerManagerContext.Client}
-			controlPlaneNodes, ready, err := r.controlPlaneNodesAvailableForKubeOvnReconcile(ctx, cluster, workloadClient)
+			controlPlaneNodes, ready, err := r.controlPlaneNodesRegistered(ctx, cluster, workloadClient)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(ready).To(Equal(tt.wantReady))
 			if tt.wantReady {
@@ -682,19 +682,21 @@ func TestBuildKubeOvnAppReleaseSetsControlPlaneNodes(t *testing.T) {
 }
 
 func TestKubeOvnAppReleaseReadiness(t *testing.T) {
-	condition := func(conditionType string, status corev1.ConditionStatus, observedGeneration int64, reason, message string) map[string]any {
+	condition := func(conditionType string, status corev1.ConditionStatus, reason, message string) map[string]any {
 		return map[string]any{
-			"type":               conditionType,
-			"status":             string(status),
-			"observedGeneration": observedGeneration,
-			"reason":             reason,
-			"message":            message,
+			"type":    conditionType,
+			"status":  string(status),
+			"reason":  reason,
+			"message": message,
 		}
 	}
-	appRelease := func(generation int64, conditions []any) *unstructured.Unstructured {
+	appRelease := func(generation, observedGeneration int64, conditions []any) *unstructured.Unstructured {
 		return &unstructured.Unstructured{Object: map[string]any{
 			"metadata": map[string]any{"generation": generation},
-			"status":   map[string]any{"conditions": conditions},
+			"status": map[string]any{
+				"observedGeneration": observedGeneration,
+				"conditions":         conditions,
+			},
 		}}
 	}
 
@@ -706,26 +708,37 @@ func TestKubeOvnAppReleaseReadiness(t *testing.T) {
 		wantMessage string
 	}{
 		{
-			name:       "ready when Sync and Health are true for current generation",
-			appRelease: appRelease(2, []any{condition("Sync", corev1.ConditionTrue, 2, "Synced", ""), condition("Health", corev1.ConditionTrue, 2, "Ready", "")}),
+			name:       "ready when top-level observedGeneration is current",
+			appRelease: appRelease(2, 2, []any{condition("Sync", corev1.ConditionTrue, "Synced", ""), condition("Health", corev1.ConditionTrue, "Ready", "")}),
 			wantReady:  true,
 			wantReason: infrav1.KubeOvnAppReleaseReadyReason,
 		},
 		{
 			name:        "waiting when Sync condition is missing",
-			appRelease:  appRelease(1, []any{condition("Health", corev1.ConditionTrue, 1, "Ready", "")}),
+			appRelease:  appRelease(1, 1, []any{condition("Health", corev1.ConditionTrue, "Ready", "")}),
 			wantReason:  infrav1.KubeOvnAppReleaseReconcilingReason,
 			wantMessage: "waiting for kube-ovn AppRelease Sync condition",
 		},
 		{
-			name:        "waiting when observedGeneration is stale",
-			appRelease:  appRelease(2, []any{condition("Sync", corev1.ConditionTrue, 1, "Synced", ""), condition("Health", corev1.ConditionTrue, 2, "Ready", "")}),
+			name:        "waiting when top-level observedGeneration is stale",
+			appRelease:  appRelease(2, 1, []any{condition("Sync", corev1.ConditionTrue, "Synced", ""), condition("Health", corev1.ConditionTrue, "Ready", "")}),
 			wantReason:  infrav1.KubeOvnAppReleaseReconcilingReason,
-			wantMessage: "waiting for kube-ovn AppRelease Sync condition to observe generation 2",
+			wantMessage: "waiting for kube-ovn AppRelease to observe generation 2",
+		},
+		{
+			name: "waiting when top-level observedGeneration is missing",
+			appRelease: &unstructured.Unstructured{Object: map[string]any{
+				"metadata": map[string]any{"generation": int64(1)},
+				"status": map[string]any{
+					"conditions": []any{condition("Sync", corev1.ConditionTrue, "Synced", ""), condition("Health", corev1.ConditionTrue, "Ready", "")},
+				},
+			}},
+			wantReason:  infrav1.KubeOvnAppReleaseReconcilingReason,
+			wantMessage: "waiting for kube-ovn AppRelease observedGeneration",
 		},
 		{
 			name:        "not ready when Health is false",
-			appRelease:  appRelease(1, []any{condition("Sync", corev1.ConditionTrue, 1, "Synced", ""), condition("Health", corev1.ConditionFalse, 1, "Progressing", "waiting for pods")}),
+			appRelease:  appRelease(1, 1, []any{condition("Sync", corev1.ConditionTrue, "Synced", ""), condition("Health", corev1.ConditionFalse, "Progressing", "waiting for pods")}),
 			wantReason:  infrav1.KubeOvnAppReleaseNotReadyReason,
 			wantMessage: "kube-ovn AppRelease Health condition is Progressing: waiting for pods",
 		},

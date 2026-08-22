@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,16 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package kubevip exposes functions to add kubevip to templates.
-package kubevip
+// Package inventory defines the contract for provider-owned metadata copied to
+// vSphere inventory objects.
+package inventory
 
-import (
-	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
-
-	"sigs.k8s.io/cluster-api-provider-vsphere/internal/kubevip"
-)
-
-// PatchControlPlane adds kube-vip to a KubeadmControlPlane object.
-func PatchControlPlane(cp *controlplanev1.KubeadmControlPlane) {
-	cp.Spec.KubeadmConfigSpec.Files = append(cp.Spec.KubeadmConfigSpec.Files, kubevip.Files()...)
-}
+// AnnotationPrefix selects annotations that are safe to copy to vSphere VM
+// custom attributes. The full annotation key is retained as the custom field
+// name so external cleanup tooling can query the same key/value contract.
+const AnnotationPrefix = "vsphere.cluster.x-k8s.io/"
