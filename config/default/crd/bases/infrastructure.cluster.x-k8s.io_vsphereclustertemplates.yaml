@@ -185,12 +185,13 @@ spec:
                       controlPlaneLoadBalancer:
                         description: |-
                           ControlPlaneLoadBalancer describes the control plane endpoint's load balancer.
-                          When nil, the control plane endpoint is provided by the cluster template or an
-                          external load balancer and the provider does not manage any VIP.
+                          Leaving it nil is allowed and means the same as type=external: the endpoint is
+                          provided by the user and the provider manages no VIP.
 
-                          The field may be backfilled once while it is nil. Once set, every field is
-                          immutable: the endpoint, the apiserver serving certificate and the guest
-                          runtime are all derived from it and cannot be changed in place.
+                          The field is set when the cluster is created or never: it cannot be added to
+                          an existing cluster, and once set every field is immutable and the field
+                          cannot be cleared. The endpoint, the apiserver serving certificate and the
+                          guest runtime are all derived from it and cannot be changed in place.
                         properties:
                           host:
                             description: Host is the control plane endpoint address.

@@ -24,8 +24,8 @@ vSphere self-built LB 采用 alive。用户在 `VSphereCluster.spec.controlPlane
 | bootstrap | 仅 `kubeadm init` 节点注入临时 VIP，走 cloud-config write_files + `runcmd` 前插；失败即阻断 kubeadm。 | `4` |
 | backend 来源 | provider 不写 `masterIPs`；alive valuesTemplate 从 workload control-plane Node `InternalIP` 生成。 | `5.2` |
 | 状态表达 | 新增 `SelfBuiltLoadBalancerReady` condition，v1beta1 与 v1beta2 双写。与 DCS 不同。 | `3.2` |
-| 可变性 | 字段为空时允许一次性回填；一旦非空，`type`、`host`、`port`、`vrid`、`interface` 全部不可变，无放行入口。 | `3.1`、`6` |
-| 存量集群 | 不推荐自动迁移，provider 升级不改变已有集群行为；外部 LB → alive 因 endpoint 变更需单独运维窗口。 | `9` |
+| 可变性 | 只在 CREATE 时可写：UPDATE 时 `nil` 不允许写成任何值，非空后 `type`、`host`、`port`、`vrid`、`interface` 全部不可变，也不允许置回 `nil`。无放行入口。 | `3.1`、`6` |
+| 存量集群 | provider 升级不改变已有集群行为；字段为空的集群不能改用 self-built LB，只能新建集群启用。 | `6`、`9` |
 | 删除边界 | cluster 删除不新增 self-built LB cleanup；minfo 清理走 platform Cluster `OwnerReference` 与 GC 通用链路。 | `7` |
 | 依赖边界 | provider 只检查通用 minfo 渲染前置对象和 alive 制品，不合成 platform Cluster、`ClusterModule` 或 clusterregistry Cluster；不引入 alauda 编译期依赖，统一用 `unstructured`。 | `5.2`、`10` |
 
@@ -46,10 +46,9 @@ vSphere self-built LB 采用 alive。用户在 `VSphereCluster.spec.controlPlane
 
 - 不调用 NSX ALB / NSX-T LB 等 vSphere 生态的独立 LB 产品 API。
 - 不把 alive 安装职责交给 provider-alauda 或 cluster-transformer 的自动插件安装链路，也不为此改造这两个组件。
-- 不支持修改已写入的 `controlPlaneLoadBalancer`，包括 LB 模式和任一关键字段。
+- 不支持在集群创建后设置或修改 `controlPlaneLoadBalancer`：字段为空的集群不能改用 self-built LB，已写入的不能改 LB 模式或任一关键字段。
 - 不支持 control-plane 节点原地重启升级；节点升级只走 CAPI 滚动替换。bootstrap VIP 相应只保证一次性建立，不保证跨重启存活。
 - 不在 provider 升级过程中把已有集群自动迁移成 `type=internal`。
-- 不承诺外部 LB 到 alive 的无中断原地切换。
 - 不提供 Service type=LoadBalancer 的 VIP 能力；alive 只承担 control-plane VIP。
 - 不实现 IPv6 或 dual-stack self-built LB。
 - 不改变 supervisor 模式（`apis/vmware/v1beta1`）已有的 `LoadBalancerReady` 语义。
@@ -96,8 +95,8 @@ vSphere self-built LB 采用 alive。用户在 `VSphereCluster.spec.controlPlane
 
 ```go
 // ControlPlaneLoadBalancer describes the control plane endpoint's load balancer.
-// When nil, the control plane endpoint is provided by the cluster template or an
-// external load balancer and the provider does not manage any VIP.
+// Leaving it nil is allowed and means the same as type=external: the endpoint is
+// provided by the user and the provider manages no VIP.
 // +optional
 ControlPlaneLoadBalancer *ControlPlaneLoadBalancer `json:"controlPlaneLoadBalancer,omitempty"`
 ```
@@ -142,7 +141,7 @@ type ControlPlaneLoadBalancer struct {
 
 | 输入 | 行为 |
 | --- | --- |
-| 字段缺省（`nil`） | 完全保持现状：endpoint 由模板或用户写入，VIP 由使用方模板或外部 LB 承担，provider 不做任何 LB 相关动作。存量集群升级后即此形态，可后续一次性回填。 |
+| 字段缺省（`nil`） | 允许，语义等同 `type=external`：endpoint 由使用方提供，provider 不做任何 LB 相关动作。这一形态的存在目的就是兼容 internal VIP 之前创建的集群——升级不触碰这块配置，存量集群升级后即此形态，且只能保持此形态。 |
 | `type=external` | 显式声明使用方自备入口。provider 校验 `host/port` 与 `controlPlaneEndpoint` 一致；`controlPlaneEndpoint` 为空时回填。不创建 minfo，不注入 bootstrap VIP。 |
 | `type=internal` | 启用 self-built LB。`host` 是 IPv4 VIP，`port` 是 apiserver 端口，`vrid` 是 keepalived VRID。 |
 | `interface` 为空 | bootstrap VIP 脚本按节点主 IP 自动探测网卡；alive installer 同样自动探测。 |
@@ -157,7 +156,7 @@ webhook 校验（新增 `internal/webhooks/vspherecluster.go`）：
 - `vrid` 不在 CRD schema 设 min/max，避免 `type=external` 或历史对象显式 `vrid: 0` 在 schema 层被拦截；internal 场景由 webhook 保证。
 - `spec.controlPlaneEndpoint` 非空时必须与 `host/port` 一致，不一致直接拒绝（对应 gap 分析 #19 的「endpoint 与 VIP 不一致时 fail fast」）。
 - `type=external` 时 `vrid` 和 `interface` 被忽略，用户填写时返回 warning。
-- 可变性只看字段本身，不看 cluster 是否 initialized：`spec.controlPlaneLoadBalancer` 为 `nil` 时允许一次性写入（回填）；非 `nil` 后 `type`、`host`、`port`、`vrid`、`interface` 全部不可变，整个字段也不允许置回 `nil`。没有例外放行入口。
+- 可变性只看字段本身，不看 cluster 是否 initialized：字段只在 CREATE 时可写。UPDATE 时 `nil` 不允许写成任何值（含 `type=external`）；非 `nil` 后 `type`、`host`、`port`、`vrid`、`interface` 全部不可变，整个字段也不允许置回 `nil`。没有例外放行入口。
 
 示例：
 
@@ -293,7 +292,7 @@ VIP 添加只发生一次，之后不存在任何复活路径：
 | --- | --- | --- | --- |
 | `clusterReconciler` | endpoint 一致性；`ensureSelfBuiltLB`；minfo；kube-proxy IPVS 配置；readiness gate 与 condition。 | 沿用现有删除流程，不新增 self-built LB cleanup。 | 不渲染 `AppRelease`；不合成平台对象；不在 cluster 删除时专门删 minfo；不维护 LB 专用 status 字段。 |
 | `vmReconciler` / `VMService` | 解析 self-built LB bootstrap 配置；init 节点注入临时 VIP。 | 走现有 VM 删除逻辑。 | 不创建 minfo；不等待 AppRelease；不操作 alive pod；不注入内核模块或 sysctl。 |
-| `VSphereCluster` webhook（新增） | 校验 LB 输入与 endpoint 一致性；字段为空时允许一次性回填，非空后拒绝一切 LB 字段修改。 | 不参与 runtime 清理。 | 不访问 workload cluster。 |
+| `VSphereCluster` webhook（新增） | 校验 LB 输入与 endpoint 一致性；UPDATE 时拒绝一切 LB 字段变化，含把空字段写成有值。 | 不参与 runtime 清理。 | 不访问 workload cluster。 |
 | `VSphereMachineConfigPool` 校验 | 槽位 IP 不得与同集群 LB VIP 冲突。 | 保持现有槽位释放逻辑。 | 不管理 VIP 漂移和 alive lifecycle。 |
 | cluster-transformer | 消费 `ModuleInfo`，按通用逻辑渲染 workload `AppRelease`。 | 带 platform Cluster `OwnerReference` 的 minfo 由 Kubernetes GC 删除；workload API 可达时 plugin minfo finalizer 按通用逻辑卸载 AppRelease。 | 不新增 vSphere 专属 affinity 或自动安装规则。 |
 | alive runtime | 安装 keepalived static pod，持有 VIP 并转发 backend。 | static pod 停止时执行 `/live/stop.sh` 清理 runtime 状态。 | 不创建 VM；不选择 minfo version。 |
@@ -430,9 +429,9 @@ alive AppRelease 的 `global.controlPlaneNodeIdentity` 用于在 control-plane �
 
 - provider 升级后，不带 `controlPlaneLoadBalancer` 的存量集群行为完全不变（外部 LB 或使用方自备入口继续工作）。
 - 新建 cluster 可直接使用 `type=internal`。
-- 字段为空的 cluster（含全部存量集群）允许一次性回填，写入即冻结；`type=internal` 的回填同时受 endpoint 一致性校验约束，见第 9 章。
+- 字段为空的 cluster（含全部存量集群）保持空值，不能改用 self-built LB，见第 9 章。
 - 字段非空的 cluster 拒绝任何修改，`type=external` 也不能再改成 `internal`。显式写过 `external` 的集群不再有切换入口，这是选择该规则的直接代价。
-- 回填 `type=internal` 后按 provider-managed minfo 继续 reconcile；minfo 所有权不匹配时不接管未知对象。
+- `type=internal` 的 cluster 按 provider-managed minfo 继续 reconcile；minfo 所有权不匹配时不接管未知对象。
 
 CRD 变更是纯新增可选字段，存量对象不需要数据迁移；交付仓库的 chart CRD 需要随之重新生成。
 
@@ -450,7 +449,8 @@ VM 删除后 guest OS 内的 keepalived manifest、VIP、IPVS 规则随 VM 消�
 | --- | --- | --- |
 | 运行时 | 使用 alive。 | 与 DCS / baremetal 模型一致，复用同一套制品与工程经验；VIP 后端走 IPVS 转发到全部 apiserver，全链路状态可观测。 |
 | 安装路径 | provider 创建和 patch alive `ModuleInfo`，不直接建 `AppRelease`。 | 复用插件版本选择与生命周期；删除走 ownerRef + GC。代价是与本仓 kube-ovn 的安装风格不一致，短期接受。 |
-| API 形状 | 新增可选 `controlPlaneLoadBalancer`，`type` 默认 `external`。 | 存量 `VSphereCluster` 不带该字段，必须落到「保持现状」语义才能平滑升级。 |
+| API 形状 | 新增可选 `controlPlaneLoadBalancer`，`type` 默认 `external`。 | 存量 `VSphereCluster` 不带该字段，必须落到「保持现状」语义才能平滑升级；`nil` 就是为兼容 internal VIP 之前的集群而保留的形态。 |
+| 可变性 | 只在 CREATE 时可写，创建后一律冻结（含 `nil` 不能写成有值）。 | VIP 配置一旦确定就不允许更改：endpoint、apiserver serving 证书 SAN、guest runtime 全部由它派生，运行中无法就地重新派生；`nil` 允许写入会让存量集群被切到从未准备过的 VIP 上。 |
 | 状态表达 | 新增 `SelfBuiltLoadBalancerReady`（v1beta1 + v1beta2）。 | 本仓 condition 约定 + gap 分析 #19 验收要求；与 DCS 的「不加 condition」不同。 |
 | bootstrap / runtime 分离 | bootstrap 只提供临时 VIP，runtime 由 alive 接管。 | `kubeadm init` 和 provider 取 workload client 都需要 endpoint 先可达；完整 backend 列表只能在 Node 注册后生成。 |
 | bootstrap 载体 | cloud-config write_files + oneshot systemd unit（无 `[Install]`）+ `runcmd` 前插。 | 复用现有 merge 机制；unit 提供同步执行、退出码传递和 journal 可观测性；无 `[Install]` 结构上杜绝开机复活；`runcmd` 前插 + `exit 1` 提供失败阻断。 |
@@ -458,40 +458,19 @@ VM 删除后 guest OS 内的 keepalived manifest、VIP、IPVS 规则随 VM 消�
 | 依赖 | 平台对象一律 `unstructured`。 | 保持 CAPV 无 alauda 编译期依赖，延续 `modulePluginGVK` 既有做法。 |
 | 删除边界 | 不新增 cleanup。 | VM 消失后 guest OS 残留随之消失；minfo / AppRelease 走通用链路。 |
 
-## 9. 存量集群迁移
+## 9. 存量集群
 
-推荐路径仍是创建阶段直接使用 `type=internal`。存量集群不会在 provider 升级时自动迁移，也不建议把迁移做成普通 reconcile 行为。
+self-built LB 只在创建阶段选择。存量集群不迁移，也没有接管入口。
 
 ### 9.1 默认行为
 
-provider 升级后，不带 `controlPlaneLoadBalancer` 的集群继续使用原入口：provider 不创建 minfo、不修改 `controlPlaneEndpoint`、不改 workload kubeconfig secret 或平台入口、不进入已有 VM 补写 bootstrap VIP。
+provider 升级后，不带 `controlPlaneLoadBalancer` 的集群继续使用原入口：provider 不创建 minfo、不修改 `controlPlaneEndpoint`、不改 workload kubeconfig secret 或平台入口、不进入已有 VM 补写 bootstrap VIP。字段保持 `nil`，provider 不回填。
 
-### 9.2 外部 LB → alive
+### 9.2 不支持迁移到 alive
 
-与 DCS 的结论一致。风险集中在 endpoint 地址会变：apiserver serving 证书 SAN 需要先轮换以包含新 VIP，workload kubeconfig、管理集群 remote client、平台入口和外部客户端都要逐步切换，原外部 LB 在确认无客户端依赖前不能下线。详细步骤复用 DCS 设计第 5.3 节，不在此重复。
+字段为空的集群不能改用 self-built LB：webhook 拒绝在 UPDATE 时把 `controlPlaneLoadBalancer` 从 `nil` 写成任何值（见 3.1 可变性）。要用 self-built LB 只能新建集群。
 
-前置与切换窗口：
-
-1. 确认 alive 前置任务已覆盖全部 control-plane 节点（内核模块、`net.ipv4.vs.conntrack=1`）。
-2. 确认目标网络放行 VIP/GARP 与 VRRP 组播（[test-cases.md](test-cases.md) 的 TC-00）。
-3. 调整 kube-proxy：IPVS 模式下设置 `strictARP=true`，`excludeCIDRs` 含 `<vip>/32`。
-4. 创建 alive `ModuleInfo`，等待 AppRelease、alive pod、IPVS backend 和 VIP probe Ready。
-5. 用标准 kubeconfig 验证 `https://<vip>:<port>` 可用（不跳过 TLS 校验），再切换客户端。
-
-### 9.3 provider 接管
-
-迁移完成并验证后，在 `VSphereCluster` 上一次性回填 `controlPlaneLoadBalancer`（`type=internal`），让后续升级和节点替换进入 self-built LB 维护路径。接管就是这次回填本身，不存在额外的放行入口——只有字段仍为空的集群能走到这一步。
-
-因此顺序是固定的：先按 9.2 完成迁移并把 `controlPlaneEndpoint` 切到新 VIP，再回填字段。webhook 要求 `host/port` 与 `controlPlaneEndpoint` 一致，而运行中的集群 `controlPlaneEndpoint` 必然非空，先回填再迁移这条路走不通。
-
-回填前必须满足：
-
-- `controlPlaneLoadBalancer.host/port/vrid/interface` 与迁移后的 alive VIP 配置一致，且 `host/port` 与 `controlPlaneEndpoint` 一致。
-- alive `ModuleInfo` 的名称、label、annotation、`spec.version`、`spec.config` 符合 provider-managed 规则；不符合时 provider 不接管。
-- 标准 kubeconfig 指向 VIP 后 TLS 校验和 `/version` probe 成功。
-- alive 前置任务能覆盖后续新建或替换的 control-plane 节点。
-
-回填一旦写入即冻结，写错只能重建 cluster，所以这一步要求上述条件全部先行验证通过。之后 provider 按 `type=internal` 维护 alive minfo，后续升级保持 internal 语义。
+这不是校验上的保守取舍，而是流程上没有安全落点：bootstrap VIP 在第一个 control-plane 节点 `kubeadm init` 期间注入并随后交给 alive 持有，运行中的控制面没有等价的注入时机；且迁移必然改变 endpoint 地址，牵动 apiserver serving 证书 SAN 轮换、workload kubeconfig、管理集群 remote client、平台入口和全部外部客户端。
 
 ## 10. 文件变更清单
 
@@ -501,7 +480,7 @@ provider 升级后，不带 `controlPlaneLoadBalancer` 的集群继续使用原�
 | `apis/v1beta1/condition_consts.go` | 新增 `SelfBuiltLoadBalancerReady` 的 v1beta1 与 v1beta2 condition / reason 常量。 |
 | `apis/v1beta1/zz_generated.deepcopy.go` | `make generate` 生成。 |
 | `apis/v1alpha3`、`v1alpha4` 的 conversion | 新增字段在旧版本无对应项，按 restored-fields 约定补 conversion 与 fuzz 测试。 |
-| `internal/webhooks/vspherecluster.go`（新增） | `VSphereCluster` 校验 webhook：LB 输入、endpoint 一致性、initialized 后不可变、迁移接管放行。 |
+| `internal/webhooks/vspherecluster.go`（新增） | `VSphereCluster` 校验 webhook：LB 输入、endpoint 一致性、创建后不可变。 |
 | `main.go` | 注册 `VSphereCluster` webhook。 |
 | `config/webhook/manifests.yaml`、`config/crd/...` | `make manifests` 更新。 |
 | `controllers/vspherecluster_reconciler.go` | `reconcileNormal` 接入 `ensureSelfBuiltLB`；新增 self-built LB GVK 常量。 |
@@ -563,6 +542,6 @@ provider 升级后，不带 `controlPlaneLoadBalancer` 的集群继续使用原�
 9. 补 readiness：minfo version、AppRelease Sync+Health、control-plane alive pod、连续 VIP probe、`controlPlaneNodeIdentity` patch。
 10. `reconcileNormal` 接入 `ensureSelfBuiltLB` 并设置 condition。
 11. 新增启动参数 `--plugin-alive-version` 与 chart value。
-12. 补单元测试与 envtest：bootstrap VIP cloud-config、minfo create/patch、readiness gate、kube-proxy、webhook、空字段回填与写入后冻结规则。
+12. 补单元测试与 envtest：bootstrap VIP cloud-config、minfo create/patch、readiness gate、kube-proxy、webhook、创建后冻结规则（含拒绝写入空字段）。
 13. 执行 `make generate`、`make manifests`，同步交付仓库 chart CRD。
 14. 在 vSphere 测试环境先跑网络 preflight（VRRP 组播、VIP/GARP、IPVS 内核），再创建 3 control-plane 的 `type=internal` 集群，验证 bootstrap init、control-plane join、alive minfo、VIP API、节点替换和删除流程。

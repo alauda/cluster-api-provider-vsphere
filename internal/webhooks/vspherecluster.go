@@ -81,11 +81,11 @@ func (webhook *VSphereCluster) validate(ctx context.Context, oldObj, newObj *inf
 	var warnings admission.Warnings
 	var allErrs field.ErrorList
 
-	// Immutability is decided by the field alone, never by cluster readiness: an
-	// empty field may be backfilled once, a populated one is frozen for good.
-	// Everything downstream of it (controlPlaneEndpoint, the apiserver serving
-	// certificate SANs, the guest bootstrap VIP, the alive ModuleInfo) is derived
-	// at creation time and cannot be re-derived in place.
+	// The control plane endpoint is a creation-time decision, so the field never
+	// changes after CREATE - not even from absent to set. Everything downstream of
+	// it (controlPlaneEndpoint, the apiserver serving certificate SANs, the guest
+	// bootstrap VIP, the alive ModuleInfo) is derived while the first control plane
+	// node bootstraps and cannot be re-derived in place.
 	if oldObj != nil {
 		allErrs = append(allErrs, validateControlPlaneLoadBalancerImmutable(oldObj.Spec.ControlPlaneLoadBalancer, newObj.Spec.ControlPlaneLoadBalancer)...)
 	}
@@ -97,13 +97,24 @@ func (webhook *VSphereCluster) validate(ctx context.Context, oldObj, newObj *inf
 	return warnings, allErrs
 }
 
-// validateControlPlaneLoadBalancerImmutable enforces the write-once rule.
+// validateControlPlaneLoadBalancerImmutable freezes the field for the life of the
+// cluster: it is set at CREATE or never.
 func validateControlPlaneLoadBalancerImmutable(oldLB, newLB *infrav1.ControlPlaneLoadBalancer) field.ErrorList {
 	lbPath := field.NewPath("spec", "controlPlaneLoadBalancer")
 
-	// Nil -> anything is the one-time backfill and is always allowed.
+	// An absent field is already a complete endpoint configuration: it means the same
+	// as type=external, an endpoint the user provides with no provider-managed VIP
+	// (see ControlPlaneLoadBalancer.IsInternal, which reads nil as not-internal). So
+	// filling it in later is a change like any other, not a harmless record of the
+	// status quo. The endpoint consistency check below pins host/port to
+	// spec.controlPlaneEndpoint but not the type, so without this a running cluster
+	// could be switched to type=internal at its current address and have alive
+	// installed on top of a VIP it does not own.
 	if oldLB == nil {
-		return nil
+		if newLB == nil {
+			return nil
+		}
+		return field.ErrorList{field.Forbidden(lbPath, "cannot be set after the cluster is created: an absent controlPlaneLoadBalancer already means an external load balancer, and the control plane endpoint is fixed at creation; recreate the cluster to change it")}
 	}
 
 	if newLB == nil {
