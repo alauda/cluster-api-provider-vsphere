@@ -49,7 +49,7 @@ spec:
 | TC-CAPV-SBLB-10 | VIP 冲突与 endpoint 一致性校验 | 异常 | webhook + reconcile 防御 |
 | TC-CAPV-SBLB-11 | 多网卡显式 `interface` | 网络 | bootstrap 脚本 + minfo config |
 | TC-CAPV-SBLB-12 | control-plane 节点替换 | E2E 主路径 | VIP join + backend 更新 |
-| TC-CAPV-SBLB-13 | 空字段可回填，写入后冻结 | 异常 | webhook immutable |
+| TC-CAPV-SBLB-13 | 创建后一律冻结，空字段也不能写入 | 异常 | webhook immutable |
 | TC-CAPV-SBLB-14 | 删除流程 | 删除 | 不新增 cleanup，不阻塞 |
 
 ## TC-CAPV-SBLB-00：vSphere 网络与内核 preflight
@@ -322,25 +322,24 @@ spec:
 
 **清理**：等待集群恢复 3 control-plane。
 
-## TC-CAPV-SBLB-13：空字段可回填，写入后冻结
+## TC-CAPV-SBLB-13：创建后一律冻结，空字段也不能写入
 
-**目标**：验证可变性只取决于 `spec.controlPlaneLoadBalancer` 是否为空，与集群是否 initialized 无关。
+**目标**：验证 `spec.controlPlaneLoadBalancer` 只在 CREATE 时可写，且规则与集群是否 initialized 无关。
 
-**前置**：TC-03 集群（字段为 `type=internal`），以及一个字段为空的集群（TC-01 形态）。
+**前置**：TC-03 集群（字段为 `type=internal`）；一个字段为空的集群（TC-01 形态）；以及一个新建的 `type=internal` 集群，在其 `ControlPlaneInitialized` 仍为 False 时用于第 4 步。
 
 **步骤**：
 1. 对 TC-03 集群分别 patch `type`、`host`、`port`、`vrid`、`interface`，以及把整个字段置回 `null`。
-2. 对字段为空的集群回填一份与其 `controlPlaneEndpoint` 一致的 `type=external`。
-3. 对第 2 步已回填的集群再 patch 任一 LB 字段。
-4. 对一个 `ControlPlaneInitialized=False` 且字段非空的新建集群 patch `host`。
+2. 对字段为空的集群写入一份与其 `controlPlaneEndpoint` 一致的 `type=external`。
+3. 对同一个空字段集群写入 `type=internal`，`host/port` 同样与 `controlPlaneEndpoint` 一致。
+4. 对前置中 `ControlPlaneInitialized=False` 的新建集群 patch `host`。
 
 **预期**：
 - 第 1 步全部被拒绝，错误信息说明字段写入后不可变、且无放行入口。
-- 第 2 步通过，`controlPlaneEndpoint` 不变。
-- 第 3 步被拒绝。
+- 第 2、3 步都被拒绝，错误信息为 `cannot be set after the cluster is created`；`controlPlaneEndpoint` 不变。第 3 步尤其重要：`host/port` 一致性校验拦不住它，只有本规则能拦。
 - 第 4 步被拒绝，证明规则不看 initialized 状态。
 
-**清理**：删除第 2 步使用的集群（回填不可撤销）。
+**清理**：删除第 4 步使用的未 initialized 集群。第 1—3 步全部被拒绝，TC-03 集群与空字段集群状态不变。
 
 ## TC-CAPV-SBLB-14：删除流程
 

@@ -164,12 +164,41 @@ func TestVSphereClusterValidateCreate(t *testing.T) {
 }
 
 func TestVSphereClusterValidateUpdate(t *testing.T) {
-	t.Run("allows a one time backfill of an empty field", func(t *testing.T) {
+	t.Run("allows an absent field to stay absent", func(t *testing.T) {
 		g := NewWithT(t)
 		oldObj := newSelfBuiltLBCluster()
 		oldObj.Spec.ControlPlaneLoadBalancer = nil
-		_, err := newVSphereClusterWebhook().ValidateUpdate(context.Background(), oldObj, newSelfBuiltLBCluster())
+		newObj := newSelfBuiltLBCluster()
+		newObj.Spec.ControlPlaneLoadBalancer = nil
+		_, err := newVSphereClusterWebhook().ValidateUpdate(context.Background(), oldObj, newObj)
 		g.Expect(err).NotTo(HaveOccurred())
+	})
+
+	t.Run("rejects setting an absent field", func(t *testing.T) {
+		// An absent field already means an external load balancer, so a running
+		// cluster can be neither annotated with one nor re-pointed at a VIP.
+		for _, tt := range []struct {
+			name string
+			lb   *infrav1.ControlPlaneLoadBalancer
+		}{
+			{"internal", newSelfBuiltLBCluster().Spec.ControlPlaneLoadBalancer},
+			{"external", &infrav1.ControlPlaneLoadBalancer{
+				Type: infrav1.ControlPlaneLoadBalancerTypeExternal,
+				Host: newSelfBuiltLBCluster().Spec.ControlPlaneEndpoint.Host,
+				Port: newSelfBuiltLBCluster().Spec.ControlPlaneEndpoint.Port,
+			}},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				g := NewWithT(t)
+				oldObj := newSelfBuiltLBCluster()
+				oldObj.Spec.ControlPlaneLoadBalancer = nil
+				newObj := newSelfBuiltLBCluster()
+				newObj.Spec.ControlPlaneLoadBalancer = tt.lb
+				_, err := newVSphereClusterWebhook().ValidateUpdate(context.Background(), oldObj, newObj)
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring("cannot be set after the cluster is created"))
+			})
+		}
 	})
 
 	t.Run("allows an unchanged load balancer", func(t *testing.T) {

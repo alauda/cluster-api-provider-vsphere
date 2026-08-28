@@ -10,7 +10,7 @@
 2. **vSphere 与 DCS 的现状差异在 API 表面**：DCS 已有 `controlPlaneLoadBalancer` 字段只是没有实现，CAPV 需要新增整个字段。govmomi 模式当前没有任何 provider-managed VIP，多 control-plane 集群依赖使用方自备外部 LB；self-built LB 的实质是把 VIP 生命周期建立在 `VSphereClusterReconciler` 上。
 3. self-built LB 选择 alive，由 provider 创建、patch 和等待管理集群的 alive `ModuleInfo`，不直接创建 workload `AppRelease`；与 DCS 保持一致。
 4. CAPV 的 bootstrap 通道是 cloud-init cloud-config，不是 Ignition；但仓库已有成熟的 userdata 改写与合并机制，bootstrap 临时 VIP 的注入成本低于 DCS。
-5. 存量外部 LB 集群不在 provider 升级时自动迁移；迁移路径与 DCS 的「外部 LB → 新 VIP」一致，因为 endpoint 地址会变，需要单独的运维窗口。
+5. 存量外部 LB 集群不迁移到 self-built LB：provider 升级不自动迁移，webhook 也拒绝在 UPDATE 时写入该字段。要启用只能新建集群，理由见 design.md 9.2。
 
 相关上下文：
 
@@ -20,7 +20,7 @@
 | DCS 对照实现 | `gitlab-ce.alauda.cn/ait/cluster-api-provider-dcs`，`release-1.0` 的 `docs/20260610-self-built-lb/`，实现见 MR 47。 |
 | baremetal 对照实现 | DCS 调研已记录，本文不重复；结论是「两阶段 bootstrap VIP + runtime alive」模型可复用。 |
 | 已有规范差距记录 | `docs/proposal/20260725-acp-provider-standard-alignment/requirements-and-research.md` 的 P2-2（#19），当时标记「⏸ 暂缓，待平台级自建 VIP 统一方案」。本需求即该统一方案在 vSphere 的落地。 |
-| 当前方案范围 | 主路径只覆盖 cluster creating 阶段的 `type=internal`；存量外部 LB 集群迁移作为单独运维方案记录。 |
+| 当前方案范围 | 主路径只覆盖 cluster creating 阶段的 `type=internal`；存量集群不在范围内，也不提供迁移路径。 |
 
 ## 1. 背景
 
@@ -203,7 +203,6 @@ vSphere 网络与节点：
 - 交付使用的 cluster 模板由谁维护，`type=internal` 时如何把 `CONTROL_PLANE_ENDPOINT_IP` 同时写入 `controlPlaneEndpoint` 和 `controlPlaneLoadBalancer.host`，需要与模板维护方确认。
 - Service type=LoadBalancer：alive 只承担 control-plane VIP，不提供 svc VIP 选举。若交付形态需要该能力，要单独找方案，不在本需求范围。
 - IPv6 / dual-stack：本方案按 IPv4 `/32` 展开，IPv6 需单独设计。
-- 存量迁移：provider 升级不自动迁移；迁移方案见 design.md 第 9 章。
 - CRD 变更：新增字段是可选字段，存量对象无需迁移；交付仓库的 chart CRD 需同步重新生成。
 
 这些问题不影响 alive 作为 vSphere self-built LB 的选型结论，但需要在落地前确认清楚。
