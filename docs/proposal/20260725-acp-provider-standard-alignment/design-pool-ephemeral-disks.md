@@ -4,7 +4,8 @@
 [`requirements-and-research.md`](requirements-and-research.md)
 的 P1-7 节与差距表，此处不重复。
 
-**依赖前提**：持久盘认盘加固（确定 vmdk 路径、删容量猜盘、`DeterministicDiskName` 命名）见
+**依赖前提**：持久盘认盘加固（`hostname + primaryIP + diskName` 确定 vmdk 标识、删 unit/capacity
+fallback、`DeterministicDiskName` 命名）见
 [`design-persistent-disk-status-matching.md`](design-persistent-disk-status-matching.md)。非持久盘与持久盘
 共用建盘（`createDataDisks`）、并盘（`mergeSlot*Disks`）、盘表生成（`GetPersistentDiskCloudConfig`）与 guest 侧
 reconcile 脚本，仅在「如何认盘」与「生命周期」两处不同。
@@ -13,7 +14,7 @@ reconcile 脚本，仅在「如何认盘」与「生命周期」两处不同。
 
 非持久盘与持久盘共用同一套建盘 / 并盘 / 盘表 / guest 挂载代码，两点不同：
 
-1. **认盘机制不同**：持久盘按记录的 vmdk 真实路径匹配（Tier 1）；非持久盘恒新建、不记录 VolumePath，靠 clone
+1. **认盘机制不同**：持久盘按记录的 vmdk 真实路径匹配，路径为空时按确定 basename 匹配；非持久盘恒新建、不记录 VolumePath，靠 clone
    分配并落到 `status.ephemeralDiskStatuses` 的 **SCSI unit** 跨 reconcile 匹配。两条机制彼此独立。
 2. **生命周期不同**：持久盘销毁 VM 时先 detach 保留、可跨 VM 重挂、参与 reclaim 与释放门禁；非持久盘随 VM 一起
    删除、每次新建空盘、不 reclaim。
@@ -25,20 +26,19 @@ guest 侧定位块设备靠 `/dev/disk/by-uuid/<DiskUUID>` 或 `/dev/disk/by-pat
 故 guest 实际主要按 **unit** 定位——unit 必须出现在 guest 盘表里。
 
 盘表在 clone 的**下一轮** reconcile 才写入 guest，彼时 clone 在内存里分配的 unit 已丢失。持久盘靠观测记录的真实
-vmdk 路径重新认盘、回读 unit；非持久盘无 VolumePath 可认，因此把 clone 分配的 unit 落到
+vmdk 路径或确定 basename 重新认盘、回读 unit；非持久盘无 VolumePath 可认，因此把 clone 分配的 unit 落到
 `status.ephemeralDiskStatuses`，下一轮 `HydrateSlotFromStatus` 再读回内存 slot，供盘表生成消费。这是非持久盘**保留
 status 的唯一理由**。
 
-（曾评估过「非持久盘也走确定路径、每轮现读 unit、删 `ephemeralDiskStatuses`」的统一方案，因非持久盘无 status 兜底、
-遇 datastore cluster/SDRS 动态放置时路径推不出会认不出盘，未采用；当前实现保留 status。）
+非持久盘保留 `ephemeralDiskStatuses`，因为其 vmdk 由 vCenter 动态命名，无法使用持久盘的确定标识。
 
 ## 与持久盘的异同
 
 | 维度 | 持久盘 PersistentDisk | 非持久盘 EphemeralDisk |
 | --- | --- | --- |
 | spec 字段 | name/sizeGiB/datastore/storagePolicy/mountPath/mountOptions/fsFormat/unitNumber/wipeFilesystem | name/sizeGiB/datastore/storagePolicy/mountPath/mountOptions/fsFormat |
-| clone backing | 复用记录的 VolumePath 则重挂；否则 `DeterministicDiskPath` 确定路径新建 | **恒新建**：`datastoreFileHint` 数据存储占位、vCenter 命名文件（不记录 VolumePath） |
-| 认盘 | 记录的真实 VolumePath（Tier 1）→ unit（Tier 2） | clone 分配、落 status 的 **unit** |
+| clone backing | 复用记录的 VolumePath 则重挂；否则按 `hostname + primaryIP + diskName` 生成确定路径或 basename 新建 | **恒新建**：`datastoreFileHint` 数据存储占位、vCenter 命名文件（不记录 VolumePath） |
+| 认盘 | 记录的完整 VolumePath；路径为空时按确定 basename；不使用 unit/capacity fallback | clone 分配、落 status 的 **unit** |
 | 观测持久化 | VolumePath/DiskUUID/UnitNumber/Phase 落 `persistentDiskStatuses` | 仅 UnitNumber 落 `ephemeralDiskStatuses`（无 VolumePath/DiskUUID/Phase） |
 | VM 销毁 | 先 detach 保留 | 不 detach，随 VM 删 |
 | 跨 VM 重建 | 复用同一 vmdk 重挂 | 永远新建空盘 |
@@ -113,4 +113,4 @@ condition，`PersistentDisksReady` 语义不变，v1beta1/v1beta2 无联动。
 
 ## 测试
 
-环境验收见 [test-cases.md](test-cases.md) TC-CAPV-ACP-07，单测清单见同文第 3 章。
+环境验收见 [test-cases.md](test-cases.md) TC-CAPV-ACP-07；单元测试随代码提交。

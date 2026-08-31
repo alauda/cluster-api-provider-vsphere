@@ -4,7 +4,8 @@
 两项展开设计见 [design-pool-ephemeral-disks.md](design-pool-ephemeral-disks.md) 与
 [design-persistent-disk-status-matching.md](design-persistent-disk-status-matching.md)。
 
-第 2 章是真实管理集群 / vCenter 上的验收用例，第 3 章是纯代码级的单测清单（不展开操作步骤）。
+本文用例均在真实管理集群 / vCenter 上执行，验证完整创建、重建和升级链路。单元测试随代码提交，
+不在本文重复列出。
 
 ## 0. 通用前置
 
@@ -30,7 +31,7 @@
 | TC-CAPV-ACP-09 | P1-9 | VM 开机仅在创建时执行一次 | 运维 |
 | TC-CAPV-ACP-10 | P1-10 | `/var/log/pods` 软链到 containerd 持久盘 | 节点检查 |
 | TC-CAPV-ACP-11 | P2-1 | 持久盘 observed state 迁 status 与存量迁移 | 升级/迁移 |
-| TC-CAPV-ACP-12 | P2-1 | 确定 vmdk 路径认盘、删除容量猜盘 | 升级/迁移 |
+| TC-CAPV-ACP-12 | P2-1 | 确定 vmdk 标识认盘、删除 unit/capacity fallback | 升级/迁移 |
 | TC-CAPV-ACP-13 | P2-3 | `BootstrapReady` condition 与 reason 区分 | 异常 |
 | TC-CAPV-ACP-14 | P2-4 | 固定 IP 升级约束（maxSurge/maxUnavailable/replicas） | 异常 + 升级 E2E |
 
@@ -235,9 +236,10 @@ P2-2（govmomi 控制面 LB/VIP）已暂缓，其用例见 [self-built LB 测试
 
 ### TC-CAPV-ACP-11：持久盘 observed state 迁 status 与存量迁移
 
-**目标**：验证观测态只写 status、存量对象幂等播种、reclaim 相变与 `Reclaimed` 墓碑收敛。本用例针对 release 1（spec 旧字段冻结但仍在）。
+**目标**：验证观测态只写 status、存量对象幂等播种、reclaim 相变与 `Reclaimed` 墓碑收敛。
 
-**前置**：一个基线（`dev/v1.13.1`）上创建、spec 已回填 `volumePath`/`diskUUID` 的存量 pool，其中一个槽位处于 mid-reclaim（带 `configStatuses[].reclaimStatus`）；另备一个全新 pool。
+**前置**：一个已有 spec `volumePath`/`diskUUID` 回填数据的存量 pool，其中一个槽位处于 mid-reclaim（带
+`configStatuses[].reclaimStatus`）；另备一个全新 pool。
 
 **步骤**：
 1. 全新 pool 上创建机器，检查观测值写到 `status.persistentDiskStatuses`，`spec.configs[].persistentDisks[]` 的 `volumePath`/`diskUUID` 保持为空。
@@ -257,25 +259,35 @@ P2-2（govmomi 控制面 LB/VIP）已暂缓，其用例见 [self-built LB 测试
 
 **清理**：删除测试 pool 与机器。
 
-### TC-CAPV-ACP-12：确定 vmdk 路径认盘
+### TC-CAPV-ACP-12：确定 vmdk 标识认盘
 
-**目标**：验证新建持久盘按确定路径命名并写进 status，观测按路径精确认盘；容量猜盘（Tier 3）已删除后不出现认错盘或认不出。
+**目标**：通过完整集群创建和节点滚动升级，验证新建持久盘按 `hostname + primaryIP + diskName` 生成确定
+vmdk 标识，观测按完整路径或 basename 精确认盘；升级重建时复用同一持久盘，不因 unit 冲突而失败。
 
-**前置**：一个槽位声明两块同规格（同 `sizeGiB`）持久盘，其中一块声明数据存储、另一块不声明；另有 TC-CAPV-ACP-11 用到的存量 pool。
+**前置**：一个可完整创建的集群，KCP 与 MD 均引用固定 IP 的 `VSphereMachineConfigPool`；槽位声明三块持久盘：
+一块指定 datastore、一块只指定 storage policy、一块不指定磁盘级 datastore/policy（使用 effective datastore）。
+准备至少两个可滚动替换的节点，配置静态 primary IP；storage policy 至少有一个兼容 datastore。
 
 **步骤**：
-1. 创建机器，检查 vCenter 上盘文件名与 `status.persistentDiskStatuses[].volumePath`。
-2. 检查不声明数据存储的那块盘的记录。
-3. 手工把某块新盘的 status `volumePath` 清空，触发下一轮观测。
-4. 存量 pool 上观察已有真实路径的盘的认盘路径。
-5. 用一个含非法字符或超长的盘名重复步骤 1。
+1. 创建完整集群，等待 KCP、MD 和各节点 Ready；记录每个槽位的 hostname、primary IP、磁盘 name、
+   vCenter 磁盘 backing.FileName 与 `status.persistentDiskStatuses[].volumePath`。
+2. 对比三类持久盘：指定 datastore 的盘应得到完整确定路径；只指定 storage policy 的盘应以确定 basename
+   创建并在观测后回填 vCenter 返回的完整路径；未指定磁盘级 datastore/policy 的盘应使用 clone 解析出的
+   effective datastore 并得到完整确定路径。
+3. 触发一次 KCP 控制面节点滚动升级/替换（例如更新 VSphereMachineTemplate 镜像），等待新节点 Ready。
+4. 触发一次 MD worker 节点滚动升级/替换，等待新节点 Ready。
+5. 在每次替换前后记录 vCenter 磁盘 backing.FileName、磁盘 UUID、SCSI unit、pool status owner 与 phase。
 
 **预期**：
-- 步骤 1：盘文件名为 `<hostname>-<盘名>`（或截断加 hash 后缀）形式，路径落在 `[数据存储] <VM 名>/…vmdk`，`Phase` 直接为 `Attached`。
-- 步骤 2：该盘走 unit 兜底，记 `Creating`；观测到 `VolumePath` 后翻 `Attached`；clone 始终未出现时停在 `Creating`，开机被 `ValidatePersistentDiskBackfill` 挡住。
-- 步骤 3：下一轮按推导路径自愈认回，不需要人工介入。
-- 步骤 4：存量盘按记录的真实路径走 Tier 1，不改名、不迁移文件、不进 `Creating`。
-- 步骤 5：盘名被规整为合法且唯一的名字，不拒绝、不静默退回 unit。
+- 步骤 1：完整创建成功；每块盘的 `VolumePath` 与 vCenter `backing.FileName` 一一对应，三类盘的确定名称均
+  包含 hostname、primary IP 和 disk name，`Phase=Attached`，无 `CloningFailed`。
+- 步骤 2：storage policy 盘的实际 datastore 可由 vCenter 选择，但 basename 保持确定；effective datastore
+  由 clone 与 `createDataDisks` 共用，未指定磁盘级配置的盘不会出现路径不一致。
+- 步骤 3：KCP 滚动替换成功，新 VM 复用原持久盘的完整 `VolumePath` 和 DiskUUID，pool status owner 更新为新
+  `VSphereMachine`，不出现 `unit number 0 is already in use` 或把 OS 盘当数据盘的错误。
+- 步骤 4：MD 滚动替换结果与步骤 3 一致，业务节点和持久盘均 Ready。
+- 步骤 5：替换前后持久盘 vmdk 路径和 UUID 不变；SCSI unit 可按配置重新分配，但不作为认盘依据；每个槽位
+  的 status 记录唯一且 phase 收敛到 `Attached`。
 - 全程无「同规格多盘认错盘」现象。
 
 **清理**：删除测试机器与池。
@@ -323,39 +335,10 @@ P2-2（govmomi 控制面 LB/VIP）已暂缓，其用例见 [self-built LB 测试
 
 **清理**：恢复原策略，删除测试对象。
 
-## 3. 单测清单
-
-以下为纯代码级验收，随实现 PR 一并提交。
-
-**P1-7 槽位非持久盘**
-
-- `pkg/services/govmomi/vcenter/clone_test.go`：非持久盘恒 `FileOperationCreate`、不记录 `VolumePath`、unit 回填；与持久盘 unit 不冲突。
-- `pkg/services/machineconfigpool_test.go`：`ApplyDiskBackfill` 落 `ephemeralDiskStatuses`、`HydrateSlotFromStatus` 读回 unit；跨两类的 name/mountPath 唯一性校验。
-- `pkg/util/machines_test.go`：盘表含非持久盘行（unit、空 UUID、`wipe=false`）；持久盘与非持久盘混合并盘（`upsertDataDisk`）。
-- `DestroyVM` 断言不 detach 非持久盘。
-
-**P2-1 持久盘 status 与确定路径认盘**
-
-- `pkg/services/govmomi/vcenter/clone_test.go`：新建持久盘（有数据存储）的 `backing.FileName` 为确定路径、仍带 `FileOperationCreate`，且 `pd.VolumePath` 被写回；无数据存储时只回填 unit；复用盘（`slotVolumePath != ""`）仍走 attach。
-- `pkg/services/machineconfigpool_test.go`：hydrate（overlay）三种情形——status 优先 / spec 显式 `UnitNumber` 保留而其余观测值仍覆盖 / 无记录时 slot 不变；带确定路径的新盘经 `ApplyDiskBackfill` 直接记 `Attached`，仅带 unit 的兜底盘记 `Creating` 并在观测到 `VolumePath` 后翻 `Attached`；`Attached`/`Available`/`Reclaiming` 不被降级；`Reclaimed` 墓碑可被 `Creating` 覆盖；回填只写 status 不写 spec，`Status().Update` 冲突重试。
-- `pkg/services/govmomi/service_test.go`：有实际路径记录走 Tier 1；`Creating`+unit 走 Tier 2；首次新建盘两者皆空但能推导路径时按推导路径自愈命中；两级都认不出时返回 nil（含同规格多盘、以及只剩单一同规格候选——Tier 3 已删除，不再按容量猜）。
-
-**P1-10 `/var/log/pods` 软链**
-
-- 覆盖 persistent 与 ephemeral 两类触发、无触发时不生成也不执行软链逻辑、已有目录或已有软链时的幂等处理。
-
-**P1-1/P1-2/P1-3/P2-3/P2-4**
-
-- 计数器汇总函数；Pool 级 condition 的置位与聚合（含 `SlotAvailable` 不参与 `Ready`）；create/update/delete validation；`BootstrapReady` 各 reason 出口；KCP/MD webhook 的各边界。
-
-**命令**：`go test -vet=off ./...`；controllers 包带
-`KUBEBUILDER_ASSETS=/home/vscode/.local/share/kubebuilder-envtest/k8s/1.32.0-linux-amd64`。
-`apis/v1alpha3` fuzz 转换失败、`pkg/services/govmomi/metadata` 与
-`TestUpdateKubeadmNodeRegistrationJoinWithoutKubernetesVersion` 为既有问题，忽略。
-
-## 4. 跑测顺序建议
+## 3. 跑测顺序建议
 
 1. TC-CAPV-ACP-03、TC-CAPV-ACP-14 只需 webhook，先跑，确认拦截面后再建集群。
 2. TC-CAPV-ACP-05 建出固定 IP 主路径集群，TC-CAPV-ACP-01、02、07、09、10、13 在该集群上复用。
-3. TC-CAPV-ACP-11、TC-CAPV-ACP-12 需要基线 CRD 上创建的存量对象，单独准备环境。
+3. TC-CAPV-ACP-11 需要已有存量对象，单独准备环境；TC-CAPV-ACP-12 从全新集群创建开始，
+   再执行 KCP/MD 节点滚动替换。
 4. TC-CAPV-ACP-04、06、08 与集群生命周期无关，可并行。
