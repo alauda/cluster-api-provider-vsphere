@@ -289,6 +289,7 @@ func TestCreateDataDisks(t *testing.T) {
 			},
 			machineConfigSlot: &infrav1.MachineConfigSlot{
 				Hostname: "host-1",
+				Network:  &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{IP: "192.168.1.10"}},
 				PersistentDisks: []infrav1.PersistentDisk{
 					{Name: "disk-1", Datastore: "datastore1"},
 				},
@@ -305,6 +306,7 @@ func TestCreateDataDisks(t *testing.T) {
 			},
 			machineConfigSlot: &infrav1.MachineConfigSlot{
 				Hostname: "host-1",
+				Network:  &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{IP: "192.168.1.10"}},
 				PersistentDisks: []infrav1.PersistentDisk{
 					{Name: "disk-1", StoragePolicy: testDefaultStoragePolicy},
 				},
@@ -344,7 +346,7 @@ func TestCreateDataDisks(t *testing.T) {
 			}
 
 			vmContext := &capvcontext.VMContext{VSphereVM: vsphereVM, MachineConfigSlot: tc.machineConfigSlot, Session: session}
-			newDisks, funcError := createDataDisks(ctx.TODO(), vmContext, tc.devices)
+			newDisks, funcError := createDataDisks(ctx.TODO(), vmContext, tc.devices, nil)
 			if (tc.err != "" && funcError == nil) || (tc.err == "" && funcError != nil) || (funcError != nil && tc.err != funcError.Error()) {
 				t.Fatalf("Expected to get '%v' error from assignUnitNumber, got: '%v'", tc.err, funcError)
 			}
@@ -388,11 +390,14 @@ func TestCreateDataDisks(t *testing.T) {
 							// First create on a known datastore: a deterministic path is
 							// assigned to both the backing file and status, and the file is
 							// still created (asserted via expectedCreateOps above).
-							expectedPath := fmt.Sprintf("[%s] %s/%s-%s.vmdk", inputDatastores[index], "test-vm", "test-vm", tc.dataDisks[index].Name)
+							expectedPath := fmt.Sprintf("[%s] %s/%s.vmdk", inputDatastores[index], "host-1-192.168.1.10", "host-1-192.168.1.10-"+tc.dataDisks[index].Name)
 							g.Expect(backingInfo.FileName).To(gomega.Equal(expectedPath))
 							g.Expect(pd.VolumePath).To(gomega.Equal(expectedPath))
 						}
 						if pd.StoragePolicy != "" {
+							if inputVolumePaths[index] == "" && inputDatastores[index] == "" {
+								g.Expect(backingInfo.FileName).To(gomega.Equal("host-1-192.168.1.10-" + tc.dataDisks[index].Name + ".vmdk"))
+							}
 							g.Expect(disk.GetVirtualDeviceConfigSpec().Profile).ToNot(gomega.BeEmpty())
 							profile, ok := disk.GetVirtualDeviceConfigSpec().Profile[0].(*types.VirtualMachineDefinedProfileSpec)
 							g.Expect(ok).To(gomega.BeTrue())
@@ -418,6 +423,126 @@ func TestCreateDataDisks(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCreateDataDisksUsesEffectiveDatastore(t *testing.T) {
+	model, session, server := initSimulator(t)
+	t.Cleanup(model.Remove)
+	t.Cleanup(server.Close)
+	vm := model.Map().Any("VirtualMachine").(*simulator.VirtualMachine)
+	machine := object.NewVirtualMachine(session.Client.Client, vm.Reference())
+	devices, err := machine.Device(ctx.TODO())
+	if err != nil {
+		t.Fatalf("Failed to obtain vm devices: %v", err)
+	}
+
+	vmContext := &capvcontext.VMContext{
+		VSphereVM: &infrav1.VSphereVM{
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					DataDisks: []infrav1.VSphereDisk{{Name: "disk-1", SizeGiB: 10}},
+				},
+			},
+		},
+		MachineConfigSlot: &infrav1.MachineConfigSlot{
+			Hostname:        "host-1",
+			Network:         &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{IP: "192.168.1.10"}},
+			PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-1"}},
+		},
+		Session: session,
+	}
+
+	newDisks, err := createDataDisks(ctx.TODO(), vmContext, devices, &effectiveDatastore{Name: "datastore1"})
+	if err != nil {
+		t.Fatalf("createDataDisks failed: %v", err)
+	}
+
+	backing := newDisks[0].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+	if got, want := backing.FileName, "[datastore1] host-1-192.168.1.10/host-1-192.168.1.10-disk-1.vmdk"; got != want {
+		t.Fatalf("backing.FileName = %q, want %q", got, want)
+	}
+}
+
+func TestCreateDataDisksUsesPrimaryIPv6ForDeterministicPath(t *testing.T) {
+	model, session, server := initSimulator(t)
+	t.Cleanup(model.Remove)
+	t.Cleanup(server.Close)
+	vm := model.Map().Any("VirtualMachine").(*simulator.VirtualMachine)
+	machine := object.NewVirtualMachine(session.Client.Client, vm.Reference())
+	devices, err := machine.Device(ctx.TODO())
+	if err != nil {
+		t.Fatalf("Failed to obtain vm devices: %v", err)
+	}
+
+	vmContext := &capvcontext.VMContext{
+		VSphereVM: &infrav1.VSphereVM{
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					DataDisks: []infrav1.VSphereDisk{{Name: "disk-1", SizeGiB: 10}},
+				},
+			},
+		},
+		MachineConfigSlot: &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			Network: &infrav1.MachineConfigSlotNetwork{Primary: infrav1.NetworkConfig{
+				IPv6: "fd00::10",
+			}},
+			PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-1"}},
+		},
+		Session: session,
+	}
+
+	newDisks, err := createDataDisks(ctx.TODO(), vmContext, devices, &effectiveDatastore{Name: "datastore1"})
+	if err != nil {
+		t.Fatalf("createDataDisks failed: %v", err)
+	}
+
+	backing := newDisks[0].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+	want := "[datastore1] host-1-fd00::10/host-1-fd00--10-disk-1-14f64.vmdk"
+	if backing.FileName != want {
+		t.Fatalf("backing.FileName = %q, want %q", backing.FileName, want)
+	}
+}
+
+func TestResolveEffectiveDatastoreReturnsNameAndReference(t *testing.T) {
+	model, session, server := initSimulator(t)
+	t.Cleanup(model.Remove)
+	t.Cleanup(server.Close)
+
+	pool, err := session.Finder.ResourcePoolOrDefault(ctx.TODO(), "")
+	if err != nil {
+		t.Fatalf("Failed to obtain resource pool: %v", err)
+	}
+	datastore, err := session.Finder.DefaultDatastore(ctx.TODO())
+	if err != nil {
+		t.Fatalf("Failed to obtain default datastore: %v", err)
+	}
+	datastoreName := datastore.Name()
+	if datastoreName == "" {
+		datastoreName, err = datastore.ObjectName(ctx.TODO())
+		if err != nil {
+			t.Fatalf("Failed to obtain datastore name: %v", err)
+		}
+	}
+	vmContext := &capvcontext.VMContext{
+		VSphereVM: &infrav1.VSphereVM{
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{Datastore: datastoreName},
+			},
+		},
+		Session: session,
+	}
+
+	effective, err := resolveEffectiveDatastore(ctx.TODO(), vmContext, pool)
+	if err != nil {
+		t.Fatalf("resolveEffectiveDatastore failed: %v", err)
+	}
+	if effective.Name != datastoreName {
+		t.Fatalf("effective datastore name = %q, want %q", effective.Name, datastoreName)
+	}
+	if effective.Ref.Type != "Datastore" || effective.Ref.Value == "" {
+		t.Fatalf("effective datastore reference = %#v, want a Datastore reference", effective.Ref)
 	}
 }
 
@@ -451,7 +576,7 @@ func TestCreateDataDisksEphemeral(t *testing.T) {
 		}
 		vmContext := newVMContext([]infrav1.VSphereDisk{{Name: "cache-1", SizeGiB: 10}}, slot)
 
-		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList)
+		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList, nil)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(newDisks).To(gomega.HaveLen(1))
 
@@ -474,7 +599,7 @@ func TestCreateDataDisksEphemeral(t *testing.T) {
 		}
 		vmContext := newVMContext([]infrav1.VSphereDisk{{Name: "cache-1", SizeGiB: 10}}, slot)
 
-		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList)
+		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList, nil)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		spec := newDisks[0].GetVirtualDeviceConfigSpec()
 		g.Expect(spec.FileOperation).To(gomega.Equal(types.VirtualDeviceConfigSpecFileOperationCreate))
@@ -490,7 +615,7 @@ func TestCreateDataDisksEphemeral(t *testing.T) {
 		}
 		vmContext := newVMContext([]infrav1.VSphereDisk{{Name: "cache-1", SizeGiB: 10}}, slot)
 
-		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList)
+		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList, nil)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(*newDisks[0].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().UnitNumber).To(gomega.Equal(int32(4)))
 	})
@@ -507,7 +632,7 @@ func TestCreateDataDisksEphemeral(t *testing.T) {
 			{Name: "cache-1", SizeGiB: 10},
 		}, slot)
 
-		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList)
+		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList, nil)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(newDisks).To(gomega.HaveLen(2))
 
@@ -554,7 +679,7 @@ func TestCreateDataDisksUsesSCSIControllerWhenPrimaryDiskIsIDE(t *testing.T) {
 		},
 	}
 
-	newDisks, err := createDataDisks(ctx.TODO(), vmContext, devices)
+	newDisks, err := createDataDisks(ctx.TODO(), vmContext, devices, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(newDisks).To(gomega.HaveLen(1))
 

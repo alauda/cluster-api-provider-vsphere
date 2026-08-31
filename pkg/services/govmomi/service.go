@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -1266,21 +1267,19 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 	}
 
 	disks := devices.SelectByType((*types.VirtualDisk)(nil))
-	scsiKeys := findSCSIControllerKeys(devices)
 	updated := false
 	usedDiskKeys := map[int32]struct{}{}
 
 	for i := range virtualMachineCtx.MachineConfigSlot.PersistentDisks {
 		pd := &virtualMachineCtx.MachineConfigSlot.PersistentDisks[i]
-		// For a freshly created disk whose status write was lost, VolumePath is
-		// empty; re-derive the deterministic path assigned at clone time so Tier 1
-		// can still self-heal. Existing disks carry a recorded VolumePath and never
-		// reach this derivation.
-		expectedPath := ""
-		if pd.VolumePath == "" {
-			expectedPath = util.DeterministicDiskPath(virtualMachineCtx.VSphereVM.Name, pd.Datastore, pd.Name)
+		expectedPath := pd.VolumePath
+		expectedName := ""
+		hostname := virtualMachineCtx.MachineConfigSlot.Hostname
+		primaryIP := util.PrimarySlotIP(virtualMachineCtx.MachineConfigSlot.Network)
+		if expectedPath == "" {
+			expectedName = util.DeterministicDiskName(hostname, primaryIP, pd.Name) + ".vmdk"
 		}
-		disk := findPersistentDiskDevice(pd, expectedPath, disks, usedDiskKeys, scsiKeys)
+		disk := findPersistentDiskDevice(pd, expectedPath, expectedName, disks, usedDiskKeys)
 		if disk == nil {
 			continue
 		}
@@ -1326,67 +1325,39 @@ func findSCSIControllerKeys(devices object.VirtualDeviceList) map[int32]struct{}
 	return keys
 }
 
-// findPersistentDiskDevice locates the VM disk that corresponds to a persistent
-// disk spec. It uses a two-tier match strategy:
-//  1. VolumePath (exact VMDK file path — globally unique, most reliable). The
-//     recorded VolumePath is preferred; for a freshly created disk whose status
-//     write was lost, expectedPath (the deterministic path re-derived by the
-//     caller) is used as a self-healing fallback. Both compare against the disk's
-//     backing file name, so a false match is not possible.
-//  2. UnitNumber on a SCSI controller (fallback for disks on an unnamed datastore;
-//     stable across VM recreations when the same unit is reused).
-//
-// There is deliberately no capacity-based tier: identity comes from the path or
-// the unit, both of which are exact. If neither matches, the disk cannot be
-// safely identified — returning nil lets ValidatePersistentDiskBackfill refuse
-// power-on rather than silently attach the wrong same-size disk.
-//
-// Tier 2 is restricted to SCSI controllers because CAPV always places persistent
-// data disks on SCSI. This prevents false matches against the OS disk when it
-// lives on an IDE or SATA controller.
-func findPersistentDiskDevice(pd *infrav1.PersistentDisk, expectedPath string, disks object.VirtualDeviceList, usedDiskKeys, scsiKeys map[int32]struct{}) *types.VirtualDisk {
+// findPersistentDiskDevice locates a persistent disk by its recorded full VMDK
+// path, or by an exact VMDK basename when the path is unavailable. UnitNumber
+// and capacity are never identity fallbacks.
+func findPersistentDiskDevice(pd *infrav1.PersistentDisk, expectedPath, expectedName string, disks object.VirtualDeviceList, usedDiskKeys map[int32]struct{}) *types.VirtualDisk {
 	if pd == nil {
 		return nil
 	}
 
-	// Tier 1: match by VolumePath (any controller — the path is unique). Prefer the
-	// recorded path; fall back to the deterministic path re-derived at clone time.
-	matchPath := pd.VolumePath
-	if matchPath == "" {
-		matchPath = expectedPath
-	}
-	if matchPath != "" {
-		for _, d := range disks {
-			disk := d.(*types.VirtualDisk)
-			if _, used := usedDiskKeys[disk.Key]; used {
-				continue
-			}
-			if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
-				if backing.FileName == matchPath {
-					return disk
-				}
-			}
+	var match *types.VirtualDisk
+	for _, d := range disks {
+		disk := d.(*types.VirtualDisk)
+		if _, used := usedDiskKeys[disk.Key]; used {
+			continue
 		}
+		backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+		if !ok {
+			continue
+		}
+
+		matched := expectedPath != "" && backing.FileName == expectedPath
+		if expectedPath == "" {
+			matched = expectedName != "" && path.Base(backing.FileName) == expectedName
+		}
+		if !matched {
+			continue
+		}
+		if match != nil {
+			return nil
+		}
+		match = disk
 	}
 
-	// Tier 2: match by UnitNumber on a SCSI controller.
-	if pd.UnitNumber != nil {
-		for _, d := range disks {
-			disk := d.(*types.VirtualDisk)
-			if _, onSCSI := scsiKeys[disk.GetVirtualDevice().ControllerKey]; !onSCSI {
-				continue
-			}
-			if disk.UnitNumber == nil || *disk.UnitNumber != *pd.UnitNumber {
-				continue
-			}
-			if _, used := usedDiskKeys[disk.Key]; used {
-				continue
-			}
-			return disk
-		}
-	}
-
-	return nil
+	return match
 }
 
 func diskBackingFileName(disk *types.VirtualDisk) string {

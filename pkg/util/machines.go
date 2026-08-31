@@ -1286,26 +1286,42 @@ func capvDiskPath(name string) string {
 }
 
 // DeterministicDiskPath derives the datastore path of a slot-managed data disk
-// that CAPV creates itself, so status carries a Tier-1 VolumePath from the moment
-// of clone instead of relying on vCenter's auto-generated vmdk name and a later
-// capacity guess. The layout is "[datastore] <vmName>/<name>.vmdk", where the
-// per-VM directory (an exact vmName, a DNS-1123 object name that is always a safe
-// path component) namespaces disks across VMs, and the file is named by
-// DeterministicDiskName(vmName, diskName). A retained persistent disk keeps living
-// under this directory across VM recreations because the directory persists as
-// long as the retained vmdk does, and the next VM reattaches by the recorded full
-// path. Used ONLY when first creating a fresh disk on a known datastore; existing
-// disks keep their recorded path. The datastore name is trusted verbatim (it
-// originates from vSphere and is already used unguarded elsewhere).
+// that CAPV creates itself, so status carries a deterministic VolumePath from the
+// moment of clone instead of relying on vCenter's auto-generated vmdk name and a
+// later identity guess. The path identity is the slot hostname, primary IP, and disk
+// name; the VM object name is deliberately excluded because it changes on node
+// replacement. Used when first creating a fresh disk or reconstructing a missing
+// VolumePath; existing disks keep their recorded path. The datastore name is
+// trusted verbatim (it originates from vSphere and is already used unguarded
+// elsewhere).
 //
-// Returns "" only when a required input (datastore, vmName, diskName) is empty.
-func DeterministicDiskPath(vmName, datastore, diskName string) string {
+// Returns "" when a required input (hostname, datastore, diskName) is empty.
+// An empty primaryIP is valid for DHCP slots and produces a stable hostname-disk name.
+func DeterministicDiskPath(hostname, primaryIP, datastore, diskName string) string {
 	ds := strings.TrimSpace(datastore)
-	vm := strings.TrimSpace(vmName)
-	if ds == "" || vm == "" || strings.TrimSpace(diskName) == "" {
+	host := strings.TrimSpace(hostname)
+	ip := strings.TrimSpace(primaryIP)
+	if ds == "" || host == "" || strings.TrimSpace(diskName) == "" {
 		return ""
 	}
-	return DatastorePrefix(ds) + " " + vm + "/" + DeterministicDiskName(vmName, diskName) + ".vmdk"
+	identity := host
+	if ip != "" {
+		identity += "-" + ip
+	}
+	return DatastorePrefix(ds) + " " + identity + "/" + DeterministicDiskName(host, ip, diskName) + ".vmdk"
+}
+
+// PrimarySlotIP returns the configured primary address used for deterministic
+// slot identities. IPv4 is preferred for dual-stack slots; IPv6 is used when
+// the slot is IPv6-only.
+func PrimarySlotIP(network *infrav1.MachineConfigSlotNetwork) string {
+	if network == nil {
+		return ""
+	}
+	if ip := strings.TrimSpace(network.Primary.IP); ip != "" {
+		return ip
+	}
+	return strings.TrimSpace(network.Primary.IPv6)
 }
 
 // DatastorePrefix returns the "[datastore]" token that opens a datastore path, or
@@ -1320,31 +1336,38 @@ func DatastorePrefix(datastore string) string {
 }
 
 // DeterministicDiskName composes an idempotent, path-safe vmdk file-name base
-// (without the ".vmdk" suffix) for a slot-managed data disk from the creating
-// VM's hostname and the disk name. The readable form is "<hostname>-<diskName>".
+// (without the ".vmdk" suffix) for a slot-managed data disk from its hostname,
+// primary IP, and disk name. The readable form is "<hostname>-<ip>-<diskName>"
+// when an IP is configured, or "<hostname>-<diskName>" for DHCP slots.
 //
 // The name must be a single datastore path component within the 255-byte
-// VMFS/NFS limit and must never collapse two distinct (hostname, diskName) pairs
+// VMFS/NFS limit and must never collapse two distinct (hostname, primaryIP,
+// diskName) triples
 // onto one name (which would match the wrong disk). To guarantee both without
 // rejecting any input: every byte outside [A-Za-z0-9._-] is replaced with '-',
 // and whenever that replacement changes the string or the result would exceed the
 // budget (255 minus the ".vmdk" the caller appends), a collision-resistant suffix
-// "-<first 5 hex of SHA-256(hostname 0x00 diskName)>" is appended to a truncated
-// prefix. The hash is taken over the raw inputs, so distinct pairs never share a
-// name even when their sanitized/truncated prefixes coincide. The function is
+// "-<first 5 hex of SHA-256(hostname 0x00 primaryIP 0x00 diskName)>" is appended
+// to a truncated prefix. The hash is taken over the raw inputs, so distinct
+// triples never share a name even when their sanitized/truncated prefixes
+// coincide. The function is
 // pure: identical inputs always yield the identical name.
-func DeterministicDiskName(hostname, diskName string) string {
+func DeterministicDiskName(hostname, primaryIP, diskName string) string {
 	const maxBase = 255 - len(".vmdk") // leave room for the ".vmdk" the caller appends
 	host := strings.TrimSpace(hostname)
+	ip := strings.TrimSpace(primaryIP)
 	disk := strings.TrimSpace(diskName)
 	readable := host + "-" + disk
+	if ip != "" {
+		readable = host + "-" + ip + "-" + disk
+	}
 
 	sanitized := sanitizeDiskPathComponent(readable)
 	if sanitized == readable && len(sanitized) <= maxBase {
 		return sanitized
 	}
 
-	sum := sha256.Sum256([]byte(host + "\x00" + disk))
+	sum := sha256.Sum256([]byte(host + "\x00" + ip + "\x00" + disk))
 	suffix := "-" + hex.EncodeToString(sum[:])[:5]
 	if prefixBudget := maxBase - len(suffix); len(sanitized) > prefixBudget {
 		sanitized = sanitized[:prefixBudget]

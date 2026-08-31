@@ -51,6 +51,11 @@ const (
 	maxUnitNumber = 30
 )
 
+type effectiveDatastore struct {
+	Name string
+	Ref  types.ManagedObjectReference
+}
+
 // Clone kicks off a clone operation on vCenter to create a new virtual machine. This function does not wait for
 // the virtual machine to be created on the vCenter, which can be resolved by waiting on the task reference stored
 // in VMContext.VSphereVM.Status.TaskRef.
@@ -155,6 +160,11 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 		return errors.Wrapf(err, "error getting devices for %q", vmCtx)
 	}
 
+	effectiveDatastore, err := resolveEffectiveDatastore(ctx, vmCtx, pool)
+	if err != nil {
+		return err
+	}
+
 	// Create a new list of device specs for cloning the VM.
 	var deviceSpecs []types.BaseVirtualDeviceConfigSpec
 
@@ -169,7 +179,7 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 
 	// Process all DataDisks definitions to dynamically create and add disks to the VM
 	if len(vmCtx.VSphereVM.Spec.DataDisks) > 0 {
-		dataDisks, err := createDataDisks(ctx, vmCtx, devices)
+		dataDisks, err := createDataDisks(ctx, vmCtx, devices, effectiveDatastore)
 		if err != nil {
 			return errors.Wrapf(err, "error getting data disks")
 		}
@@ -235,107 +245,10 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 		spec.Config.MemoryReservationLockedToMax = ptr.To(true)
 	}
 
-	var datastoreRef *types.ManagedObjectReference
-	if vmCtx.VSphereVM.Spec.Datastore != "" {
-		datastore, err := vmCtx.Session.Finder.Datastore(ctx, vmCtx.VSphereVM.Spec.Datastore)
-		if err != nil {
-			return errors.Wrapf(err, "unable to get datastore %s for %q", vmCtx.VSphereVM.Spec.Datastore, vmCtx)
-		}
-		datastoreRef = types.NewReference(datastore.Reference())
-		spec.Location.Datastore = datastoreRef
-	}
-
-	var storageProfileID string
-	if vmCtx.VSphereVM.Spec.StoragePolicyName != "" {
-		pbmClient, err := pbm.NewClient(ctx, vmCtx.Session.Client.Client)
-		if err != nil {
-			return errors.Wrapf(err, "unable to create pbm client for %q", vmCtx)
-		}
-
-		storageProfileID, err = pbmClient.ProfileIDByName(ctx, vmCtx.VSphereVM.Spec.StoragePolicyName)
-		if err != nil {
-			return errors.Wrapf(err, "unable to get storageProfileID from name %s for %q", vmCtx.VSphereVM.Spec.StoragePolicyName, vmCtx)
-		}
-
-		var hubs []pbmTypes.PbmPlacementHub
-
-		// If there's a Datastore configured, it should be the only one for which we check if it matches the requirements of the Storage Policy
-		if datastoreRef != nil {
-			hubs = append(hubs, pbmTypes.PbmPlacementHub{
-				HubType: datastoreRef.Type,
-				HubId:   datastoreRef.Value,
-			})
-		} else {
-			// Otherwise we should get just the Datastores connected to our pool
-			cluster, err := pool.Owner(ctx)
-			if err != nil {
-				return errors.Wrapf(err, "failed to get owning cluster of resourcepool %q to calculate datastore based on storage policy", pool)
-			}
-
-			dsList, err := object.NewComputeResource(vmCtx.Session.Client.Client, cluster.Reference()).Datastores(ctx)
-			if err != nil {
-				return errors.Wrapf(err, "unable to list datastores from owning cluster of requested resourcepool")
-			}
-
-			var refs []types.ManagedObjectReference
-			for i := range dsList {
-				refs = append(refs, dsList[i].Reference())
-			}
-
-			var datastores []mo.Datastore
-			if err := property.DefaultCollector(vmCtx.Session.Client.Client).Retrieve(ctx, refs, []string{"summary"}, &datastores); err != nil {
-				return errors.Wrapf(err, "unable to collect datastore properties to validate maintenance mode")
-			}
-
-			for _, ds := range datastores {
-				if ds.Summary.MaintenanceMode != string(types.DatastoreSummaryMaintenanceModeStateNormal) {
-					log.V(4).Info("datastore is in maintenance mode, skipping", "datastore", ds.Summary.Name)
-					continue
-				}
-
-				hubs = append(hubs, pbmTypes.PbmPlacementHub{
-					HubType: ds.Reference().Type,
-					HubId:   ds.Reference().Value,
-				})
-			}
-		}
-
-		var constraints []pbmTypes.BasePbmPlacementRequirement
-		constraints = append(constraints, &pbmTypes.PbmPlacementCapabilityProfileRequirement{ProfileId: pbmTypes.PbmProfileId{UniqueId: storageProfileID}})
-		result, err := pbmClient.CheckRequirements(ctx, hubs, nil, constraints)
-		if err != nil {
-			return errors.Wrapf(err, "unable to check requirements for storage policy")
-		}
-
-		if len(result.CompatibleDatastores()) == 0 {
-			return fmt.Errorf("no compatible datastores found for storage policy: %s", vmCtx.VSphereVM.Spec.StoragePolicyName)
-		}
-
-		// If datastoreRef is nil here it means that the user didn't specify a Datastore. So we should
-		// select one of the datastores of the owning cluster of the resource pool that matched the
-		// requirements of the storage policy.
-		if datastoreRef == nil {
-			r := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // We won't need cryptographically secure randomness here.
-			ds := result.CompatibleDatastores()[r.Intn(len(result.CompatibleDatastores()))]
-			datastoreRef = &types.ManagedObjectReference{Type: ds.HubType, Value: ds.HubId}
-		}
-	}
-
-	// if datastoreRef is nil here, means that user didn't specified a datastore NOR a
-	// storagepolicy, so we should select the default
-	if datastoreRef == nil {
-		// if no datastore defined through VM spec or storage policy, use default
-		datastore, err := vmCtx.Session.Finder.DefaultDatastore(ctx)
-		if err != nil {
-			return errors.Wrapf(err, "unable to get default datastore for %q", vmCtx)
-		}
-		datastoreRef = types.NewReference(datastore.Reference())
-	}
-
 	disks := devices.SelectByType((*types.VirtualDisk)(nil))
 	isLinkedClone := snapshotRef != nil
-	spec.Location.Disk = getDiskLocators(disks, *datastoreRef, isLinkedClone)
-	spec.Location.Datastore = datastoreRef
+	spec.Location.Disk = getDiskLocators(disks, effectiveDatastore.Ref, isLinkedClone)
+	spec.Location.Datastore = &effectiveDatastore.Ref
 
 	log.Info(fmt.Sprintf("Cloning Machine with clone mode %s", vmCtx.VSphereVM.Status.CloneMode))
 	task, err := tpl.Clone(ctx, folder, vmCtx.VSphereVM.Name, spec)
@@ -352,6 +265,115 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 		log.Error(err, "Failed to patch VSphereVM (best-effort)")
 	}
 	return nil
+}
+
+func resolveEffectiveDatastore(ctx context.Context, vmCtx *capvcontext.VMContext, pool *object.ResourcePool) (*effectiveDatastore, error) {
+	var datastoreRef *types.ManagedObjectReference
+	var datastore *object.Datastore
+
+	if vmCtx.VSphereVM.Spec.Datastore != "" {
+		var err error
+		datastore, err = vmCtx.Session.Finder.Datastore(ctx, vmCtx.VSphereVM.Spec.Datastore)
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to get datastore %s for %q", vmCtx.VSphereVM.Spec.Datastore, vmCtx)
+		}
+		datastoreRef = types.NewReference(datastore.Reference())
+	}
+
+	if vmCtx.VSphereVM.Spec.StoragePolicyName != "" {
+		pbmClient, err := pbm.NewClient(ctx, vmCtx.Session.Client.Client)
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to create pbm client for %q", vmCtx)
+		}
+
+		storageProfileID, err := pbmClient.ProfileIDByName(ctx, vmCtx.VSphereVM.Spec.StoragePolicyName)
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to get storageProfileID from name %s for %q", vmCtx.VSphereVM.Spec.StoragePolicyName, vmCtx)
+		}
+
+		var hubs []pbmTypes.PbmPlacementHub
+		if datastoreRef != nil {
+			hubs = append(hubs, pbmTypes.PbmPlacementHub{
+				HubType: datastoreRef.Type,
+				HubId:   datastoreRef.Value,
+			})
+		} else {
+			cluster, err := pool.Owner(ctx)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to get owning cluster of resourcepool %q to calculate datastore based on storage policy", pool)
+			}
+
+			dsList, err := object.NewComputeResource(vmCtx.Session.Client.Client, cluster.Reference()).Datastores(ctx)
+			if err != nil {
+				return nil, errors.Wrapf(err, "unable to list datastores from owning cluster of requested resourcepool")
+			}
+
+			var refs []types.ManagedObjectReference
+			for i := range dsList {
+				refs = append(refs, dsList[i].Reference())
+			}
+
+			var datastores []mo.Datastore
+			if err := property.DefaultCollector(vmCtx.Session.Client.Client).Retrieve(ctx, refs, []string{"summary"}, &datastores); err != nil {
+				return nil, errors.Wrapf(err, "unable to collect datastore properties to validate maintenance mode")
+			}
+
+			for _, ds := range datastores {
+				if ds.Summary.MaintenanceMode != string(types.DatastoreSummaryMaintenanceModeStateNormal) {
+					ctrl.LoggerFrom(ctx).V(4).Info("datastore is in maintenance mode, skipping", "datastore", ds.Summary.Name)
+					continue
+				}
+
+				hubs = append(hubs, pbmTypes.PbmPlacementHub{
+					HubType: ds.Reference().Type,
+					HubId:   ds.Reference().Value,
+				})
+			}
+		}
+
+		constraints := []pbmTypes.BasePbmPlacementRequirement{
+			&pbmTypes.PbmPlacementCapabilityProfileRequirement{ProfileId: pbmTypes.PbmProfileId{UniqueId: storageProfileID}},
+		}
+		result, err := pbmClient.CheckRequirements(ctx, hubs, nil, constraints)
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to check requirements for storage policy")
+		}
+		if len(result.CompatibleDatastores()) == 0 {
+			return nil, fmt.Errorf("no compatible datastores found for storage policy: %s", vmCtx.VSphereVM.Spec.StoragePolicyName)
+		}
+
+		if datastoreRef == nil {
+			r := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // We won't need cryptographically secure randomness here.
+			ds := result.CompatibleDatastores()[r.Intn(len(result.CompatibleDatastores()))]
+			datastoreRef = &types.ManagedObjectReference{Type: ds.HubType, Value: ds.HubId}
+		}
+	}
+
+	if datastoreRef == nil {
+		var err error
+		datastore, err = vmCtx.Session.Finder.DefaultDatastore(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to get default datastore for %q", vmCtx)
+		}
+		datastoreRef = types.NewReference(datastore.Reference())
+	}
+
+	if datastore == nil {
+		datastore = object.NewDatastore(vmCtx.Session.Client.Client, *datastoreRef)
+	}
+	name := datastore.Name()
+	if name == "" {
+		var err error
+		name, err = datastore.ObjectName(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to get datastore name for %s", datastoreRef.Value)
+		}
+	}
+	if name == "" {
+		return nil, errors.Errorf("datastore %s has no name", datastoreRef.Value)
+	}
+
+	return &effectiveDatastore{Name: name, Ref: *datastoreRef}, nil
 }
 
 func newVMFlagInfo() *types.VirtualMachineFlagInfo {
@@ -439,7 +461,7 @@ func getDiskConfigSpec(disk *types.VirtualDisk, diskCloneCapacityKB int64) (type
 }
 
 // createDataDisks parses through the list of VSphereDisk objects and generates the VirtualDeviceConfigSpec for each one.
-func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices object.VirtualDeviceList) ([]types.BaseVirtualDeviceConfigSpec, error) {
+func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices object.VirtualDeviceList, effective *effectiveDatastore) ([]types.BaseVirtualDeviceConfigSpec, error) {
 	log := ctrl.LoggerFrom(ctx)
 	additionalDisks := []types.BaseVirtualDeviceConfigSpec{}
 	storageProfileIDs := map[string]string{}
@@ -502,6 +524,9 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 		case ed != nil:
 			slotDatastore, slotStoragePolicy, slotPinnedUnit = ed.Datastore, ed.StoragePolicy, ed.UnitNumber
 		}
+		if slotDatastore == "" && slotStoragePolicy == "" && effective != nil {
+			slotDatastore = effective.Name
+		}
 
 		backing := &types.VirtualDiskFlatVer2BackingInfo{
 			DiskMode: string(types.VirtualDiskModePersistent),
@@ -519,15 +544,23 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 			// Fresh persistent disk on a known datastore: name the vmdk
 			// deterministically and record it on the slot so status carries a Tier-1
 			// VolumePath from the moment of clone, instead of relying on vCenter's
-			// auto-generated name and a later capacity guess. DeterministicDiskName
+			// auto-generated name and a later identity guess. DeterministicDiskName
 			// sanitizes/hashes any disk name (it never rejects), so even an unsafe or
-			// over-long name yields a stable, unique path rather than falling back to a
-			// capacity guess. FileOperationCreate below still creates the file; the
+			// over-long name yields a stable, unique path rather than falling back to an
+			// identity guess. FileOperationCreate below still creates the file; the
 			// write is self-healing because the same path is re-derivable at observe
 			// time.
-			path := util.DeterministicDiskPath(vmCtx.VSphereVM.Name, slotDatastore, dataDisk.Name)
+			hostname := vmCtx.MachineConfigSlot.Hostname
+			primaryIP := util.PrimarySlotIP(vmCtx.MachineConfigSlot.Network)
+			path := util.DeterministicDiskPath(hostname, primaryIP, slotDatastore, dataDisk.Name)
 			backing.FileName = path
 			pd.VolumePath = path
+		case pd != nil && slotStoragePolicy != "":
+			// Let the storage policy choose the datastore, but keep a deterministic
+			// basename so the resulting full path can be matched after clone.
+			hostname := vmCtx.MachineConfigSlot.Hostname
+			primaryIP := util.PrimarySlotIP(vmCtx.MachineConfigSlot.Network)
+			backing.FileName = util.DeterministicDiskName(hostname, primaryIP, dataDisk.Name) + ".vmdk"
 		case slotDatastore != "":
 			// Ephemeral disk (or a persistent disk whose name is not path-safe):
 			// Reconfigure VM disk creation allows datastore selection via the backing

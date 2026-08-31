@@ -1086,7 +1086,7 @@ func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infr
 		// Pick the phase from provisioning progress:
 		//   - VolumePath known -> Attached (created/observed/reused vmdk).
 		//   - only UnitNumber  -> Creating (clone assigned a unit but the vmdk is not
-		//     observed yet; the disk falls back to unit-based matching until then).
+		//     observed yet; unit is recorded for device configuration, not identity matching).
 		//   - neither          -> nothing to record; the pool reconciler seeds/observes
 		//     it. Leave any existing entry untouched.
 		var phase infrav1.PersistentDiskPhase

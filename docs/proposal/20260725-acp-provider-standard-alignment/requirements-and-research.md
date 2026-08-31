@@ -191,10 +191,13 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 3. **reclaim**：`vspheremachineconfigpool_controller.go` 的读/清空改到 status；`reclaimSlotDisks`+`pollReclaimTask` 用 per-disk `Phase`（`Reclaiming`/`Available`/`Error`）+ `TaskRef`/`RetryAfter`/`LastError` 取代 per-slot `reclaimStatus`。回收成功不删记录，改标 `Reclaimed` 墓碑（`TombstoneDiskStatus`，清空 `VolumePath`/`DiskUUID`/`TaskRef`/`RetryAfter`），循环开头见 `Reclaimed` 即跳过——原因见「存量迁移」。
 4. **provision 判定与 condition**：未 provision 判定（`poolUnprovisionedInUseDisk`）经 `ObservedVolumePath`（status 优先、spec 兜底）判断；`PersistentDisksReady` 改看 per-disk `Phase==Error`。
 
-**存量迁移（两 release，不可同版本删）**：`reclaimStatus` 与 `persistentDisks.volumePath/diskUUID` 在基线 `dev/v1.13.1` 及交付仓库 CRD 中均已存在，属存量已发布字段。
-- **release 1（本 PR）**：加 status 字段；pool reconcile（normal 与 delete）入口调 `SeedPersistentDiskStatuses(pool)`：对 spec 有 `volumePath/diskUUID` 却无 status 记录的盘幂等播种一条 status（Phase 按 slot 态取 `Attached`/`Available`，owner 取 slot 的 MachineRef），并把存量 `configStatuses[].reclaimStatus` 折叠进对应盘记录后清空；此后只写 status，spec 旧字段冻结。overlay 读取时 status 优先、spec 兜底，未播种也不影响消费者。
-- **`Reclaimed` 墓碑（为何回收成功不删记录）**：因 release 1 里 spec 的 `volumePath` 冻结保留，若回收成功直接 `RemoveDiskStatus`，下一轮 seed 会因「spec 有 volumePath、status 无记录」再次播种，把已删的盘重新判为可回收，陷入 seed→删盘（file-not-found）→删记录→再 seed 的死循环，`reclaimed` 永不为真——升级删 pool 时 finalizer 摘不掉、正常运行时释放槽位回不到 `Available`。故回收成功保留记录、标 `Reclaimed`（观测值清空）：记录在则 seed 跳过、`HasReclaimablePersistentDiskBacking` 判不可回收；`HydrateSlotFromStatus` 见 `Reclaimed` 把内存 slot 的 `volumePath/diskUUID` 清空，使复用该槽位的新机器新建盘而非挂已删 vmdk；槽位复用时 backfill 覆盖墓碑。release 2 spec 字段删除后此约束自然消失，墓碑逻辑仍适用。
-- **release 2**：从 CRD 删 spec 的 `volumePath/diskUUID`（`UnitNumber` 保留为用户期望字段）与 `configStatuses[].reclaimStatus`（及 `MachineConfigSlotReclaimStatus` 类型）。不可同版本删，否则 CRD pruning 会在播种前裁掉指针。兜底：数据在 `.vmdk`，指针可按 unitNumber 从 vCenter 重发现。
+**存量迁移**：现有 `reclaimStatus` 与 `persistentDisks.volumePath/diskUUID` 字段需要兼容。pool reconcile 入口调用
+`SeedPersistentDiskStatuses(pool)`，对 spec 中已有观测值但 status 尚无记录的盘幂等播种；后续观测态只写
+`status.persistentDiskStatuses`，overlay 读取时 status 优先、spec 兜底。
+- **`Reclaimed` 墓碑**：回收成功保留 status 记录并清空观测值，标记 `Reclaimed`，避免旧 spec 观测值导致下一轮
+  重复播种已删除的 vmdk。`HydrateSlotFromStatus` 看到墓碑时清空内存 slot 的 `volumePath/diskUUID`，槽位复用
+  时新机器创建新盘并覆盖墓碑。数据盘身份由 status 的完整 `VolumePath` 或确定 basename 维护；unit 仅用于设备
+  配置，不作为持久盘认盘 fallback。
 
 **验收**：见 [test-cases.md](test-cases.md) TC-CAPV-ACP-11（status 迁移、reclaim 相变与墓碑）。认盘方式的加固另见
 [design-persistent-disk-status-matching.md](design-persistent-disk-status-matching.md) 与 TC-CAPV-ACP-12。交付仓库 chart CRD

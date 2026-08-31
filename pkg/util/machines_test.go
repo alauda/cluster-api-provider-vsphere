@@ -2211,35 +2211,33 @@ func toStringPtr(s string) *string {
 }
 
 func Test_DeterministicDiskPath(t *testing.T) {
-	// Clean, path-safe names produce an exact "[datastore] <vmName>/<host>-<disk>.vmdk":
-	// the per-VM directory namespaces disks across VMs, the file name is self-describing.
-	// Empty required inputs return "".
+	// Stable slot identity produces an exact "[datastore] <hostname>-<ip>/<hostname>-<ip>-<disk>.vmdk".
+	// Hostname, datastore, and disk name are required; an empty IP is valid for DHCP slots.
 	tests := []struct {
 		name      string
-		vmName    string
+		hostname  string
+		ip        string
 		datastore string
 		diskName  string
 		want      string
 	}{
-		{name: "happy path", vmName: "vm-1", datastore: "datastore1", diskName: "etcd", want: "[datastore1] vm-1/vm-1-etcd.vmdk"},
-		{name: "datastore with spaces is kept verbatim", vmName: "vm-1", datastore: "my datastore", diskName: "data-0", want: "[my datastore] vm-1/vm-1-data-0.vmdk"},
-		{name: "dots underscores hyphens allowed", vmName: "vm.1_a-b", datastore: "ds", diskName: "d.0_x-y", want: "[ds] vm.1_a-b/vm.1_a-b-d.0_x-y.vmdk"},
-		{name: "empty datastore returns empty", vmName: "vm-1", datastore: "", diskName: "etcd", want: ""},
-		{name: "empty vm name returns empty", vmName: "", datastore: "ds", diskName: "etcd", want: ""},
-		{name: "empty disk name returns empty", vmName: "vm-1", datastore: "ds", diskName: "", want: ""},
+		{name: "happy path", hostname: "master-1", ip: "192.168.1.10", datastore: "datastore1", diskName: "etcd", want: "[datastore1] master-1-192.168.1.10/master-1-192.168.1.10-etcd.vmdk"},
+		{name: "datastore with spaces", hostname: "master-1", ip: "192.168.1.10", datastore: "my datastore", diskName: "data-0", want: "[my datastore] master-1-192.168.1.10/master-1-192.168.1.10-data-0.vmdk"},
+		{name: "empty datastore returns empty", hostname: "master-1", ip: "192.168.1.10", datastore: "", diskName: "etcd", want: ""},
+		{name: "empty hostname returns empty", hostname: "", ip: "192.168.1.10", datastore: "ds", diskName: "etcd", want: ""},
+		{name: "empty ip remains deterministic for DHCP", hostname: "master-1", ip: "", datastore: "ds", diskName: "etcd", want: "[ds] master-1/master-1-etcd.vmdk"},
+		{name: "empty disk name returns empty", hostname: "master-1", ip: "192.168.1.10", datastore: "ds", diskName: "", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := gomega.NewWithT(t)
-			g.Expect(util.DeterministicDiskPath(tt.vmName, tt.datastore, tt.diskName)).To(gomega.Equal(tt.want))
+			g.Expect(util.DeterministicDiskPath(tt.hostname, tt.ip, tt.datastore, tt.diskName)).To(gomega.Equal(tt.want))
 		})
 	}
 
-	t.Run("different host/disk splits do not collide (per-VM directory namespaces)", func(t *testing.T) {
+	t.Run("different host/ip pairs do not collide", func(t *testing.T) {
 		g := gomega.NewWithT(t)
-		// Readable names "a-b-c" coincide, but the per-VM directory ("a" vs "a-b")
-		// keeps the full paths distinct.
-		g.Expect(util.DeterministicDiskPath("a", "ds", "b-c")).ToNot(gomega.Equal(util.DeterministicDiskPath("a-b", "ds", "c")))
+		g.Expect(util.DeterministicDiskPath("master-1", "192.168.1.10", "ds", "data")).ToNot(gomega.Equal(util.DeterministicDiskPath("master-1", "192.168.1.11", "ds", "data")))
 	})
 }
 
@@ -2248,35 +2246,40 @@ func Test_DeterministicDiskName(t *testing.T) {
 
 	t.Run("clean name is readable host-disk", func(t *testing.T) {
 		g := gomega.NewWithT(t)
-		g.Expect(util.DeterministicDiskName("vm-1", "etcd")).To(gomega.Equal("vm-1-etcd"))
-		g.Expect(util.DeterministicDiskName("vm.1_a-b", "d.0_x-y")).To(gomega.Equal("vm.1_a-b-d.0_x-y"))
+		g.Expect(util.DeterministicDiskName("master-1", "192.168.1.10", "etcd")).To(gomega.Equal("master-1-192.168.1.10-etcd"))
+		g.Expect(util.DeterministicDiskName("master.1_a-b", "192.168.1.10", "d.0_x-y")).To(gomega.Equal("master.1_a-b-192.168.1.10-d.0_x-y"))
+	})
+
+	t.Run("empty IP does not add an extra separator", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		g.Expect(util.DeterministicDiskName("master-1", "", "etcd")).To(gomega.Equal("master-1-etcd"))
 	})
 
 	t.Run("unsafe chars are sanitized and disambiguated by a hash suffix", func(t *testing.T) {
 		g := gomega.NewWithT(t)
-		got := util.DeterministicDiskName("vm-1", "a/b")
+		got := util.DeterministicDiskName("master-1", "192.168.1.10", "a/b")
 		// Sanitized prefix preserved, unsafe byte replaced by '-', hash appended.
-		g.Expect(got).To(gomega.HavePrefix("vm-1-a-b"))
-		g.Expect(hexSuffix.MatchString(got[len("vm-1-a-b"):])).To(gomega.BeTrue())
+		g.Expect(got).To(gomega.HavePrefix("master-1-192.168.1.10-a-b"))
+		g.Expect(hexSuffix.MatchString(got[len("master-1-192.168.1.10-a-b"):])).To(gomega.BeTrue())
 	})
 
 	t.Run("unsafe names that sanitize alike are kept apart by the raw-input hash", func(t *testing.T) {
 		g := gomega.NewWithT(t)
 		// "a/b" and "a]b" both sanitize to "a-b"; the hash over the raw inputs disambiguates.
-		g.Expect(util.DeterministicDiskName("vm-1", "a/b")).ToNot(gomega.Equal(util.DeterministicDiskName("vm-1", "a]b")))
+		g.Expect(util.DeterministicDiskName("master-1", "192.168.1.10", "a/b")).ToNot(gomega.Equal(util.DeterministicDiskName("master-1", "192.168.1.10", "a]b")))
 	})
 
 	t.Run("over-long name is truncated and hashed within the 250-byte budget", func(t *testing.T) {
 		g := gomega.NewWithT(t)
-		got := util.DeterministicDiskName("vm-1", strings.Repeat("a", 300))
+		got := util.DeterministicDiskName("master-1", "192.168.1.10", strings.Repeat("a", 300))
 		g.Expect(len(got)).To(gomega.Equal(250)) // 255 minus the ".vmdk" the caller appends
 		g.Expect(hexSuffix.MatchString(got[len(got)-6:])).To(gomega.BeTrue())
 	})
 
 	t.Run("is idempotent", func(t *testing.T) {
 		g := gomega.NewWithT(t)
-		for _, tc := range [][2]string{{"vm-1", "etcd"}, {"vm-1", "a/b"}, {"vm-1", strings.Repeat("a", 300)}} {
-			g.Expect(util.DeterministicDiskName(tc[0], tc[1])).To(gomega.Equal(util.DeterministicDiskName(tc[0], tc[1])))
+		for _, diskName := range []string{"etcd", "a/b", strings.Repeat("a", 300)} {
+			g.Expect(util.DeterministicDiskName("master-1", "192.168.1.10", diskName)).To(gomega.Equal(util.DeterministicDiskName("master-1", "192.168.1.10", diskName)))
 		}
 	})
 }
