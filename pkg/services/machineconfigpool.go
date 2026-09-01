@@ -1070,9 +1070,10 @@ func FindMachineConfigPoolForMachine(ctx context.Context, c client.Client, names
 // ApplyDiskBackfill records the controller-observed disk metadata (VolumePath,
 // DiskUUID, actually-assigned UnitNumber) from updatedSlot into
 // pool.Status.PersistentDiskStatuses, keyed by (hostname, disk name). Disks that
-// have a backfilled VolumePath are marked Attached and stamped with the owning
-// machine. It returns true if any observed field changed, so the caller only
-// issues a status update when needed. Spec is never written — observed state
+// have both a verified VolumePath and DiskUUID are marked Attached; a disk with
+// only an assigned unit is recorded as Creating until vCenter observation proves
+// the backing exists. It returns true if any observed field changed, so the caller
+// only issues a status update when needed. Spec is never written — observed state
 // lives in status (see HydrateSlotFromStatus for the read side).
 func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infrav1.MachineConfigSlot, ownerName, ownerUID string) bool {
 	if pool == nil || updatedSlot == nil {
@@ -1084,15 +1085,17 @@ func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infr
 		existing, _ := infrav1.FindDiskStatus(pool, updatedSlot.Hostname, pd.Name)
 
 		// Pick the phase from provisioning progress:
-		//   - VolumePath known -> Attached (created/observed/reused vmdk).
+		//   - VolumePath and DiskUUID known -> Attached (created/observed/reused vmdk).
 		//   - only UnitNumber  -> Creating (clone assigned a unit but the vmdk is not
 		//     observed yet; unit is recorded for device configuration, not identity matching).
 		//   - neither          -> nothing to record; the pool reconciler seeds/observes
 		//     it. Leave any existing entry untouched.
 		var phase infrav1.PersistentDiskPhase
+		volumePath, diskUUID := "", ""
 		switch {
-		case pd.VolumePath != "":
+		case pd.VolumePath != "" && pd.DiskUUID != "":
 			phase = infrav1.PersistentDiskPhaseAttached
+			volumePath, diskUUID = pd.VolumePath, pd.DiskUUID
 		case pd.UnitNumber != nil:
 			phase = infrav1.PersistentDiskPhaseCreating
 		default:
@@ -1116,8 +1119,8 @@ func ApplyDiskBackfill(pool *infrav1.VSphereMachineConfigPool, updatedSlot *infr
 		rec := infrav1.PersistentDiskStatus{
 			Hostname:         updatedSlot.Hostname,
 			Name:             pd.Name,
-			VolumePath:       pd.VolumePath,
-			DiskUUID:         pd.DiskUUID,
+			VolumePath:       volumePath,
+			DiskUUID:         diskUUID,
 			UnitNumber:       cloneInt32(pd.UnitNumber),
 			Phase:            phase,
 			OwnerMachineName: ownerName,

@@ -1292,6 +1292,14 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 		}
 
 		if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+			exists, err := persistentDiskBackingExists(ctx, virtualMachineCtx, backing.FileName)
+			if err != nil {
+				ctrl.LoggerFrom(ctx).Info("Unable to verify persistent disk backing", "disk", pd.Name, "path", backing.FileName, "error", err)
+				continue
+			}
+			if !exists {
+				continue
+			}
 			if pd.VolumePath != backing.FileName {
 				pd.VolumePath = backing.FileName
 				updated = true
@@ -1312,6 +1320,34 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 		return errors.Wrapf(err, "persistent disk metadata incomplete for machine config slot %q; refusing to generate persistent disk user-data or power on VM", virtualMachineCtx.MachineConfigSlot.Hostname)
 	}
 	return nil
+}
+
+// persistentDiskBackingExists verifies the observed VMDK through the datastore
+// browser before its path is persisted as an attached disk. A VM device alone is
+// not sufficient evidence here because the clone request may have recorded the
+// expected path before the asynchronous task created the file.
+func persistentDiskBackingExists(ctx context.Context, virtualMachineCtx *virtualMachineContext, fileName string) (bool, error) {
+	if virtualMachineCtx == nil || virtualMachineCtx.Session == nil || fileName == "" {
+		return false, nil
+	}
+
+	var datastorePath object.DatastorePath
+	if !datastorePath.FromString(fileName) || datastorePath.Datastore == "" || datastorePath.Path == "" {
+		return false, errors.Errorf("invalid datastore backing path %q", fileName)
+	}
+	datastore, err := virtualMachineCtx.Session.Finder.Datastore(ctx, datastorePath.Datastore)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to find datastore %q", datastorePath.Datastore)
+	}
+	if _, err := datastore.Stat(ctx, datastorePath.Path); err != nil {
+		var noSuchFile object.DatastoreNoSuchFileError
+		var noSuchDirectory object.DatastoreNoSuchDirectoryError
+		if errors.As(err, &noSuchFile) || errors.As(err, &noSuchDirectory) || types.IsFileNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // findSCSIControllerKeys returns the keys of all SCSI controllers found in devices.

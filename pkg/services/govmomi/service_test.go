@@ -660,6 +660,44 @@ func TestReconcilePersistentDiskStatusesRequiresCompleteMetadata(t *testing.T) {
 	})
 }
 
+func TestPersistentDiskBackingExists(t *testing.T) {
+	g := NewWithT(t)
+	simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+		password, _ := simulator.DefaultLogin.Password()
+		authSession, err := session.GetOrCreate(ctx, session.NewParams().
+			WithServer(fmt.Sprintf("https://%s", c.Client.URL().Host)).
+			WithUserInfo(simulator.DefaultLogin.Username(), password).
+			WithDatacenter("*"))
+		g.Expect(err).ToNot(HaveOccurred())
+		vm, err := getPoweredoffVM(ctx, c)
+		g.Expect(err).ToNot(HaveOccurred())
+		devices, err := vm.Device(ctx)
+		g.Expect(err).ToNot(HaveOccurred())
+		var existingPath string
+		for _, device := range devices.SelectByType((*types.VirtualDisk)(nil)) {
+			backing, ok := device.(*types.VirtualDisk).Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+			if ok {
+				existingPath = backing.FileName
+				break
+			}
+		}
+		g.Expect(existingPath).NotTo(BeEmpty())
+
+		vmCtx := &virtualMachineContext{VMContext: capvcontext.VMContext{Session: authSession}}
+		exists, err := persistentDiskBackingExists(ctx, vmCtx, existingPath)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(exists).To(BeTrue())
+
+		var missing object.DatastorePath
+		g.Expect(missing.FromString(existingPath)).To(BeTrue())
+		missing.Path = "does-not-exist/missing.vmdk"
+		exists, err = persistentDiskBackingExists(ctx, vmCtx, missing.String())
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(exists).To(BeFalse())
+		return nil
+	})
+}
+
 func TestFindSCSIControllerKeys(t *testing.T) {
 	g := NewWithT(t)
 

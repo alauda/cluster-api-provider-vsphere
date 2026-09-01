@@ -879,6 +879,25 @@ func TestApplyDiskBackfill(t *testing.T) {
 		g.Expect(rec.VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
 	})
 
+	t.Run("does not mark an unverified expected path as Attached", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				// createDataDisks sets the expected path before CloneVM completes;
+				// no UUID means the backing has not been observed yet.
+				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] host-1/disk-a.vmdk", UnitNumber: int32Ptr(2)},
+			},
+		}, "machine-1", "machine-1-uid")
+		g.Expect(updated).To(BeTrue())
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseCreating))
+		g.Expect(rec.VolumePath).To(BeEmpty())
+		g.Expect(rec.DiskUUID).To(BeEmpty())
+	})
+
 	t.Run("does not downgrade an active disk to Creating", func(t *testing.T) {
 		g := NewWithT(t)
 		for _, phase := range []infrav1.PersistentDiskPhase{
