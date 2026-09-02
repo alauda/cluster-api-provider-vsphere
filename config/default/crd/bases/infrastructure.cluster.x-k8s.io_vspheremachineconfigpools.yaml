@@ -297,8 +297,8 @@ spec:
                             type: string
                           unitNumber:
                             description: |-
-                              UnitNumber is the SCSI unit number for the disk (0-15, excluding 7).
-                              This ensures consistent disk ordering across VM recreations.
+                              UnitNumber is the last observed SCSI unit number for the disk (0-15,
+                              excluding 7). It is refreshed when the VM is recreated.
                             format: int32
                             maximum: 15
                             minimum: 0
@@ -561,8 +561,8 @@ spec:
                 description: |-
                   EphemeralDiskStatuses records the controller-observed SCSI unit number of
                   each non-persistent disk, keyed by (hostname, disk name). The unit is
-                  assigned at clone time and reused (hydrated back onto the in-memory slot)
-                  on the next reconcile so the guest disk table can address the disk. Unlike
+                  assigned at clone time and refreshed after VM recreation so the guest disk
+                  table can address the disk. Unlike
                   PersistentDiskStatuses this carries no VolumePath/DiskUUID/Phase: ephemeral
                   disks are recreated with the VM and never reclaimed.
                 items:
@@ -584,9 +584,8 @@ spec:
                       type: string
                     unitNumber:
                       description: |-
-                        UnitNumber is the SCSI unit number the disk was attached at, assigned by
-                        the controller at clone time and reused on the next VM recreation to keep
-                        guest disk addressing stable.
+                        UnitNumber is the last observed SCSI unit number at which the disk was
+                        attached. It is refreshed after VM recreation.
                       format: int32
                       type: integer
                   required:
@@ -670,9 +669,8 @@ spec:
                       type: string
                     unitNumber:
                       description: |-
-                        UnitNumber is the SCSI unit number the disk was actually attached at. When
-                        spec does not pin a UnitNumber, this observed value is reused on the next
-                        VM recreation to keep disk ordering stable.
+                        UnitNumber is the last observed SCSI unit number at which the disk was
+                        attached. It is refreshed after VM recreation.
                       format: int32
                       type: integer
                     volumePath:

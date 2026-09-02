@@ -92,11 +92,11 @@ P1 = 验收/上架必需；P2 = 随产品节奏推进。
 
 ### P1-3　MachineConfigPool validation 补齐（#9）
 
-- **现状**：webhook 已有 clusterRef 校验（含 consumerRef 已设时 immutable）、hostname 格式、network 必填；删除阻断已由 controller finalizer 实现（有 InUse 槽位时报错阻塞，盘 reclaim 完成后才移除 finalizer），不是缺口。缺：CRD 数值约束、唯一性、已分配槽位 immutable、跨池检查。
+- **现状**：webhook 已有 clusterRef 校验（含 consumerRef 已设时 immutable）、hostname 格式、network 必填；删除阻断已由 controller finalizer 实现（有 InUse 槽位时报错阻塞，盘 reclaim 完成后才移除 finalizer），不是缺口。缺：CRD 数值约束、唯一性、已分配槽位 immutable、跨池检查。`UnitNumber` 是观测字段，不属于已分配槽位的不可变配置。
 - **设计**：
   1. CRD marker：`configs` MinItems=1；`sizeGiB` Minimum=1；`unitNumber` Minimum=0、Maximum=15，排除 7 用 CEL（`+kubebuilder:validation:XValidation:rule="self != 7"`），不进 webhook。
-  2. 池内唯一与字段合法（webhook）：hostname、primary IP/IPv6、数据盘（持久与非持久，见 P1-7）name/unitNumber/mountPath 唯一；写法参照 DCS `validateStatic`（`dcsiphostnamepool_webhook.go`，`field.Duplicate` 错误信息带首个冲突方位置）。
-  3. immutable（webhook）：由 old 对象 `status.configStatuses` 判定已分配（InUse/Released）槽位，禁止修改其 hostname/IP/盘 size/unitNumber、禁止删除该槽位条目；参照 DCS `indexPool` 的 old/new 索引对比。
+  2. 池内唯一与字段合法（webhook）：hostname、primary IP/IPv6、数据盘（持久与非持久，见 P1-7）name/mountPath 唯一；`UnitNumber` 仅校验范围与保留号，不作为声明唯一性约束。写法参照 DCS `validateStatic`（`dcsiphostnamepool_webhook.go`，`field.Duplicate` 错误信息带首个冲突方位置）。
+  3. immutable（webhook）：由 old 对象 `status.configStatuses` 判定已分配（InUse/Released）槽位，禁止修改其 hostname/IP/盘 size、禁止删除该槽位条目；允许 `UnitNumber` 变化，因为它表示最新观测到的实际挂载位置。
   4. 跨池唯一（webhook 注入 client）：同 namespace 同 clusterRef 的池间 hostname/IP 重复检查；并发写入存在竞态，由 P1-2 `MembersUnique` condition 兜底。
   5. 校验函数放公共包，webhook 与 reconciler（P1-2）共用，避免逻辑漂移。网络名称只做格式校验，存在性在 reconcile 期校验。
   6. 可选增强：`ValidateDelete` fail-fast（当场拒绝删除有已分配槽位的池，而非删除后卡在 deleting）；DCS/HCS 均未做，非规范差距。
@@ -177,7 +177,7 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 |---|---|
 | `Hostname`、`Name` | key：所属 slot 与盘名（对齐 spec） |
 | `VolumePath`、`DiskUUID` | 观测：vmdk 路径与磁盘 UUID |
-| `UnitNumber *int32` | 观测/实际分配的 SCSI unit（spec 的 `UnitNumber` 保留为用户可选期望值，不再回填） |
+| `UnitNumber *int32` | 观测/实际分配的 SCSI unit；重建时根据当前模板设备重新分配，成功观测后更新 status |
 | `Phase` | `Creating`\|`Attached`\|`Available`\|`Reclaiming`\|`Reclaimed`\|`Error`；`Reclaimed` 为回收完成的终态墓碑（详见下「存量迁移」） |
 | `OwnerMachineUID`、`OwnerMachineName` | 占用盘的 `VSphereMachine`（取其 Name/UID，与 slot 的 `configStatuses[].machineRef` 同源，非 CAPI `Machine`）；跨机器删除保留，滚动升级时把盘认回重建的新机 |
 | `LastError`、`LastTransitionTime` | `Error` 时的错误与最近相变时间 |
@@ -186,7 +186,7 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 **不引入 `attachedVM`**：CAPV 的 hostname 即 VM 名（也是 node 名），slot→hostname→VM 天然对应，加 `OwnerMachine`（即 `VSphereMachine`）已足；reclaim 前的挂载安全检查当场查 vCenter（`FindAttachedPersistentDisks`），不落盘。DCS `AttachedVmUrn`/HCS `AttachedServerID` 因其 VM 标识是不透明 URN 才需单存，CAPV 冗余。
 
 **改动缝合点**（内存 slot 的下游消费者 clone/guest-config 全不改）：
-1. **加载（overlay）**：新增纯函数 `HydrateSlotFromStatus(pool, slot)`（`pkg/services/machineconfigpool.go`），把 status 的 `VolumePath`/`DiskUUID`/`UnitNumber` 覆盖到从 spec 取出的内存 slot 副本；在 `AllocateSlot`/`allocateSlotOnce`、`GetSlotForMachine` 返回前及 `vspherevm_controller.go` 的 annotation 回退取 slot 处调用。规则：spec 显式声明的 `UnitNumber` 优先，未声明才用 status 上次观测值。仅为「clone 复用已有 vmdk（`clone.go:488`）」与「guest 挂载认盘（`util/machines.go`）」两处消费者服务。hydrate 不做持久化。
+1. **加载（overlay）**：新增纯函数 `HydrateSlotFromStatus(pool, slot)`（`pkg/services/machineconfigpool.go`），把 status 的 `VolumePath`/`DiskUUID`/`UnitNumber` 覆盖到从 spec 取出的内存 slot 副本；在 `AllocateSlot`/`allocateSlotOnce`、`GetSlotForMachine` 返回前及 `vspherevm_controller.go` 的 annotation 回退取 slot 处调用。最新 status `UnitNumber` 仅用于展示、guest 盘表和本轮 clone 前的上下文，不作为下一次 clone 的 pinned 约束；hydrate 不做持久化。
 2. **回填**：`persistMachineConfigPoolChanges`（`vimmachine.go`）、`persistMachineConfigSlotBackfill`（`govmomi/service.go`）、`PersistSlotChanges`/`ApplyDiskBackfill`（`machineconfigpool.go`）改写 `status.PersistentDiskStatuses`（走 `Status().Update`，Phase=`Attached`、记 OwnerMachine），不再写 spec。
 3. **reclaim**：`vspheremachineconfigpool_controller.go` 的读/清空改到 status；`reclaimSlotDisks`+`pollReclaimTask` 用 per-disk `Phase`（`Reclaiming`/`Available`/`Error`）+ `TaskRef`/`RetryAfter`/`LastError` 取代 per-slot `reclaimStatus`。回收成功不删记录，改标 `Reclaimed` 墓碑（`TombstoneDiskStatus`，清空 `VolumePath`/`DiskUUID`/`TaskRef`/`RetryAfter`），循环开头见 `Reclaimed` 即跳过——原因见「存量迁移」。
 4. **provision 判定与 condition**：未 provision 判定（`poolUnprovisionedInUseDisk`）经 `ObservedVolumePath`（status 优先、spec 兜底）判断；`PersistentDisksReady` 改看 per-disk `Phase==Error`。

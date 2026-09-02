@@ -681,7 +681,7 @@ func TestCreateDataDisksEphemeral(t *testing.T) {
 		g.Expect(backing.FileName).To(gomega.Equal("[datastore1]"))
 	})
 
-	t.Run("observed ephemeral unit is reused when hydrated", func(t *testing.T) {
+	t.Run("observed ephemeral unit is refreshed during rebuild", func(t *testing.T) {
 		g := gomega.NewWithT(t)
 		slot := &infrav1.MachineConfigSlot{
 			Hostname:       "host-1",
@@ -691,7 +691,8 @@ func TestCreateDataDisksEphemeral(t *testing.T) {
 
 		newDisks, err := createDataDisks(ctx.TODO(), vmContext, deviceList, nil)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
-		g.Expect(*newDisks[0].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().UnitNumber).To(gomega.Equal(int32(4)))
+		g.Expect(*newDisks[0].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().UnitNumber).To(gomega.Equal(int32(1)))
+		g.Expect(*slot.EphemeralDisks[0].UnitNumber).To(gomega.Equal(int32(1)))
 	})
 
 	t.Run("ephemeral and persistent disks receive distinct unit numbers", func(t *testing.T) {
@@ -712,8 +713,8 @@ func TestCreateDataDisksEphemeral(t *testing.T) {
 
 		persistentUnit := *newDisks[0].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().UnitNumber
 		ephemeralUnit := *newDisks[1].GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().UnitNumber
-		g.Expect(persistentUnit).To(gomega.Equal(int32(5)))
-		g.Expect(ephemeralUnit).NotTo(gomega.Equal(int32(5)))
+		g.Expect(persistentUnit).To(gomega.Equal(int32(1)))
+		g.Expect(ephemeralUnit).To(gomega.Equal(int32(2)))
 		g.Expect(slot.EphemeralDisks[0].UnitNumber).NotTo(gomega.BeNil())
 		g.Expect(*slot.EphemeralDisks[0].UnitNumber).To(gomega.Equal(ephemeralUnit))
 	})
@@ -761,6 +762,49 @@ func TestCreateDataDisksUsesSCSIControllerWhenPrimaryDiskIsIDE(t *testing.T) {
 	g.Expect(vd.ControllerKey).To(gomega.Equal(scsiController.Key))
 	g.Expect(vd.UnitNumber).NotTo(gomega.BeNil())
 	g.Expect(*vd.UnitNumber).To(gomega.Equal(int32(0)))
+}
+
+func TestCreateDataDisksReassignsObservedUnitWhenTemplateUsesSCSIForPrimaryDisk(t *testing.T) {
+	primaryController := &types.ParaVirtualSCSIController{
+		VirtualSCSIController: types.VirtualSCSIController{
+			VirtualController: types.VirtualController{
+				VirtualDevice: types.VirtualDevice{Key: 1000},
+			},
+			ScsiCtlrUnitNumber: 7,
+		},
+	}
+	primaryUnit := int32(0)
+	primaryDisk := createVirtualDisk(2000, primaryController, 100)
+	primaryDisk.UnitNumber = &primaryUnit
+	observedUnit := int32(0)
+
+	vmContext := &capvcontext.VMContext{
+		VSphereVM: &infrav1.VSphereVM{
+			Spec: infrav1.VSphereVMSpec{
+				VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+					DataDisks: []infrav1.VSphereDisk{{Name: "var-cpaas", SizeGiB: 20}},
+				},
+			},
+		},
+		MachineConfigSlot: &infrav1.MachineConfigSlot{
+			PersistentDisks: []infrav1.PersistentDisk{{Name: "var-cpaas", SizeGiB: 20, UnitNumber: &observedUnit}},
+		},
+	}
+
+	newDisks, err := createDataDisks(ctx.TODO(), vmContext, object.VirtualDeviceList{primaryController, primaryDisk}, nil)
+	if err != nil {
+		t.Fatalf("createDataDisks failed: %v", err)
+	}
+	if len(newDisks) != 1 {
+		t.Fatalf("expected one data disk, got %d", len(newDisks))
+	}
+	dataDisk := newDisks[0].GetVirtualDeviceConfigSpec().Device.(*types.VirtualDisk)
+	if dataDisk.UnitNumber == nil || *dataDisk.UnitNumber != 1 {
+		t.Fatalf("expected data disk to be reassigned to unit 1, got %v", dataDisk.UnitNumber)
+	}
+	if vmContext.MachineConfigSlot.PersistentDisks[0].UnitNumber == nil || *vmContext.MachineConfigSlot.PersistentDisks[0].UnitNumber != 1 {
+		t.Fatalf("expected observed slot unit to be refreshed to 1, got %v", vmContext.MachineConfigSlot.PersistentDisks[0].UnitNumber)
+	}
 }
 
 func createAdditionalDisks(devices object.VirtualDeviceList, controller types.BaseVirtualController, numOfDisks int) object.VirtualDeviceList {

@@ -174,6 +174,10 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 			Status: metav1.ConditionTrue,
 			Reason: infrav1.VSphereVMBootstrapReadyV1Beta2Reason,
 		})
+		// The clone request has been accepted and createDataDisks selected the
+		// requested runtime slots. Record them as Creating; persistent disks are
+		// corrected from the actual VM device after observation, while ephemeral
+		// disks have no durable identity beyond this assigned slot.
 		if err := persistMachineConfigSlotBackfill(ctx, vmCtx); err != nil {
 			return vm, err
 		}
@@ -1226,8 +1230,8 @@ func (vms *VMService) detachPersistentDisks(ctx context.Context, virtualMachineC
 								"expectedUnit", *pd.UnitNumber, "actualUnit", *disk.UnitNumber)
 						}
 					}
-				} else if pd.UnitNumber != nil && disk.UnitNumber != nil && *pd.UnitNumber == *disk.UnitNumber {
-					// Fall back to UnitNumber only when VolumePath is not available.
+				} else if pd.DiskUUID != "" && backing.Uuid == pd.DiskUUID {
+					// DiskUUID remains a stable identity when the path is unavailable.
 					match = true
 				}
 
@@ -1285,7 +1289,7 @@ func (vms *VMService) reconcilePersistentDiskStatuses(ctx context.Context, virtu
 		}
 
 		usedDiskKeys[disk.Key] = struct{}{}
-		if pd.UnitNumber == nil && disk.UnitNumber != nil {
+		if disk.UnitNumber != nil && (pd.UnitNumber == nil || *pd.UnitNumber != *disk.UnitNumber) {
 			unitNumber := *disk.UnitNumber
 			pd.UnitNumber = &unitNumber
 			updated = true

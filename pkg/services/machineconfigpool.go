@@ -49,10 +49,9 @@ const (
 //
 // Persistent and ephemeral disks share one name and mount-path namespace within
 // a slot, so a name or mount path used by a persistent disk cannot be reused by
-// an ephemeral disk and vice versa. Ephemeral disks have no user-declared unit
-// number (it is controller-assigned), so only persistent disks contribute to
-// unit-number uniqueness; cross-kind unit conflicts are prevented at clone time
-// by the unitNumberAssigner.
+// an ephemeral disk and vice versa. UnitNumber is an observed attachment
+// position, not a stable declaration or identity; clone-time conflicts are
+// resolved from the template's currently occupied devices by unitNumberAssigner.
 //
 // Keep this function pure: it is used by the pool reconciler to set the P1-2
 // MembersValid condition and by the P1-3 validating webhook as a hard admission
@@ -88,7 +87,6 @@ func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList 
 		}
 
 		seenNames := map[string]struct{}{}
-		seenUnits := map[int32]struct{}{}
 		seenMounts := map[string]struct{}{}
 		for j := range slot.PersistentDisks {
 			pd := &slot.PersistentDisks[j]
@@ -113,12 +111,6 @@ func ValidateSlotFields(pool *infrav1.VSphereMachineConfigPool) field.ErrorList 
 					allErrs = append(allErrs, field.Invalid(diskPath.Child("unitNumber"), u, "must be between 0 and 15"))
 				case u == diskReservedUnitNumber:
 					allErrs = append(allErrs, field.Invalid(diskPath.Child("unitNumber"), u, "unit number 7 is reserved for the SCSI controller"))
-				default:
-					if _, dup := seenUnits[u]; dup {
-						allErrs = append(allErrs, field.Duplicate(diskPath.Child("unitNumber"), u))
-					} else {
-						seenUnits[u] = struct{}{}
-					}
 				}
 			}
 
@@ -305,14 +297,13 @@ func CrossPoolUniquenessConflicts(pool *infrav1.VSphereMachineConfigPool, others
 // webhook on update. Allocated slots are matched by hostname (the slot identity).
 // For each allocated slot it forbids: removing the slot entry, changing its
 // primary IP/IPv6, removing an existing persistent disk, and changing an existing
-// disk's sizeGiB, mountPath, or a already-set unitNumber (disks matched by name).
+// disk's sizeGiB or mountPath (disks matched by name). UnitNumber is deliberately
+// excluded because it records the latest observed attachment position and may
+// change when a VM is rebuilt from a template with different device occupancy.
 //
 // Adding disks to an allocated slot is allowed (decision: does not take effect
-// until VM recreation, harmless). unitNumber is only rejected on a
-// concrete→different-concrete change: a nil→value transition is how the
-// controller records the assigned SCSI slot (see ApplyDiskBackfill), and a
-// value→nil clear self-heals because the reconciler re-derives it — blocking
-// either would deadlock the controller's own spec writes.
+// until VM recreation, harmless). UnitNumber changes and clears are also
+// allowed; the reconciler re-derives the value from the rebuilt VM.
 func ValidateAllocatedSlotsImmutable(oldPool, newPool *infrav1.VSphereMachineConfigPool) field.ErrorList {
 	var allErrs field.ErrorList
 	if oldPool == nil || newPool == nil {
@@ -396,10 +387,6 @@ func validateSlotImmutable(slotPath *field.Path, oldSlot, newSlot *infrav1.Machi
 		if oldMountErr == nil && newMountErr == nil && oldMountPath != newMountPath {
 			allErrs = append(allErrs, field.Forbidden(diskBase.Child("mountPath"),
 				fmt.Sprintf("mountPath is immutable for disk %q on allocated slot %q: %q → %q", oldDisk.Name, hostname, oldDisk.MountPath, newDisk.MountPath)))
-		}
-		if oldDisk.UnitNumber != nil && newDisk.UnitNumber != nil && *oldDisk.UnitNumber != *newDisk.UnitNumber {
-			allErrs = append(allErrs, field.Forbidden(diskBase.Child("unitNumber"),
-				fmt.Sprintf("unitNumber is immutable once set for disk %q on allocated slot %q: %d → %d", oldDisk.Name, hostname, *oldDisk.UnitNumber, *newDisk.UnitNumber)))
 		}
 	}
 	return allErrs
@@ -574,8 +561,8 @@ func findSlotByHostname(pool *infrav1.VSphereMachineConfigPool, hostname string)
 // they see the observed state regardless of whether it still lives on spec
 // (legacy, frozen) or only in status (post-migration).
 //
-// A UnitNumber pinned explicitly on spec wins; otherwise the last observed unit
-// is reused to keep SCSI ordering stable across VM recreation.
+// UnitNumber is hydrated for display and guest configuration. Clone allocation
+// recomputes it from the current template hardware on every rebuild.
 func HydrateSlotFromStatus(pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot) {
 	if pool == nil || slot == nil {
 		return
@@ -600,7 +587,7 @@ func HydrateSlotFromStatus(pool *infrav1.VSphereMachineConfigPool, slot *infrav1
 		if rec.DiskUUID != "" {
 			pd.DiskUUID = rec.DiskUUID
 		}
-		if pd.UnitNumber == nil && rec.UnitNumber != nil {
+		if rec.UnitNumber != nil {
 			u := *rec.UnitNumber
 			pd.UnitNumber = &u
 		}
@@ -611,10 +598,9 @@ func HydrateSlotFromStatus(pool *infrav1.VSphereMachineConfigPool, slot *infrav1
 		if rec == nil {
 			continue
 		}
-		// Ephemeral disks have no spec unit; reuse the last observed unit so the
-		// guest disk table addresses the disk at a stable SCSI position across VM
-		// recreation.
-		if ed.UnitNumber == nil && rec.UnitNumber != nil {
+		// Ephemeral disks have no spec unit; expose the last observed unit until
+		// the next clone assigns a fresh position.
+		if rec.UnitNumber != nil {
 			u := *rec.UnitNumber
 			ed.UnitNumber = &u
 		}

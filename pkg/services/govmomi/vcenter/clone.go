@@ -563,7 +563,7 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 		// ADDITION: Check for a slot-managed disk (persistent or ephemeral) in the
 		// MachineConfigSlot. Disk names are unique across both lists, so a data
 		// disk matches at most one of them. Persistent disks may carry a
-		// backfilled VolumePath (reuse an existing vmdk) and a pinned/observed
+		// backfilled VolumePath (reuse an existing vmdk) and an observed
 		// UnitNumber; ephemeral disks never have a VolumePath (always created
 		// fresh) but do carry a controller-observed UnitNumber hydrated from
 		// status. slotDisk captures the placement/unit shared by both.
@@ -586,15 +586,14 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 			}
 		}
 
-		// Placement/unit shared by both disk kinds. VolumePath stays empty for
+		// Placement shared by both disk kinds. VolumePath stays empty for
 		// ephemeral disks, forcing a fresh create below.
 		var slotDatastore, slotStoragePolicy, slotVolumePath string
-		var slotPinnedUnit *int32
 		switch {
 		case pd != nil:
-			slotDatastore, slotStoragePolicy, slotVolumePath, slotPinnedUnit = pd.Datastore, pd.StoragePolicy, pd.VolumePath, pd.UnitNumber
+			slotDatastore, slotStoragePolicy, slotVolumePath = pd.Datastore, pd.StoragePolicy, pd.VolumePath
 		case ed != nil:
-			slotDatastore, slotStoragePolicy, slotPinnedUnit = ed.Datastore, ed.StoragePolicy, ed.UnitNumber
+			slotDatastore, slotStoragePolicy = ed.Datastore, ed.StoragePolicy
 		}
 		if slotDatastore == "" && slotStoragePolicy == "" && effective != nil {
 			slotDatastore = effective.Name
@@ -671,27 +670,19 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 		vd := dev.GetVirtualDevice()
 		vd.ControllerKey = controllerKey
 
-		// Assign unit number, favoring a pinned (persistent spec) or observed
-		// (persistent/ephemeral status) unit if provided; otherwise assign a free
-		// unit and backfill it onto the matched slot disk so it persists to status
-		// and stays stable across VM recreations.
-		var unitNumber int32
-		if slotPinnedUnit != nil {
-			unitNumber = *slotPinnedUnit
-			if err := unitNumberAssigner.markUsed(unitNumber); err != nil {
-				return nil, errors.Wrapf(err, "invalid unit number for data disk %q", dataDisk.Name)
-			}
-		} else {
-			unitNumber, err = unitNumberAssigner.assign()
-			if err != nil {
-				return nil, err
-			}
-			switch {
-			case pd != nil:
-				pd.UnitNumber = &unitNumber
-			case ed != nil:
-				ed.UnitNumber = &unitNumber
-			}
+		// UnitNumber is an observation of the current VM layout, not a stable
+		// disk identity or a placement constraint. Reassign it from the template's
+		// currently occupied slots on every rebuild, then persist the new value
+		// after the VM is successfully observed.
+		unitNumber, err := unitNumberAssigner.assign()
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case pd != nil:
+			pd.UnitNumber = &unitNumber
+		case ed != nil:
+			ed.UnitNumber = &unitNumber
 		}
 		vd.UnitNumber = &unitNumber
 
