@@ -154,6 +154,29 @@ func TestAliveModuleInfoName(t *testing.T) {
 	g.Expect(aliveModuleInfoName("other-cluster")).NotTo(Equal(name))
 }
 
+func TestAliveModuleInfoConfigPorts(t *testing.T) {
+	tests := []struct {
+		name        string
+		clusterName string
+		wantHTTP    int64
+		wantHTTPS   int64
+		wantExtra   string
+	}{
+		{name: "ordinary cluster", clusterName: "workload", wantHTTP: 11780, wantHTTPS: 11781, wantExtra: ""},
+		{name: "global cluster", clusterName: "global", wantHTTP: 80, wantHTTPS: 443, wantExtra: "11443 2379"},
+		{name: "global cluster case insensitive", clusterName: "GLOBAL", wantHTTP: 80, wantHTTPS: 443, wantExtra: "11443 2379"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := aliveModuleInfoConfigForCluster(tt.clusterName, selfBuiltLBCluster().Spec.ControlPlaneLoadBalancer)
+			if config["apiserverPort"] != int64(6443) || config["httpPort"] != tt.wantHTTP || config["httpsPort"] != tt.wantHTTPS || config["extraPorts"] != tt.wantExtra {
+				t.Fatalf("ports = api:%v http:%v https:%v extra:%q, want api:6443 http:%d https:%d extra:%q", config["apiserverPort"], config["httpPort"], config["httpsPort"], config["extraPorts"], tt.wantHTTP, tt.wantHTTPS, tt.wantExtra)
+			}
+		})
+	}
+}
+
 func TestAliveVersionFor(t *testing.T) {
 	modulePlugin := func(latest string, targets map[string]interface{}) *unstructured.Unstructured {
 		status := map[string]interface{}{}
@@ -254,7 +277,7 @@ func TestEnsureAliveModuleInfo(t *testing.T) {
 		g.Expect(changed).To(BeFalse())
 	})
 
-	t.Run("patches the version and keeps foreign config keys", func(t *testing.T) {
+	t.Run("leaves an existing provider-managed ModuleInfo to the platform", func(t *testing.T) {
 		g := NewWithT(t)
 		existing := newUnstructured(moduleInfoGVK)
 		existing.SetName(aliveModuleInfoName("test-cluster"))
@@ -268,12 +291,12 @@ func TestEnsureAliveModuleInfo(t *testing.T) {
 		reconciler := &clusterReconciler{Client: ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(existing).Build()}
 		moduleInfo, changed, err := reconciler.ensureAliveModuleInfo(context.Background(), "test-cluster", lb, "v4.1.0", pluginLabels)
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(changed).To(BeTrue())
+		g.Expect(changed).To(BeFalse())
 		version, _, _ := unstructured.NestedString(moduleInfo.Object, "spec", "version")
-		g.Expect(version).To(Equal("v4.1.0"))
+		g.Expect(version).To(Equal("v4.0.0"))
 		config, _, _ := unstructured.NestedMap(moduleInfo.Object, "spec", "config")
 		g.Expect(config).To(HaveKeyWithValue("somethingElse", "keep-me"))
-		g.Expect(config).To(HaveKeyWithValue("vrid", int64(42)))
+		g.Expect(config).NotTo(HaveKey("vrid"))
 	})
 
 	t.Run("leaves the annotations and the product label to the platform webhook", func(t *testing.T) {
@@ -297,15 +320,16 @@ func TestEnsureAliveModuleInfo(t *testing.T) {
 		g.Expect(moduleInfo.GetAnnotations()).To(HaveKeyWithValue("cpaas.io/display-name", "set-by-cluster-transformer"))
 	})
 
-	t.Run("refuses to adopt a ModuleInfo it does not own", func(t *testing.T) {
+	t.Run("leaves an existing platform ModuleInfo unchanged", func(t *testing.T) {
 		g := NewWithT(t)
 		existing := newUnstructured(moduleInfoGVK)
 		existing.SetName(aliveModuleInfoName("test-cluster"))
 
 		reconciler := &clusterReconciler{Client: ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(existing).Build()}
-		_, _, err := reconciler.ensureAliveModuleInfo(context.Background(), "test-cluster", lb, "v4.1.0", pluginLabels)
-		g.Expect(err).To(HaveOccurred())
-		g.Expect(err.Error()).To(ContainSubstring("refusing to adopt"))
+		moduleInfo, changed, err := reconciler.ensureAliveModuleInfo(context.Background(), "test-cluster", lb, "v4.1.0", pluginLabels)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(changed).To(BeFalse())
+		g.Expect(moduleInfo.GetLabels()).NotTo(HaveKey(selfBuiltLBManagedLabel))
 	})
 }
 
