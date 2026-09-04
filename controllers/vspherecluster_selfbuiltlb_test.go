@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -277,7 +278,7 @@ func TestEnsureAliveModuleInfo(t *testing.T) {
 		g.Expect(changed).To(BeFalse())
 	})
 
-	t.Run("leaves an existing provider-managed ModuleInfo to the platform", func(t *testing.T) {
+	t.Run("patches a newer version on an existing provider-managed ModuleInfo", func(t *testing.T) {
 		g := NewWithT(t)
 		existing := newUnstructured(moduleInfoGVK)
 		existing.SetName(aliveModuleInfoName("test-cluster"))
@@ -291,12 +292,40 @@ func TestEnsureAliveModuleInfo(t *testing.T) {
 		reconciler := &clusterReconciler{Client: ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(existing).Build()}
 		moduleInfo, changed, err := reconciler.ensureAliveModuleInfo(context.Background(), "test-cluster", lb, "v4.1.0", pluginLabels)
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(changed).To(BeFalse())
+		g.Expect(changed).To(BeTrue())
 		version, _, _ := unstructured.NestedString(moduleInfo.Object, "spec", "version")
-		g.Expect(version).To(Equal("v4.0.0"))
+		g.Expect(version).To(Equal("v4.1.0"))
 		config, _, _ := unstructured.NestedMap(moduleInfo.Object, "spec", "config")
 		g.Expect(config).To(HaveKeyWithValue("somethingElse", "keep-me"))
 		g.Expect(config).NotTo(HaveKey("vrid"))
+	})
+
+	t.Run("does not downgrade or rewrite an equal version on an existing provider-managed ModuleInfo", func(t *testing.T) {
+		for _, tt := range []struct {
+			name        string
+			current     string
+			target      string
+			wantChanged bool
+			wantVersion string
+		}{
+			{name: "equal", current: "v4.1.0", target: "v4.1.0", wantChanged: false, wantVersion: "v4.1.0"},
+			{name: "lower target", current: "v4.1.0", target: "v4.0.0", wantChanged: false, wantVersion: "v4.1.0"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				g := NewWithT(t)
+				existing := newUnstructured(moduleInfoGVK)
+				existing.SetName(aliveModuleInfoName("test-cluster"))
+				existing.SetLabels(map[string]string{selfBuiltLBManagedLabel: "true"})
+				g.Expect(unstructured.SetNestedField(existing.Object, tt.current, "spec", "version")).To(Succeed())
+
+				reconciler := &clusterReconciler{Client: ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(existing).Build()}
+				moduleInfo, changed, err := reconciler.ensureAliveModuleInfo(context.Background(), "test-cluster", lb, tt.target, pluginLabels)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(changed).To(Equal(tt.wantChanged))
+				version, _, _ := unstructured.NestedString(moduleInfo.Object, "spec", "version")
+				g.Expect(version).To(Equal(tt.wantVersion))
+			})
+		}
 	})
 
 	t.Run("leaves the annotations and the product label to the platform webhook", func(t *testing.T) {
@@ -324,13 +353,66 @@ func TestEnsureAliveModuleInfo(t *testing.T) {
 		g := NewWithT(t)
 		existing := newUnstructured(moduleInfoGVK)
 		existing.SetName(aliveModuleInfoName("test-cluster"))
+		g.Expect(unstructured.SetNestedField(existing.Object, "v4.0.0", "spec", "version")).To(Succeed())
 
 		reconciler := &clusterReconciler{Client: ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(existing).Build()}
 		moduleInfo, changed, err := reconciler.ensureAliveModuleInfo(context.Background(), "test-cluster", lb, "v4.1.0", pluginLabels)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(changed).To(BeFalse())
 		g.Expect(moduleInfo.GetLabels()).NotTo(HaveKey(selfBuiltLBManagedLabel))
+		version, _, _ := unstructured.NestedString(moduleInfo.Object, "spec", "version")
+		g.Expect(version).To(Equal("v4.0.0"))
 	})
+}
+
+func TestResolveAliveModuleForReconcileUsesUnmanagedModuleInfoVersion(t *testing.T) {
+	g := NewWithT(t)
+	existing := newUnstructured(moduleInfoGVK)
+	existing.SetName(aliveModuleInfoName("test-cluster"))
+	existing.SetLabels(map[string]string{"cpaas.io/module-name": aliveModuleName})
+	g.Expect(unstructured.SetNestedField(existing.Object, "v4.0.0", "spec", "version")).To(Succeed())
+
+	reconciler := &clusterReconciler{Client: ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(existing).Build()}
+	version, _, missing, err := reconciler.resolveAliveModuleForReconcile(context.Background(), "test-cluster", "default")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(missing).To(BeEmpty())
+	g.Expect(version).To(Equal("v4.0.0"))
+}
+
+func TestEnsureAliveModuleInfoUsesOptimisticLock(t *testing.T) {
+	g := NewWithT(t)
+	existing := newUnstructured(moduleInfoGVK)
+	existing.SetName(aliveModuleInfoName("test-cluster"))
+	existing.SetLabels(map[string]string{selfBuiltLBManagedLabel: "true"})
+	g.Expect(unstructured.SetNestedField(existing.Object, "v4.0.0", "spec", "version")).To(Succeed())
+
+	base := ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(existing).Build()
+	client := &moduleInfoRaceClient{Client: base, name: existing.GetName()}
+	reconciler := &clusterReconciler{Client: client}
+	_, _, err := reconciler.ensureAliveModuleInfo(context.Background(), "test-cluster", selfBuiltLBCluster().Spec.ControlPlaneLoadBalancer, "v4.1.0", nil)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(apierrors.IsConflict(err)).To(BeTrue())
+}
+
+type moduleInfoRaceClient struct {
+	client.Client
+	name string
+}
+
+func (c *moduleInfoRaceClient) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.PatchOption) error {
+	if obj.GetName() == c.name {
+		latest := newUnstructured(moduleInfoGVK)
+		if err := c.Client.Get(ctx, client.ObjectKey{Name: c.name}, latest); err != nil {
+			return err
+		}
+		if err := unstructured.SetNestedField(latest.Object, "v4.2.0", "spec", "version"); err != nil {
+			return err
+		}
+		if err := c.Client.Update(ctx, latest); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, obj, p, opts...)
 }
 
 func TestModuleInfoReadiness(t *testing.T) {
@@ -344,17 +426,27 @@ func TestModuleInfoReadiness(t *testing.T) {
 		name        string
 		moduleInfo  *unstructured.Unstructured
 		wantMessage string
+		wantErr     bool
 	}{
-		{"ready", moduleInfo("v4.1.0", "Running"), ""},
-		{"version not observed yet", moduleInfo("v4.0.0", "Running"), `waiting for alive ModuleInfo to observe version "v4.1.0"`},
+		{name: "ready", moduleInfo: moduleInfo("v4.1.0", "Running")},
+		{name: "version not observed yet", moduleInfo: moduleInfo("v4.0.0", "Running"), wantMessage: `waiting for alive ModuleInfo to observe version "v4.1.0"`},
 		// The phase lags behind a healthy installation, so it must not gate; the
 		// AppRelease, the alive pods and the VIP probe decide instead.
-		{"phase not Running does not block", moduleInfo("v4.1.0", "Installing"), ""},
+		{name: "phase not Running does not block", moduleInfo: moduleInfo("v4.1.0", "Installing")},
+		{name: "invalid status version is an error", moduleInfo: &unstructured.Unstructured{Object: map[string]interface{}{
+			"status": map[string]interface{}{"version": int64(1)},
+		}}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
-			g.Expect(moduleInfoReadiness(tt.moduleInfo, "v4.1.0")).To(Equal(tt.wantMessage))
+			message, err := moduleInfoReadiness(tt.moduleInfo, "v4.1.0")
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(message).To(Equal(tt.wantMessage))
 		})
 	}
 }

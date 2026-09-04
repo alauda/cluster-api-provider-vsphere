@@ -18,7 +18,10 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -41,7 +44,10 @@ import (
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-vsphere/internal/test/helpers/vcsim"
@@ -49,6 +55,35 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/context/fake"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
 )
+
+func TestRequeueAfterSuccessfulReconcile(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(requeueAfterSuccessfulReconcile(reconcile.Result{}, nil, false).RequeueAfter).To(Equal(30 * time.Second))
+	g.Expect(requeueAfterSuccessfulReconcile(reconcile.Result{RequeueAfter: 10 * time.Second}, nil, false).RequeueAfter).To(Equal(10 * time.Second))
+	errorResult := requeueAfterSuccessfulReconcile(reconcile.Result{}, errors.New("reconcile failed"), false)
+	g.Expect(errorResult.IsZero()).To(BeTrue())
+	errorWithWaitResult := requeueAfterSuccessfulReconcile(reconcile.Result{RequeueAfter: 10 * time.Second}, errors.New("reconcile failed"), false)
+	g.Expect(errorWithWaitResult.IsZero()).To(BeTrue())
+	pausedResult := requeueAfterSuccessfulReconcile(reconcile.Result{}, nil, true)
+	g.Expect(pausedResult.IsZero()).To(BeTrue())
+}
+
+func TestSetReadinessUnknown(t *testing.T) {
+	g := NewWithT(t)
+	r := &clusterReconciler{}
+	vsphereCluster := &infrav1.VSphereCluster{}
+	err := errors.New("workload status cannot be read")
+
+	r.setReadinessUnknown(vsphereCluster, kubeOvnAppReleaseConditionSpec, err)
+	g.Expect(conditions.Get(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition).Status).To(Equal(corev1.ConditionUnknown))
+	g.Expect(v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition).Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition).Reason).To(Equal(infrav1.KubeOvnAppReleaseReconcilingReason))
+
+	r.setReadinessUnknown(vsphereCluster, selfBuiltLBConditionSpec, err)
+	g.Expect(conditions.Get(vsphereCluster, infrav1.SelfBuiltLoadBalancerReadyCondition).Status).To(Equal(corev1.ConditionUnknown))
+	g.Expect(v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition).Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition).Reason).To(Equal(infrav1.SelfBuiltLoadBalancerReconcilingReason))
+}
 
 const (
 	timeout = time.Second * 30
@@ -522,6 +557,7 @@ func TestClusterReconciler_ControlPlaneNodesRegistered(t *testing.T) {
 		existingNodes int32
 		listNodeErr   error
 		wantReady     bool
+		wantErr       bool
 	}{
 		{
 			name:          "all control plane Nodes are registered",
@@ -540,6 +576,7 @@ func TestClusterReconciler_ControlPlaneNodesRegistered(t *testing.T) {
 			desired:     1,
 			listNodeErr: fmt.Errorf("workload cluster is not ready"),
 			wantReady:   false,
+			wantErr:     true,
 		},
 	}
 
@@ -590,7 +627,12 @@ func TestClusterReconciler_ControlPlaneNodesRegistered(t *testing.T) {
 			}
 			r := clusterReconciler{Client: controllerManagerContext.Client}
 			controlPlaneNodes, ready, err := r.controlPlaneNodesRegistered(ctx, cluster, workloadClient)
-			g.Expect(err).NotTo(HaveOccurred())
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring("workload cluster is not ready"))
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+			}
 			g.Expect(ready).To(Equal(tt.wantReady))
 			if tt.wantReady {
 				g.Expect(controlPlaneNodes).To(Equal([]string{"test-control-plane-0", "test-control-plane-1", "test-control-plane-2"}))
@@ -706,6 +748,7 @@ func TestKubeOvnAppReleaseReadiness(t *testing.T) {
 		wantReady   bool
 		wantReason  string
 		wantMessage string
+		wantErr     bool
 	}{
 		{
 			name:       "ready when top-level observedGeneration is current",
@@ -742,12 +785,35 @@ func TestKubeOvnAppReleaseReadiness(t *testing.T) {
 			wantReason:  infrav1.KubeOvnAppReleaseNotReadyReason,
 			wantMessage: "kube-ovn AppRelease Health condition is Progressing: waiting for pods",
 		},
+		{
+			name: "invalid conditions shape is an error",
+			appRelease: &unstructured.Unstructured{Object: map[string]any{
+				"metadata": map[string]any{"generation": int64(1)},
+				"status": map[string]any{
+					"observedGeneration": int64(1),
+					"conditions":         "invalid",
+				},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "invalid condition field type is an error",
+			appRelease: appRelease(1, 1, []any{
+				map[string]any{"type": "Sync", "status": true},
+				condition("Health", corev1.ConditionTrue, "Ready", ""),
+			}),
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
 			got := kubeOvnAppReleaseReadiness(tt.appRelease)
+			if tt.wantErr {
+				g.Expect(got.err).To(HaveOccurred())
+				return
+			}
 			g.Expect(got.ready).To(Equal(tt.wantReady))
 			g.Expect(got.reason).To(Equal(tt.wantReason))
 			if tt.wantMessage != "" {
@@ -850,6 +916,79 @@ func TestClusterReconciler_ReconcileKubeOvnAppReleaseRequeuesUntilControlPlaneNo
 	g.Expect(condition).NotTo(BeNil())
 	g.Expect(condition.Status).To(Equal(metav1.ConditionFalse))
 	g.Expect(condition.Reason).To(Equal(infrav1.KubeOvnAppReleaseReconcilingReason))
+}
+
+func TestClusterReconciler_ReconcileKubeOvnAppReleaseMarksUnknownWhenNodesCannotBeListed(t *testing.T) {
+	g := NewWithT(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-cluster",
+			Annotations: map[string]string{
+				"cpaas.io/network-type":     "kube-ovn",
+				"cpaas.io/kube-ovn-version": "v1.0.0",
+				"cpaas.io/registry-address": "registry.example.com",
+			},
+		},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneRef: &corev1.ObjectReference{
+				APIVersion: controlplanev1.GroupVersion.String(),
+				Kind:       "KubeadmControlPlane",
+				Name:       "test-kcp",
+			},
+			ClusterNetwork: &clusterv1.ClusterNetwork{
+				Pods:     &clusterv1.NetworkRanges{CIDRBlocks: []string{"192.168.0.0/16"}},
+				Services: &clusterv1.NetworkRanges{CIDRBlocks: []string{"10.96.0.0/12"}},
+			},
+		},
+	}
+	kubeconfig := []byte(fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: test
+  cluster:
+    server: %s
+    insecure-skip-tls-verify: true
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test
+current-context: test
+users:
+- name: test
+  user:
+    token: test
+`, server.URL))
+	controllerManagerContext := fake.NewControllerManagerContext(
+		cluster,
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: cluster.Name + "-kubeconfig"},
+			Data:       map[string][]byte{"value": kubeconfig},
+		},
+		&controlplanev1.KubeadmControlPlane{
+			ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: "test-kcp"},
+			Spec:       controlplanev1.KubeadmControlPlaneSpec{Replicas: ptr.To[int32](1)},
+		},
+	)
+	vsphereCluster := &infrav1.VSphereCluster{ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: cluster.Name}}
+	conditions.MarkTrue(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition)
+	v1beta2conditions.Set(vsphereCluster, metav1.Condition{
+		Type:   infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
+		Status: metav1.ConditionTrue,
+		Reason: infrav1.KubeOvnAppReleaseReadyReason,
+	})
+
+	r := clusterReconciler{Client: controllerManagerContext.Client}
+	_, err := r.reconcileKubeOvnAppRelease(ctx, &capvcontext.ClusterContext{Cluster: cluster, VSphereCluster: vsphereCluster})
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(conditions.Get(vsphereCluster, infrav1.KubeOvnAppReleaseReadyCondition).Status).To(Equal(corev1.ConditionUnknown))
+	g.Expect(v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition).Status).To(Equal(metav1.ConditionUnknown))
 }
 
 func TestClusterReconciler_ReconcileDeploymentZones(t *testing.T) {
@@ -1064,6 +1203,81 @@ func TestClusterReconciler_ReconcileDeploymentZones(t *testing.T) {
 			}, 3)
 		})
 	})
+}
+
+func TestClusterReconciler_ReconcileDeploymentZonesReturnsMachineConfigPoolListError(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	poolErr := errors.New("machine config pool list failed")
+	client := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, underlying client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*infrav1.VSphereMachineConfigPoolList); ok {
+				return poolErr
+			}
+			return underlying.List(ctx, list, opts...)
+		},
+	}).Build()
+	r := clusterReconciler{Client: client}
+	clusterCtx := &capvcontext.ClusterContext{
+		Cluster: &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-cluster"}},
+		VSphereCluster: &infrav1.VSphereCluster{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-cluster"},
+			Spec:       infrav1.VSphereClusterSpec{FailureDomainSelector: &metav1.LabelSelector{}},
+		},
+	}
+	clusterCtx.VSphereCluster.Status.FailureDomains = clusterv1.FailureDomains{
+		"stale": {ControlPlane: true},
+	}
+	conditions.MarkTrue(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition)
+
+	reconciled, err := r.reconcileDeploymentZones(context.Background(), clusterCtx)
+	g.Expect(reconciled).To(BeFalse())
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring(poolErr.Error()))
+	g.Expect(clusterCtx.VSphereCluster.Status.FailureDomains).To(BeEmpty())
+	g.Expect(conditions.IsFalse(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition)).To(BeTrue())
+}
+
+func TestClusterReconciler_ReconcileDeploymentZonesReturnsFailureDomainLookupError(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	lookupErr := errors.New("failure domain lookup failed")
+	zone := deploymentZone("vcenter123.foo.com", "fd-one", ptr.To(true), ptr.To(true))
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster", Namespace: "default"},
+		},
+	}
+	client := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(zone, pool).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*infrav1.VSphereFailureDomain); ok {
+				return lookupErr
+			}
+			return underlying.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+	r := clusterReconciler{Client: client}
+	clusterCtx := &capvcontext.ClusterContext{
+		Cluster: &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-cluster"}},
+		VSphereCluster: &infrav1.VSphereCluster{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-cluster"},
+			Spec:       infrav1.VSphereClusterSpec{Server: "vcenter123.foo.com", FailureDomainSelector: &metav1.LabelSelector{}},
+		},
+	}
+	clusterCtx.VSphereCluster.Status.FailureDomains = clusterv1.FailureDomains{"stale": {ControlPlane: true}}
+	conditions.MarkTrue(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition)
+
+	reconciled, err := r.reconcileDeploymentZones(context.Background(), clusterCtx)
+	g.Expect(reconciled).To(BeFalse())
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring(lookupErr.Error()))
+	g.Expect(clusterCtx.VSphereCluster.Status.FailureDomains).To(BeEmpty())
+	g.Expect(conditions.IsFalse(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition)).To(BeTrue())
 }
 
 func deploymentZone(server, fdName string, cp, ready *bool) *infrav1.VSphereDeploymentZone {

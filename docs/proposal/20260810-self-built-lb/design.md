@@ -13,14 +13,14 @@ vSphere self-built LB 采用 alive。用户在 `VSphereCluster.spec.controlPlane
 核心链路分两段：
 
 1. Bootstrap：`VMService.reconcileBootstrapUserData()` 只在首个 `kubeadm init` 节点注入临时 VIP，让 `controlPlaneEndpoint` 在 apiserver 起来前可达。
-2. Controller：workload apiserver 可访问且 control-plane Node 注册完成后，`clusterReconciler` 创建 alive `ModuleInfo`，后续版本和生命周期由平台管理，cluster-transformer 走通用链路渲染 workload `AppRelease`，alive installer 在 control-plane 节点安装 keepalived / IPVS static pod。
+2. Controller：workload apiserver 可访问且 control-plane Node 注册完成后，`clusterReconciler` 解析 alive 目标版本并创建 `ModuleInfo`；如果 CAPV 管理的现有 minfo 目标版本更高，则只 patch `spec.version`。之后由平台渲染 workload `AppRelease`，alive installer 在 control-plane 节点安装 keepalived / IPVS static pod。
 
 需要重点 review 的决策：
 
 | 关注点 | 设计结论 | 章节 |
 | --- | --- | --- |
 | 入口 | 新增可选字段 `spec.controlPlaneLoadBalancer`；字段缺省与 `type=external` 都保持现状语义，`type=internal` 启用 self-built LB。 | `3.1` |
-| 运行组件 | 固定使用 alive；provider 只创建 alive `ModuleInfo`，不直接创建 workload `AppRelease`，后续 minfo 生命周期由平台管理。 | `2`、`5.1` |
+| 运行组件 | 固定使用 alive；provider 创建 alive `ModuleInfo`，并在自身管理的 minfo 上仅升级更高的 `spec.version`；不直接创建 workload `AppRelease`，后续渲染、安装和运行态生命周期由平台管理。 | `2`、`5.1` |
 | bootstrap | 仅 `kubeadm init` 节点注入临时 VIP，走 cloud-config write_files + `runcmd` 前插；失败即阻断 kubeadm。 | `4` |
 | backend 来源 | provider 不写 `masterIPs`；alive valuesTemplate 从 workload control-plane Node `InternalIP` 生成。 | `5.2` |
 | 状态表达 | 新增 `SelfBuiltLoadBalancerReady` condition，v1beta1 与 v1beta2 双写。与 DCS 不同。 | `3.2` |
@@ -35,7 +35,7 @@ vSphere self-built LB 采用 alive。用户在 `VSphereCluster.spec.controlPlane
 
 目标行为：
 
-- `type=internal` 时，provider 注入 bootstrap 临时 VIP，创建并等待 alive `ModuleInfo`；创建后的 minfo 生命周期由平台管理。
+- `type=internal` 时，provider 注入 bootstrap 临时 VIP，解析版本并创建 alive `ModuleInfo`；当 CAPV 管理的现有 minfo 目标版本更高时只 patch `spec.version`，再等待平台和 runtime 收敛。
 - `kubeadm init` 前 VIP 已在首个 control-plane 节点存在；后续 control-plane 通过 VIP join。
 - control-plane Node 注册完成后，alive 接管 VIP 和 IPVS backend。
 - `VSphereCluster` 通过 `SelfBuiltLoadBalancerReady` condition 表达 LB 状态。
@@ -329,7 +329,7 @@ VIP 添加只发生一次，之后不存在任何复活路径：
 
 control-plane Node 全部注册后才创建 minfo，是为了让 alive valuesTemplate 拿到完整 backend 列表。复用现有的 `controlPlaneNodesRegistered()`（该函数按 `KubeadmControlPlane.spec.replicas` 比对已注册 control-plane Node 数）。
 
-未 Ready 时统一 `RequeueAfter: 10 * time.Second` 并置 condition=False，与 kube-ovn 路径的节奏一致；制品缺失类问题返回 error。
+各子流程已有明确的异步等待时使用 `RequeueAfter: 10 * time.Second` 并置 condition=False，与 kube-ovn 路径的节奏一致；如果一次 reconcile 成功且没有显式等待结果，`VSphereCluster` controller 统一在 30 秒后再次 reconcile；制品缺失和 API/解析失败直接返回 error。
 
 前置对象处理：
 
@@ -357,9 +357,9 @@ control-plane Node 全部注册后才创建 minfo，是为了让 alive valuesTem
 alive version 选择（与 DCS 一致）：
 
 1. provider 启动参数 `--plugin-alive-version=<version>` 非空时直接使用。
-2. 否则取 `ModulePlugin/alive.status.latestVersion` 作默认。
-3. 若存在 `ModulePlugin/alive.status.targetClusterVersions[ClusterModule.spec.version]`，使用该映射版本。
-4. 读取 `ModuleConfig/alive-<version>`，缺失或未 ready 即失败。
+2. 否则若存在 `ModulePlugin/alive.status.targetClusterVersions[ClusterModule.spec.version]`，使用该映射版本。
+3. 没有命中映射时使用 `ModulePlugin/alive.status.latestVersion`。
+4. 读取 `ModuleConfig/alive-<version>`，缺失或未 ready 即失败。该解析和校验在每轮 self-built LB reconcile 执行，以便发现更高目标版本。
 
 `--plugin-alive-version` 是 provider 级覆盖，影响该 provider 管理的所有 self-built LB 集群，只覆盖版本选择，不绕过 `ModuleConfig` 的存在性与 ready 检查。
 
@@ -416,8 +416,9 @@ CAPV 对齐 baremetal provider，按关联 CAPI `Cluster` 名称区分 alive 端
 patch 规则：
 
 - minfo 不存在时创建 provider-managed minfo。
-- 同名 minfo 已存在时，无论是否带 `self-built-lb-managed=true`，都不接管、不 patch，后续版本和配置由平台管理。
-- minfo status 存在滞后：readiness 只以 `status.version == spec.version` 为准；已有 minfo 的 `spec.version` 由平台维护，CAPV 不用新解析出的插件版本覆盖它。phase 不为 `Running` 只记日志，实际健康由 AppRelease、alive pod 和 VIP probe 判定。
+- 同名 minfo 带 `self-built-lb-managed=true` 时，CAPV 比较现有 `spec.version` 与本轮解析出的目标版本：目标版本更高时只 patch `spec.version`，相同或更低时不修改；`spec.config`、label 和 annotation 保持不变。
+- 同名 minfo 不带 `self-built-lb-managed=true` 时，CAPV 不接管、不 patch，沿用该对象自身的 `spec.version` 进行 readiness 观察。
+- minfo status 存在滞后：readiness 只以 `status.version == spec.version` 为准。phase 不为 `Running` 只记日志，实际健康由 AppRelease、alive pod 和 VIP probe 判定。
 
 ### 5.4 kube-proxy IPVS 配置
 
@@ -448,7 +449,7 @@ alive AppRelease 的 `global.controlPlaneNodeIdentity` 用于在 control-plane �
 - 新建 cluster 可直接使用 `type=internal`。
 - 字段为空的 cluster（含全部存量集群）保持空值，不能改用 self-built LB，见第 9 章。
 - 字段非空的 cluster 拒绝任何修改，`type=external` 也不能再改成 `internal`。显式写过 `external` 的集群不再有切换入口，这是选择该规则的直接代价。
-- `type=internal` 的 cluster 只等待平台管理的 minfo、AppRelease 和 alive runtime 收敛；不接管已存在的未知 minfo。
+- `type=internal` 的 cluster 由 CAPV 解析目标版本，并仅升级自身管理的 minfo；平台负责 AppRelease 和 alive runtime 收敛，CAPV 不接管已存在的未知 minfo。
 
 CRD 变更是纯新增可选字段，存量对象不需要数据迁移；交付仓库的 chart CRD 需要随之重新生成。
 
@@ -465,7 +466,7 @@ VM 删除后 guest OS 内的 keepalived manifest、VIP、IPVS 规则随 VM 消�
 | 决策 | 结论 | 原因 |
 | --- | --- | --- |
 | 运行时 | 使用 alive。 | 与 DCS / baremetal 模型一致，复用同一套制品与工程经验；VIP 后端走 IPVS 转发到全部 apiserver，全链路状态可观测。 |
-| 安装路径 | provider 只创建 alive `ModuleInfo`，不直接建 `AppRelease`；后续 minfo 生命周期由平台管理。 | 复用插件版本选择与生命周期；删除走 ownerRef + GC。代价是与本仓 kube-ovn 的安装风格不一致，短期接受。 |
+| 安装路径 | provider 创建 alive `ModuleInfo`，对自身管理的 minfo 仅 patch 更高的 `spec.version`，不直接建 `AppRelease`；平台负责后续渲染、安装和运行态生命周期。 | 复用插件版本选择与生命周期；删除走 ownerRef + GC。代价是与本仓 kube-ovn 的安装风格不一致，短期接受。 |
 | API 形状 | 新增可选 `controlPlaneLoadBalancer`，`type` 默认 `external`。 | 存量 `VSphereCluster` 不带该字段，必须落到「保持现状」语义才能平滑升级；`nil` 就是为兼容 internal VIP 之前的集群而保留的形态。 |
 | 可变性 | 只在 CREATE 时可写，创建后一律冻结（含 `nil` 不能写成有值）。 | VIP 配置一旦确定就不允许更改：endpoint、apiserver serving 证书 SAN、guest runtime 全部由它派生，运行中无法就地重新派生；`nil` 允许写入会让存量集群被切到从未准备过的 VIP 上。 |
 | 状态表达 | 新增 `SelfBuiltLoadBalancerReady`（v1beta1 + v1beta2）。 | 本仓 condition 约定 + gap 分析 #19 验收要求；与 DCS 的「不加 condition」不同。 |
@@ -530,7 +531,7 @@ provider 升级后，不带 `controlPlaneLoadBalancer` 的集群继续使用原�
 | control-plane Node 未全部注册 | alive backend 列表不完整。 | 复用 `controlPlaneNodesRegistered()`，未就绪时 requeue。 |
 | 平台前置对象缺失 | minfo 渲染不出 AppRelease。 | 缺 platform Cluster / clusterregistry Cluster / `ClusterModule` 时 requeue；缺 `ModulePlugin` / `ModuleConfig` 时返回错误。 |
 | `ModulePlugin/alive` affinity 只匹配 Baremetal | 自动安装路径不覆盖 vSphere。 | provider 显式创建 minfo，不依赖 affinity。 |
-| 同名 minfo 不是 provider-managed | 存在接管风险。 | 校验所有权 label，不匹配时返回错误。 |
+| 同名 minfo 不是 provider-managed | 存在接管风险。 | 不匹配时不接管、不 patch，沿用对象自身版本等待 readiness。 |
 | minfo status 滞后 | 误判 Ready，或 phase 长期不 `Running` 导致永远不 Ready。 | 只比对 `status.version == spec.version`，phase 不阻塞。 |
 | minfo Running 但 VIP API 不稳定 | 部署状态不能证明四层流量稳定。 | 连续 5 次 `/version` probe。 |
 | alive 内核模块或 sysctl 缺失 | NAT 模式间歇超时。 | 由 alive 前置任务保障；provider 只通过 readiness 和 VIP probe 暴露。 |

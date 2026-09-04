@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blang/semver/v4"
 	pkgerrors "github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -140,6 +141,13 @@ var (
 		reconciling: infrav1.SelfBuiltLoadBalancerReconcilingReason,
 		notReady:    infrav1.SelfBuiltLoadBalancerNotReadyReason,
 	}
+
+	selfBuiltLBConditionSpec = readinessConditionSpec{
+		v1beta1Type:       infrav1.SelfBuiltLoadBalancerReadyCondition,
+		v1beta2Type:       infrav1.VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition,
+		subject:           "self-built load balancer",
+		reconcilingReason: infrav1.SelfBuiltLoadBalancerReconcilingReason,
+	}
 )
 
 // reconcileControlPlaneEndpoint keeps spec.controlPlaneEndpoint and
@@ -208,13 +216,15 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 	clientset, restConfig, err := r.newRemoteClients(ctx, cluster)
 	if err != nil {
 		log.Error(err, "Skipping self-built load balancer reconcile because workload cluster client is unavailable")
-		return r.selfBuiltLBRequeue(vsphereCluster, err.Error())
+		r.setSelfBuiltLBCondition(vsphereCluster, corev1.ConditionUnknown, infrav1.SelfBuiltLoadBalancerReconcilingReason, clusterv1.ConditionSeverityInfo, err.Error())
+		return reconcile.Result{}, err
 	}
 
 	// alive's backend list is generated from the registered control plane Nodes, so
 	// the ModuleInfo is only created once they are all there.
 	controlPlaneNodeNames, ready, err := r.controlPlaneNodesRegistered(ctx, cluster, clientset)
 	if err != nil {
+		r.setReadinessUnknown(vsphereCluster, selfBuiltLBConditionSpec, err)
 		return reconcile.Result{}, err
 	}
 	if !ready {
@@ -231,7 +241,7 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 		return r.selfBuiltLBRequeue(vsphereCluster, message)
 	}
 
-	version, pluginLabels, missing, err := r.resolveAliveModule(ctx, cluster.Name, cluster.Namespace)
+	version, pluginLabels, missing, err := r.resolveAliveModuleForReconcile(ctx, cluster.Name, cluster.Namespace)
 	if err != nil {
 		r.setSelfBuiltLBCondition(vsphereCluster, corev1.ConditionFalse, infrav1.SelfBuiltLoadBalancerInvalidConfigurationReason, clusterv1.ConditionSeverityError, err.Error())
 		return reconcile.Result{}, err
@@ -250,11 +260,23 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 	}
 
 	// ModuleInfo status lags behind its spec, so wait for the observed version.
-	observedVersion, _, _ := unstructured.NestedString(moduleInfo.Object, "spec", "version")
-	if message := moduleInfoReadiness(moduleInfo, observedVersion); message != "" {
+	observedVersion, _, err := unstructured.NestedString(moduleInfo.Object, "spec", "version")
+	if err != nil {
+		wrappedErr := pkgerrors.Wrap(err, "failed to read alive ModuleInfo spec.version")
+		r.setReadinessUnknown(vsphereCluster, selfBuiltLBConditionSpec, wrappedErr)
+		return reconcile.Result{}, wrappedErr
+	}
+	message, err = moduleInfoReadiness(moduleInfo, observedVersion)
+	if err != nil {
+		r.setReadinessUnknown(vsphereCluster, selfBuiltLBConditionSpec, err)
+		return reconcile.Result{}, err
+	}
+	if message != "" {
 		return r.selfBuiltLBRequeue(vsphereCluster, message)
 	}
-	if phase := moduleInfoPhase(moduleInfo); phase != "Running" {
+	if phase, err := moduleInfoPhase(moduleInfo); err != nil {
+		return reconcile.Result{}, err
+	} else if phase != "Running" {
 		log.V(4).Info("Alive ModuleInfo phase is not Running, checking the runtime instead", "ModuleInfo", moduleInfo.GetName(), "phase", phase)
 	}
 
@@ -269,7 +291,12 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 	if err != nil {
 		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to get alive AppRelease")
 	}
-	if readiness := appReleaseReadiness(appRelease, aliveModuleName, aliveAppReleaseReasons); !readiness.ready {
+	readiness := appReleaseReadiness(appRelease, aliveModuleName, aliveAppReleaseReasons)
+	if readiness.err != nil {
+		r.setReadinessUnknown(vsphereCluster, selfBuiltLBConditionSpec, readiness.err)
+		return reconcile.Result{}, readiness.err
+	}
+	if !readiness.ready {
 		r.setSelfBuiltLBCondition(vsphereCluster, corev1.ConditionFalse, readiness.reason, clusterv1.ConditionSeverityInfo, readiness.message)
 		return reconcile.Result{RequeueAfter: selfBuiltLBRequeueAfter}, nil
 	}
@@ -295,6 +322,31 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 	return reconcile.Result{}, nil
 }
 
+// resolveAliveModuleForReconcile preserves the platform-owned ModuleInfo path.
+// Once an unmanaged canonical object exists, its spec.version is the source of
+// truth for readiness and CAPV must not require platform projections or catalog
+// artifacts merely to inspect it.
+func (r *clusterReconciler) resolveAliveModuleForReconcile(ctx context.Context, clusterName, clusterNamespace string) (version string, pluginLabels map[string]string, missing string, err error) {
+	moduleInfo := newUnstructured(moduleInfoGVK)
+	err = r.Client.Get(ctx, client.ObjectKey{Name: aliveModuleInfoName(clusterName)}, moduleInfo)
+	if err == nil {
+		if moduleInfo.GetLabels()[selfBuiltLBManagedLabel] != "true" {
+			version, found, readErr := unstructured.NestedString(moduleInfo.Object, "spec", "version")
+			if readErr != nil {
+				return "", nil, "", pkgerrors.Wrapf(readErr, "failed to read ModuleInfo %q spec.version", moduleInfo.GetName())
+			}
+			if !found || version == "" {
+				return "", nil, "", fmt.Errorf("unmanaged ModuleInfo %q has no spec.version", moduleInfo.GetName())
+			}
+			return version, nil, "", nil
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return "", nil, "", pkgerrors.Wrapf(err, "failed to get ModuleInfo %q", moduleInfo.GetName())
+	}
+
+	return r.resolveAliveModule(ctx, clusterName, clusterNamespace)
+}
+
 // selfBuiltLBRequeue marks the condition False with the reconciling reason and asks
 // for the standard retry, matching the cadence of the kube-ovn path.
 func (r *clusterReconciler) selfBuiltLBRequeue(vsphereCluster *infrav1.VSphereCluster, message string) (reconcile.Result, error) {
@@ -303,11 +355,7 @@ func (r *clusterReconciler) selfBuiltLBRequeue(vsphereCluster *infrav1.VSphereCl
 }
 
 func (r *clusterReconciler) setSelfBuiltLBCondition(vsphereCluster *infrav1.VSphereCluster, status corev1.ConditionStatus, reason string, severity clusterv1.ConditionSeverity, message string) {
-	r.setDualCondition(vsphereCluster,
-		infrav1.SelfBuiltLoadBalancerReadyCondition,
-		infrav1.VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition,
-		"self-built load balancer",
-		status, reason, severity, message)
+	r.setReadinessCondition(vsphereCluster, selfBuiltLBConditionSpec, status, reason, severity, message)
 }
 
 // validateVIPNotClaimedBySlot repeats the webhook's VIP conflict check against the
@@ -343,23 +391,6 @@ func (r *clusterReconciler) validateVIPNotClaimedBySlot(ctx context.Context, vsp
 // clusterNamespace is the namespace of the Cluster: unlike the rest of the platform
 // objects read here, the clusterregistry Cluster is namespaced.
 func (r *clusterReconciler) resolveAliveModule(ctx context.Context, clusterName, clusterNamespace string) (version string, pluginLabels map[string]string, missing string, err error) {
-	// Once the canonical ModuleInfo exists, its version is platform-owned. Do not
-	// resolve ModulePlugin/ModuleConfig again and accidentally wait for or select a
-	// newer artifact before the platform has upgraded the existing minfo.
-	existing := newUnstructured(moduleInfoGVK)
-	if err := r.Client.Get(ctx, client.ObjectKey{Name: aliveModuleInfoName(clusterName)}, existing); err == nil {
-		version, found, err := unstructured.NestedString(existing.Object, "spec", "version")
-		if err != nil {
-			return "", nil, "", pkgerrors.Wrap(err, "failed to read existing alive ModuleInfo spec.version")
-		}
-		if !found || version == "" {
-			return "", nil, "", fmt.Errorf("existing alive ModuleInfo %q has no spec.version", existing.GetName())
-		}
-		return version, nil, "", nil
-	} else if !apierrors.IsNotFound(err) {
-		return "", nil, "", pkgerrors.Wrap(err, "failed to get existing alive ModuleInfo")
-	}
-
 	for _, projection := range []struct {
 		gvk schema.GroupVersionKind
 		key client.ObjectKey
@@ -548,9 +579,9 @@ func alivePortsForCluster(clusterName string) (int32, int32, string) {
 	return aliveHTTPPort, aliveHTTPSPort, ""
 }
 
-// ensureAliveModuleInfo creates the alive ModuleInfo and leaves an existing one
-// unchanged. After creation, ModuleInfo version and configuration lifecycle belong
-// to the platform, matching the platform-managed alive installation path.
+// ensureAliveModuleInfo creates the alive ModuleInfo and upgrades an existing
+// provider-managed one when the resolved target version is newer. Configuration,
+// labels, and annotations on existing objects remain platform-owned.
 func (r *clusterReconciler) ensureAliveModuleInfo(ctx context.Context, clusterName string, lb *infrav1.ControlPlaneLoadBalancer, version string, pluginLabels map[string]string) (*unstructured.Unstructured, bool, error) {
 	name := aliveModuleInfoName(clusterName)
 	desiredLabels := aliveModuleInfoLabels(clusterName, pluginLabels)
@@ -579,8 +610,42 @@ func (r *clusterReconciler) ensureAliveModuleInfo(ctx context.Context, clusterNa
 		return nil, false, pkgerrors.Wrapf(err, "failed to get ModuleInfo %q", name)
 	}
 
-	ctrl.LoggerFrom(ctx).Info("Alive ModuleInfo already exists; leaving lifecycle management to the platform", "ModuleInfo", name)
-	return moduleInfo, false, nil
+	if moduleInfo.GetLabels()[selfBuiltLBManagedLabel] != "true" {
+		ctrl.LoggerFrom(ctx).Info("Alive ModuleInfo already exists and is not managed by CAPV", "ModuleInfo", name)
+		return moduleInfo, false, nil
+	}
+
+	currentVersion, found, err := unstructured.NestedString(moduleInfo.Object, "spec", "version")
+	if err != nil {
+		return nil, false, pkgerrors.Wrapf(err, "failed to read ModuleInfo %q spec.version", name)
+	}
+	if !found || currentVersion == "" {
+		return nil, false, fmt.Errorf("provider-managed ModuleInfo %q has no spec.version", name)
+	}
+
+	targetVersion, err := semver.ParseTolerant(version)
+	if err != nil {
+		return nil, false, pkgerrors.Wrapf(err, "failed to parse target alive version %q", version)
+	}
+	current, err := semver.ParseTolerant(currentVersion)
+	if err != nil {
+		return nil, false, pkgerrors.Wrapf(err, "failed to parse current alive version %q", currentVersion)
+	}
+	if !targetVersion.GT(current) {
+		ctrl.LoggerFrom(ctx).Info("Alive ModuleInfo version is already current or newer", "ModuleInfo", name, "currentVersion", currentVersion, "targetVersion", version)
+		return moduleInfo, false, nil
+	}
+
+	origin := moduleInfo.DeepCopy()
+	if err := unstructured.SetNestedField(moduleInfo.Object, version, "spec", "version"); err != nil {
+		return nil, false, pkgerrors.Wrapf(err, "failed to set ModuleInfo %q spec.version", name)
+	}
+	patch := client.MergeFromWithOptions(origin, client.MergeFromWithOptimisticLock{})
+	if err := r.Client.Patch(ctx, moduleInfo, patch); err != nil {
+		return nil, false, pkgerrors.Wrapf(err, "failed to patch ModuleInfo %q spec.version", name)
+	}
+	ctrl.LoggerFrom(ctx).Info("Upgraded alive ModuleInfo", "ModuleInfo", name, "currentVersion", currentVersion, "targetVersion", version)
+	return moduleInfo, true, nil
 }
 
 // moduleInfoReadiness returns an empty string once the ModuleInfo has observed the
@@ -590,21 +655,24 @@ func (r *clusterReconciler) ensureAliveModuleInfo(ctx context.Context, clusterNa
 // our spec, and everything after this point (AppRelease conditions, alive pods, the
 // VIP probe) measures the actual runtime. status.phase is reported separately and
 // deliberately does not block, because it lags behind a healthy installation.
-func moduleInfoReadiness(moduleInfo *unstructured.Unstructured, version string) string {
+func moduleInfoReadiness(moduleInfo *unstructured.Unstructured, version string) (string, error) {
 	observedVersion, _, err := unstructured.NestedString(moduleInfo.Object, "status", "version")
 	if err != nil {
-		return fmt.Sprintf("failed to read alive ModuleInfo status.version: %v", err)
+		return "", pkgerrors.Wrap(err, "failed to read alive ModuleInfo status.version")
 	}
 	if observedVersion != version {
-		return fmt.Sprintf("waiting for alive ModuleInfo to observe version %q", version)
+		return fmt.Sprintf("waiting for alive ModuleInfo to observe version %q", version), nil
 	}
-	return ""
+	return "", nil
 }
 
 // moduleInfoPhase reports the ModuleInfo phase for logging.
-func moduleInfoPhase(moduleInfo *unstructured.Unstructured) string {
-	phase, _, _ := unstructured.NestedString(moduleInfo.Object, "status", "phase")
-	return phase
+func moduleInfoPhase(moduleInfo *unstructured.Unstructured) (string, error) {
+	phase, _, err := unstructured.NestedString(moduleInfo.Object, "status", "phase")
+	if err != nil {
+		return "", pkgerrors.Wrap(err, "failed to read alive ModuleInfo status.phase")
+	}
+	return phase, nil
 }
 
 // ensureKubeProxyIPVSForVIP stops kube-proxy from competing with keepalived for the

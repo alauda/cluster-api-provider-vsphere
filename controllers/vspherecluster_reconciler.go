@@ -64,6 +64,21 @@ import (
 	infrautilv1 "sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
+const clusterRequeueAfter = 30 * time.Second
+
+// requeueAfterSuccessfulReconcile keeps explicit waits, uses the controller-wide
+// polling interval for a successful zero result, and leaves errors and paused
+// reconciles to the controller-runtime event flow.
+func requeueAfterSuccessfulReconcile(result reconcile.Result, err error, paused bool) reconcile.Result {
+	if err != nil || paused {
+		return reconcile.Result{}
+	}
+	if result.IsZero() {
+		return reconcile.Result{RequeueAfter: clusterRequeueAfter}
+	}
+	return result
+}
+
 var (
 	modulePluginGVK = schema.GroupVersionKind{
 		Group:   "cluster.alauda.io",
@@ -87,7 +102,7 @@ type clusterReconciler struct {
 }
 
 // Reconcile ensures the back-end state reflects the Kubernetes resource state intent.
-func (r *clusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
+func (r *clusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, reterr error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	// Get the VSphereCluster resource for this request.
@@ -127,12 +142,15 @@ func (r *clusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 		PatchHelper:    patchHelper,
 	}
 
+	pausedReconcile := false
+
 	// Always issue a patch when exiting this function so changes to the
 	// resource are patched back to the API server.
 	defer func() {
 		if err := r.patch(ctx, clusterContext); err != nil {
 			reterr = kerrors.NewAggregate([]error{reterr, err})
 		}
+		result = requeueAfterSuccessfulReconcile(result, reterr, pausedReconcile)
 	}()
 
 	// Handle deleted clusters
@@ -141,6 +159,7 @@ func (r *clusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ 
 	}
 
 	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, vsphereCluster); err != nil || isPaused || requeue {
+		pausedReconcile = isPaused
 		return ctrl.Result{}, err
 	}
 
@@ -341,12 +360,8 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 	})
 
 	// Reconcile cluster modules.
-	err = r.reconcileVCenterVersion(clusterCtx, vcenterSession)
-	if err != nil || clusterCtx.VSphereCluster.Status.VCenterVersion == "" {
-		message := "vCenter version is missing"
-		if err != nil {
-			message = err.Error()
-		}
+	if err = r.reconcileVCenterVersion(clusterCtx, vcenterSession); err != nil {
+		message := err.Error()
 		conditions.MarkFalse(clusterCtx.VSphereCluster, infrav1.ClusterModulesAvailableCondition, infrav1.MissingVCenterVersionReason, clusterv1.ConditionSeverityWarning, "%s", message)
 		v1beta2conditions.Set(clusterCtx.VSphereCluster, metav1.Condition{
 			Type:    infrav1.VSphereClusterClusterModulesReadyV1Beta2Condition,
@@ -354,11 +369,20 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 			Reason:  infrav1.VSphereClusterModulesInvalidVCenterVersionV1Beta2Reason,
 			Message: message,
 		})
-		if err != nil {
-			log.Error(err, "could not reconcile vCenter version")
-		} else {
-			log.Info("could not reconcile vCenter version", "reason", message)
-		}
+		log.Error(err, "could not reconcile vCenter version")
+		return reconcile.Result{}, err
+	}
+	if clusterCtx.VSphereCluster.Status.VCenterVersion == "" {
+		err = errors.New("vCenter version is missing")
+		conditions.MarkFalse(clusterCtx.VSphereCluster, infrav1.ClusterModulesAvailableCondition, infrav1.MissingVCenterVersionReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
+		v1beta2conditions.Set(clusterCtx.VSphereCluster, metav1.Condition{
+			Type:    infrav1.VSphereClusterClusterModulesReadyV1Beta2Condition,
+			Status:  metav1.ConditionFalse,
+			Reason:  infrav1.VSphereClusterModulesInvalidVCenterVersionV1Beta2Reason,
+			Message: err.Error(),
+		})
+		log.Error(err, "could not reconcile vCenter version")
+		return reconcile.Result{}, err
 	}
 
 	affinityReconcileResult, err := r.reconcileClusterModules(ctx, clusterCtx)
@@ -447,11 +471,12 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	if err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "Skipping kube-ovn AppRelease reconcile because workload cluster client is unavailable")
 		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionUnknown, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, err.Error())
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{}, err
 	}
 
 	controlPlaneNodes, ready, err := r.controlPlaneNodesRegistered(ctx, cluster, clientset)
 	if err != nil {
+		r.setReadinessUnknown(clusterCtx.VSphereCluster, kubeOvnAppReleaseConditionSpec, err)
 		return reconcile.Result{}, err
 	}
 	if !ready {
@@ -501,6 +526,10 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	}
 
 	readiness := kubeOvnAppReleaseReadiness(current)
+	if readiness.err != nil {
+		r.setReadinessUnknown(clusterCtx.VSphereCluster, kubeOvnAppReleaseConditionSpec, readiness.err)
+		return reconcile.Result{}, readiness.err
+	}
 	if readiness.ready {
 		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionTrue, infrav1.KubeOvnAppReleaseReadyReason, clusterv1.ConditionSeverityInfo, "")
 		return reconcile.Result{}, nil
@@ -513,6 +542,7 @@ type appReleaseStatus struct {
 	ready   bool
 	reason  string
 	message string
+	err     error
 }
 
 // appReleaseReasons names the condition reasons a caller wants an AppRelease
@@ -525,11 +555,29 @@ type appReleaseReasons struct {
 }
 
 func (r *clusterReconciler) setKubeOvnAppReleaseCondition(vsphereCluster *infrav1.VSphereCluster, status corev1.ConditionStatus, reason string, severity clusterv1.ConditionSeverity, message string) {
-	r.setDualCondition(vsphereCluster,
-		infrav1.KubeOvnAppReleaseReadyCondition,
-		infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
-		"kube-ovn AppRelease",
-		status, reason, severity, message)
+	r.setReadinessCondition(vsphereCluster, kubeOvnAppReleaseConditionSpec, status, reason, severity, message)
+}
+
+var kubeOvnAppReleaseConditionSpec = readinessConditionSpec{
+	v1beta1Type:       infrav1.KubeOvnAppReleaseReadyCondition,
+	v1beta2Type:       infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
+	subject:           "kube-ovn AppRelease",
+	reconcilingReason: infrav1.KubeOvnAppReleaseReconcilingReason,
+}
+
+type readinessConditionSpec struct {
+	v1beta1Type       clusterv1.ConditionType
+	v1beta2Type       string
+	subject           string
+	reconcilingReason string
+}
+
+func (r *clusterReconciler) setReadinessCondition(vsphereCluster *infrav1.VSphereCluster, spec readinessConditionSpec, status corev1.ConditionStatus, reason string, severity clusterv1.ConditionSeverity, message string) {
+	r.setDualCondition(vsphereCluster, spec.v1beta1Type, spec.v1beta2Type, spec.subject, status, reason, severity, message)
+}
+
+func (r *clusterReconciler) setReadinessUnknown(vsphereCluster *infrav1.VSphereCluster, spec readinessConditionSpec, err error) {
+	r.setReadinessCondition(vsphereCluster, spec, corev1.ConditionUnknown, spec.reconcilingReason, clusterv1.ConditionSeverityInfo, err.Error())
 }
 
 // setDualCondition writes the same verdict to both the v1beta1 and the v1beta2
@@ -599,28 +647,48 @@ func kubeOvnAppReleaseReadiness(appRelease *unstructured.Unstructured) appReleas
 func appReleaseReadiness(appRelease *unstructured.Unstructured, releaseLabel string, reasons appReleaseReasons) appReleaseStatus {
 	syncCondition, found, err := appReleaseCondition(appRelease, "Sync")
 	if err != nil {
-		return appReleaseStatus{reason: reasons.reconciling, message: err.Error()}
+		return appReleaseStatus{err: pkgerrors.Wrapf(err, "failed to read %s AppRelease Sync condition", releaseLabel)}
 	}
 	if !found {
 		return appReleaseStatus{reason: reasons.reconciling, message: fmt.Sprintf("waiting for %s AppRelease Sync condition", releaseLabel)}
 	}
 	healthCondition, found, err := appReleaseCondition(appRelease, "Health")
 	if err != nil {
-		return appReleaseStatus{reason: reasons.reconciling, message: err.Error()}
+		return appReleaseStatus{err: pkgerrors.Wrapf(err, "failed to read %s AppRelease Health condition", releaseLabel)}
 	}
 	if !found {
 		return appReleaseStatus{reason: reasons.reconciling, message: fmt.Sprintf("waiting for %s AppRelease Health condition", releaseLabel)}
 	}
 
-	if stale, message := appReleaseStale(appRelease, releaseLabel); stale {
+	stale, message, err := appReleaseStale(appRelease, releaseLabel)
+	if err != nil {
+		return appReleaseStatus{err: err}
+	}
+	if stale {
 		return appReleaseStatus{reason: reasons.reconciling, message: message}
 	}
 
-	if status := conditionString(syncCondition, "status"); status != string(corev1.ConditionTrue) {
-		return appReleaseStatus{reason: reasons.notReady, message: appReleaseConditionMessage(releaseLabel, "Sync", syncCondition, status)}
+	syncStatus, err := conditionString(syncCondition, "status")
+	if err != nil {
+		return appReleaseStatus{err: pkgerrors.Wrapf(err, "failed to read %s AppRelease Sync status", releaseLabel)}
 	}
-	if status := conditionString(healthCondition, "status"); status != string(corev1.ConditionTrue) {
-		return appReleaseStatus{reason: reasons.notReady, message: appReleaseConditionMessage(releaseLabel, "Health", healthCondition, status)}
+	if syncStatus != string(corev1.ConditionTrue) {
+		message, err := appReleaseConditionMessage(releaseLabel, "Sync", syncCondition, syncStatus)
+		if err != nil {
+			return appReleaseStatus{err: err}
+		}
+		return appReleaseStatus{reason: reasons.notReady, message: message}
+	}
+	healthStatus, err := conditionString(healthCondition, "status")
+	if err != nil {
+		return appReleaseStatus{err: pkgerrors.Wrapf(err, "failed to read %s AppRelease Health status", releaseLabel)}
+	}
+	if healthStatus != string(corev1.ConditionTrue) {
+		message, err := appReleaseConditionMessage(releaseLabel, "Health", healthCondition, healthStatus)
+		if err != nil {
+			return appReleaseStatus{err: err}
+		}
+		return appReleaseStatus{reason: reasons.notReady, message: message}
 	}
 
 	return appReleaseStatus{ready: true, reason: reasons.ready}
@@ -634,48 +702,65 @@ func appReleaseCondition(appRelease *unstructured.Unstructured, conditionType st
 	for _, condition := range conditionList {
 		conditionMap, ok := condition.(map[string]any)
 		if !ok {
-			continue
+			return nil, false, fmt.Errorf("AppRelease %s condition has invalid type %T", conditionType, condition)
 		}
-		if conditionString(conditionMap, "type") == conditionType {
+		conditionName, err := conditionString(conditionMap, "type")
+		if err != nil {
+			return nil, false, err
+		}
+		if conditionName == conditionType {
 			return conditionMap, true, nil
 		}
 	}
 	return nil, false, nil
 }
 
-func appReleaseStale(appRelease *unstructured.Unstructured, releaseLabel string) (bool, string) {
+func appReleaseStale(appRelease *unstructured.Unstructured, releaseLabel string) (bool, string, error) {
 	generation := appRelease.GetGeneration()
 	observedGeneration, found, err := unstructured.NestedInt64(appRelease.Object, "status", "observedGeneration")
 	if err != nil {
-		return true, fmt.Sprintf("invalid %s AppRelease status observedGeneration: %v", releaseLabel, err)
+		return false, "", pkgerrors.Wrapf(err, "invalid %s AppRelease status observedGeneration", releaseLabel)
 	}
 	if !found {
-		return true, fmt.Sprintf("waiting for %s AppRelease observedGeneration", releaseLabel)
+		return true, fmt.Sprintf("waiting for %s AppRelease observedGeneration", releaseLabel), nil
 	}
 	if observedGeneration != generation {
-		return true, fmt.Sprintf("waiting for %s AppRelease to observe generation %d", releaseLabel, generation)
+		return true, fmt.Sprintf("waiting for %s AppRelease to observe generation %d", releaseLabel, generation), nil
 	}
-	return false, ""
+	return false, "", nil
 }
 
-func appReleaseConditionMessage(releaseLabel, conditionType string, condition map[string]any, status string) string {
-	reason := conditionString(condition, "reason")
-	message := conditionString(condition, "message")
+func appReleaseConditionMessage(releaseLabel, conditionType string, condition map[string]any, status string) (string, error) {
+	reason, err := conditionString(condition, "reason")
+	if err != nil {
+		return "", err
+	}
+	message, err := conditionString(condition, "message")
+	if err != nil {
+		return "", err
+	}
 	if reason == "" && message == "" {
-		return fmt.Sprintf("%s AppRelease %s condition status is %s", releaseLabel, conditionType, status)
+		return fmt.Sprintf("%s AppRelease %s condition status is %s", releaseLabel, conditionType, status), nil
 	}
 	if message == "" {
-		return fmt.Sprintf("%s AppRelease %s condition is %s", releaseLabel, conditionType, reason)
+		return fmt.Sprintf("%s AppRelease %s condition is %s", releaseLabel, conditionType, reason), nil
 	}
 	if reason == "" {
-		return fmt.Sprintf("%s AppRelease %s condition: %s", releaseLabel, conditionType, message)
+		return fmt.Sprintf("%s AppRelease %s condition: %s", releaseLabel, conditionType, message), nil
 	}
-	return fmt.Sprintf("%s AppRelease %s condition is %s: %s", releaseLabel, conditionType, reason, message)
+	return fmt.Sprintf("%s AppRelease %s condition is %s: %s", releaseLabel, conditionType, reason, message), nil
 }
 
-func conditionString(condition map[string]any, field string) string {
-	value, _ := condition[field].(string)
-	return value
+func conditionString(condition map[string]any, field string) (string, error) {
+	value, found := condition[field]
+	if !found {
+		return "", nil
+	}
+	valueString, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("AppRelease condition field %q has invalid type %T", field, value)
+	}
+	return valueString, nil
 }
 
 // controlPlaneNodesRegistered lists the workload cluster's control plane Node
@@ -695,7 +780,7 @@ func (r *clusterReconciler) controlPlaneNodesRegistered(ctx context.Context, clu
 	})
 	if err != nil {
 		log.Error(err, "Control plane Nodes cannot be listed")
-		return nil, false, nil
+		return nil, false, pkgerrors.Wrap(err, "failed to list control plane Nodes")
 	}
 
 	controlPlaneNodes := make([]string, 0, len(nodes.Items))
@@ -922,18 +1007,23 @@ func buildKubeOvnAppRelease(
 			},
 		},
 	}
+	spec := appRelease.Object["spec"].(map[string]interface{})
+	source := spec["source"].(map[string]interface{})
+	values := spec["values"].(map[string]interface{})
+	global := values["global"].(map[string]interface{})
+	registryValues := global["registry"].(map[string]interface{})
 	if len(controlPlaneNodes) > 0 {
 		nodes := make([]interface{}, 0, len(controlPlaneNodes))
 		for _, node := range controlPlaneNodes {
 			nodes = append(nodes, node)
 		}
-		_ = unstructured.SetNestedSlice(appRelease.Object, nodes, "spec", "values", "controlPlaneNodes")
+		values["controlPlaneNodes"] = nodes
 	}
 	if chartPullSecret != "" {
-		_ = unstructured.SetNestedField(appRelease.Object, chartPullSecret, "spec", "source", "chartPullSecret")
+		source["chartPullSecret"] = chartPullSecret
 	}
 	if len(imagePullSecrets) > 0 {
-		_ = unstructured.SetNestedSlice(appRelease.Object, imagePullSecrets, "spec", "values", "global", "registry", "imagePullSecrets")
+		registryValues["imagePullSecrets"] = imagePullSecrets
 	}
 	return appRelease
 }
@@ -1026,12 +1116,18 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 	var deploymentZoneList infrav1.VSphereDeploymentZoneList
 	err = r.Client.List(ctx, &deploymentZoneList, &opts)
 	if err != nil {
-		return false, pkgerrors.Wrap(err, "unable to list VSphereDeploymentZones")
+		err = pkgerrors.Wrap(err, "unable to list VSphereDeploymentZones")
+		invalidateFailureDomainStatus(clusterCtx.VSphereCluster, err)
+		return false, err
 	}
 
 	// Check machine config pool slot availability per datacenter to filter out
 	// failure domains that have no allocatable slots.
-	availableDatacenters, hasMachineConfigPools := r.computeAvailableDatacenters(ctx, clusterCtx)
+	availableDatacenters, hasMachineConfigPools, err := r.computeAvailableDatacenters(ctx, clusterCtx)
+	if err != nil {
+		invalidateFailureDomainStatus(clusterCtx.VSphereCluster, err)
+		return false, err
+	}
 
 	readyNotReported, notReady, excludedByPool := 0, 0, 0
 	failureDomains := clusterv1.FailureDomains{}
@@ -1054,11 +1150,18 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 				ControlPlane: ptr.Deref(zone.Spec.ControlPlane, true),
 			}
 			allReadyDomains[zone.Name] = fdSpec
-			if hasMachineConfigPools && !r.zoneHasAvailableSlots(ctx, zone, availableDatacenters) {
-				log.Info("Excluding failure domain: no machine config pool slots available for its datacenter",
-					"zone", zone.Name, "failureDomain", zone.Spec.FailureDomain)
-				excludedByPool++
-				continue
+			if hasMachineConfigPools {
+				hasAvailableSlots, err := r.zoneHasAvailableSlots(ctx, zone, availableDatacenters)
+				if err != nil {
+					invalidateFailureDomainStatus(clusterCtx.VSphereCluster, err)
+					return false, err
+				}
+				if !hasAvailableSlots {
+					log.Info("Excluding failure domain: no machine config pool slots available for its datacenter",
+						"zone", zone.Name, "failureDomain", zone.Spec.FailureDomain)
+					excludedByPool++
+					continue
+				}
 			}
 			failureDomains[zone.Name] = fdSpec
 			continue
@@ -1127,6 +1230,15 @@ func (r *clusterReconciler) reconcileDeploymentZones(ctx context.Context, cluste
 		conditions.Delete(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition)
 	}
 	return true, nil
+}
+
+// invalidateFailureDomainStatus prevents consumers from using a previously
+// successful failure-domain result after the pool or failure-domain lookup has
+// become unavailable.
+func invalidateFailureDomainStatus(vsphereCluster *infrav1.VSphereCluster, err error) {
+	vsphereCluster.Status.FailureDomains = clusterv1.FailureDomains{}
+	conditions.MarkFalse(vsphereCluster, infrav1.FailureDomainsAvailableCondition,
+		infrav1.WaitingForFailureDomainStatusReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
 }
 
 func (r *clusterReconciler) reconcileClusterModules(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {
@@ -1255,12 +1367,10 @@ func (r *clusterReconciler) deploymentZoneToCluster(ctx context.Context, o clien
 // computeAvailableDatacenters lists all VSphereMachineConfigPools for this cluster
 // and returns the set of datacenters that have at least one allocatable slot.
 // The second return value indicates whether any machine config pools exist.
-func (r *clusterReconciler) computeAvailableDatacenters(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (map[string]struct{}, bool) {
-	log := ctrl.LoggerFrom(ctx)
+func (r *clusterReconciler) computeAvailableDatacenters(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (map[string]struct{}, bool, error) {
 	var poolList infrav1.VSphereMachineConfigPoolList
 	if err := r.Client.List(ctx, &poolList, client.InNamespace(clusterCtx.Cluster.Namespace)); err != nil {
-		log.Error(err, "Failed to list VSphereMachineConfigPools, skipping slot-based filtering")
-		return nil, false
+		return nil, false, pkgerrors.Wrap(err, "failed to list VSphereMachineConfigPools")
 	}
 
 	var clusterPools []infrav1.VSphereMachineConfigPool
@@ -1272,34 +1382,32 @@ func (r *clusterReconciler) computeAvailableDatacenters(ctx context.Context, clu
 	}
 
 	if len(clusterPools) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
-	return services.DatacentersWithAvailableSlots(clusterPools), true
+	return services.DatacentersWithAvailableSlots(clusterPools), true, nil
 }
 
 // zoneHasAvailableSlots checks whether the given deployment zone's datacenter
-// has available machine config pool slots. Returns true conservatively if the
-// failure domain cannot be resolved.
-func (r *clusterReconciler) zoneHasAvailableSlots(ctx context.Context, zone infrav1.VSphereDeploymentZone, availableDatacenters map[string]struct{}) bool {
-	log := ctrl.LoggerFrom(ctx)
+// has available machine config pool slots. A lookup failure is returned so the
+// caller can retry instead of silently including an unverified zone.
+func (r *clusterReconciler) zoneHasAvailableSlots(ctx context.Context, zone infrav1.VSphereDeploymentZone, availableDatacenters map[string]struct{}) (bool, error) {
 	if zone.Spec.FailureDomain == "" {
-		return true
+		return true, nil
 	}
 
 	var fd infrav1.VSphereFailureDomain
 	if err := r.Client.Get(ctx, client.ObjectKey{Name: zone.Spec.FailureDomain}, &fd); err != nil {
-		log.Error(err, "Failed to get VSphereFailureDomain, including zone conservatively", "zone", zone.Name, "failureDomain", zone.Spec.FailureDomain)
-		return true
+		return false, pkgerrors.Wrapf(err, "failed to get VSphereFailureDomain %q for zone %q", zone.Spec.FailureDomain, zone.Name)
 	}
 
 	dc := fd.Spec.Topology.Datacenter
 	if dc == "" {
-		return true
+		return true, nil
 	}
 
 	_, ok := availableDatacenters[dc]
-	return ok
+	return ok, nil
 }
 
 // machineConfigPoolToCluster maps a VSphereMachineConfigPool to the VSphereCluster
