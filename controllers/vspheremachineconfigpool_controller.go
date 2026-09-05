@@ -849,19 +849,12 @@ func (r machineConfigPoolReconciler) reconcileDelete(ctx context.Context, pool *
 	// pool.Status.PersistentDiskStatuses before reclaiming against it.
 	services.SeedPersistentDiskStatuses(pool)
 
-	// Check if any vCenter operations are needed (released slots with reclaimable disks)
+	// Check if any vCenter operations are needed (any slot with reclaimable disks).
 	needsVCenter := false
 	for i := range pool.Spec.Configs {
 		slot := &pool.Spec.Configs[i]
-		for _, s := range pool.Status.ConfigStatuses {
-			if s.Hostname == slot.Hostname && s.State == infrav1.MachineConfigSlotStateReleased {
-				if services.HasReclaimablePersistentDiskBacking(pool, slot) {
-					needsVCenter = true
-					break
-				}
-			}
-		}
-		if needsVCenter {
+		if services.HasReclaimablePersistentDiskBacking(pool, slot) {
+			needsVCenter = true
 			break
 		}
 	}
@@ -895,11 +888,13 @@ func (r machineConfigPoolReconciler) reconcileDelete(ctx context.Context, pool *
 			}
 		}
 
+		machinePresent := false
 		if status.MachineRef != nil {
 			machine := &infrav1.VSphereMachine{}
 			err := r.Client.Get(ctx, client.ObjectKey{Namespace: status.MachineRef.Namespace, Name: status.MachineRef.Name}, machine)
 			switch {
 			case err == nil:
+				machinePresent = true
 				blockingMachines = append(blockingMachines, status.MachineRef.Namespace+"/"+status.MachineRef.Name)
 			case apierrors.IsNotFound(err):
 				log.Info("Deleting pool: machine for slot no longer exists, continuing reclaim", "hostname", slot.Hostname, "machine", status.MachineRef.Name)
@@ -914,9 +909,20 @@ func (r machineConfigPoolReconciler) reconcileDelete(ctx context.Context, pool *
 			}
 		}
 
-		if status.State == infrav1.MachineConfigSlotStateReleased {
+		// A slot with no live machine is eligible for reclaim regardless of its
+		// previous state. In particular, an Available slot can still carry a
+		// persistent-disk VolumePath after an interrupted or legacy reconcile.
+		if !machinePresent && status.State == infrav1.MachineConfigSlotStateInUse {
+			status.State = infrav1.MachineConfigSlotStateReleased
+			if status.LastReleasedTime == nil {
+				now := metav1.Now()
+				status.LastReleasedTime = &now
+			}
+		}
+
+		if !machinePresent && status.State != infrav1.MachineConfigSlotStateInUse {
 			if services.HasReclaimablePersistentDiskBacking(pool, slot) {
-				log.Info("Deleting pool: reclaiming released slot's persistent disks",
+				log.Info("Deleting pool: reclaiming slot's persistent disks",
 					"hostname", slot.Hostname,
 					"persistentDiskCount", len(slot.PersistentDisks),
 				)
@@ -933,7 +939,7 @@ func (r machineConfigPoolReconciler) reconcileDelete(ctx context.Context, pool *
 					requeueAfter = wait
 				}
 			} else {
-				log.Info("Deleting pool: released slot has no reclaimable persistent disks, marking available",
+				log.Info("Deleting pool: slot has no reclaimable persistent disks, marking available",
 					"hostname", slot.Hostname,
 					"persistentDiskCount", len(slot.PersistentDisks),
 				)

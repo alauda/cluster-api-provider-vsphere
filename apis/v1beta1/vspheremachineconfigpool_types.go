@@ -182,8 +182,8 @@ type PersistentDisk struct {
 	// +optional
 	StoragePolicy string `json:"storagePolicy,omitempty"`
 
-	// UnitNumber is the SCSI unit number for the disk (0-15, excluding 7).
-	// This ensures consistent disk ordering across VM recreations.
+	// UnitNumber is the last observed SCSI unit number for the disk (0-15,
+	// excluding 7). It is refreshed when the VM is recreated.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=15
@@ -455,9 +455,8 @@ type PersistentDiskStatus struct {
 	// +optional
 	DiskUUID string `json:"diskUUID,omitempty"`
 
-	// UnitNumber is the SCSI unit number the disk was actually attached at. When
-	// spec does not pin a UnitNumber, this observed value is reused on the next
-	// VM recreation to keep disk ordering stable.
+	// UnitNumber is the last observed SCSI unit number at which the disk was
+	// attached. It is refreshed after VM recreation.
 	// +optional
 	UnitNumber *int32 `json:"unitNumber,omitempty"`
 
@@ -513,9 +512,8 @@ type EphemeralDiskStatus struct {
 	// Name is the disk name (matches EphemeralDisk.Name within the slot).
 	Name string `json:"name"`
 
-	// UnitNumber is the SCSI unit number the disk was attached at, assigned by
-	// the controller at clone time and reused on the next VM recreation to keep
-	// guest disk addressing stable.
+	// UnitNumber is the last observed SCSI unit number at which the disk was
+	// attached. It is refreshed after VM recreation.
 	// +optional
 	UnitNumber *int32 `json:"unitNumber,omitempty"`
 }

@@ -2241,6 +2241,19 @@ func Test_DeterministicDiskPath(t *testing.T) {
 	})
 }
 
+func Test_DeterministicDiskPathNormalizesCIDR(t *testing.T) {
+	got := util.DeterministicDiskPath("master-0", "192.168.142.125/20", "vm-store1", "var-cpaas")
+	want := "[vm-store1] master-0-192.168.142.125/master-0-192.168.142.125-var-cpaas.vmdk"
+	if got != want {
+		t.Fatalf("DeterministicDiskPath() = %q, want %q", got, want)
+	}
+	clustered := util.DeterministicDiskPath("master-0", "192.168.142.125/20", "vm-store1", "var-cpaas", "global")
+	clusteredWant := "[vm-store1] global-master-0-192.168.142.125/master-0-192.168.142.125-var-cpaas.vmdk"
+	if clustered != clusteredWant {
+		t.Fatalf("clustered DeterministicDiskPath() = %q, want %q", clustered, clusteredWant)
+	}
+}
+
 func Test_DeterministicDiskName(t *testing.T) {
 	hexSuffix := regexp.MustCompile(`^-[0-9a-f]{5}$`)
 

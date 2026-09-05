@@ -43,7 +43,8 @@ spec:
 | TC-CAPV-SBLB-04 | bootstrap 仅 init 节点注入临时 VIP | 节点检查 | cloud-config + systemd unit |
 | TC-CAPV-SBLB-05 | bootstrap VIP 失败阻断 kubeadm | 异常 | `runcmd` 前插 + `exit 1` |
 | TC-CAPV-SBLB-06 | kube-proxy IPVS 配置调整 | 配置 | `strictARP`、`excludeCIDRs`、DaemonSet 滚动 |
-| TC-CAPV-SBLB-07 | alive `ModuleInfo` 创建和 patch | E2E 主路径 | version、label、config、所有权 |
+| TC-CAPV-SBLB-07 | alive `ModuleInfo` 创建和版本升级生命周期 | E2E 主路径 | 初始 version、目标版本 patch、label、config |
+| TC-CAPV-SBLB-15 | Global 与普通集群端口渲染 | 配置 | `6443`、`80`、`443`、`11443`、`2379` |
 | TC-CAPV-SBLB-08 | readiness 与 VIP probe | E2E 主路径 | minfo、AppRelease、pod、`/version`、condition |
 | TC-CAPV-SBLB-09 | backend 来源为 Node `InternalIP` | 配置 | 不写 `masterIPs` |
 | TC-CAPV-SBLB-10 | VIP 冲突与 endpoint 一致性校验 | 异常 | webhook + reconcile 防御 |
@@ -111,6 +112,33 @@ spec:
 - 填写 `vrid` / `interface` 时 webhook 返回 warning 但不拒绝，且这两个字段被忽略。
 
 **清理**：删除测试集群。
+
+## TC-CAPV-SBLB-15：Global 与普通集群端口渲染
+
+**目标**：确认 CAPV 按 CAPI `Cluster` 名称区分 alive 端口，并且 `6443` 仍作为
+独立的 kube-apiserver 端口渲染。
+
+**前置**：准备两个 `type=internal` 的测试集群，均配置
+`controlPlaneLoadBalancer.port: 6443`；一个关联 Cluster 名称为
+`tc-vsphere-sblb-workload`，另一个名称为 `global`。
+
+**步骤**：
+1. 分别等待 provider 创建 alive `ModuleInfo`。
+2. 检查两个 `ModuleInfo.spec.config` 的 `apiserverPort`、`httpPort`、
+   `httpsPort` 和 `extraPorts`。
+3. 集群运行后，在 alive 节点执行 `ipvsadm -Ln` 或检查
+   `/proc/net/ip_vs`，确认 VIP 服务端口。
+
+**预期**：
+- 普通集群配置为 `apiserverPort=6443`、`httpPort=11780`、
+  `httpsPort=11781`、`extraPorts=""`，VIP 服务为 `6443/11780/11781`。
+- `global` 集群配置为 `apiserverPort=6443`、`httpPort=80`、
+  `httpsPort=443`、`extraPorts="11443 2379"`，VIP 服务为
+  `6443/80/443/11443/2379`。
+- `6443` 的后端均为 control-plane 节点的 `:6443`；Global 端口策略不改写
+  `controlPlaneLoadBalancer.port`。
+
+**清理**：删除两个测试集群及其测试 VIP。
 
 ## TC-CAPV-SBLB-03：`type=internal` 新建集群主路径
 
@@ -199,9 +227,9 @@ spec:
 
 **清理**：无。
 
-## TC-CAPV-SBLB-07：alive `ModuleInfo` 创建和 patch
+## TC-CAPV-SBLB-07：alive `ModuleInfo` 创建和版本升级生命周期
 
-**目标**：验证 minfo 名称、label、annotation、version、config 与所有权保护。
+**目标**：验证 minfo 名称、label、annotation、初始 version/config，以及 CAPV 对自身管理 minfo 的版本升级边界。
 
 **前置**：TC-03 集群。
 
@@ -209,15 +237,17 @@ spec:
 1. 检查 minfo 名称是否为 `<clusterName>-<sha256(clusterName:alive:alive) 前 32 位>`。
 2. 检查 label（`cpaas.io/cluster-name`、`cpaas.io/module-name`、`cpaas.io/module-type`、`self-built-lb-managed`）、annotation `cpaas.io/display-name` 与 `spec.config` 各字段。
 3. 手工把 `spec.config.vrid` 改成其它值，观察下一轮 reconcile。
-4. 手工删除 `self-built-lb-managed` label，观察 controller 行为。
-5. 分别测试三种版本来源：设置 `--plugin-alive-version`、`ModulePlugin.status.targetClusterVersions` 命中、仅 `latestVersion`。
-6. 临时把 `ModuleConfig/alive-<version>` 置为未 ready 或删除，观察 controller 行为。
+4. 将 CAPV 管理的 minfo 当前 `spec.version` 设为低于目标版本，观察下一轮 reconcile 是否只 patch `spec.version`。
+5. 将目标版本分别设为等于和低于当前版本，观察 CAPV 是否保持 minfo 不变。
+6. 手工删除 `self-built-lb-managed` label，观察 controller 是否保持不接管、不 patch 该 minfo。
+7. 分别测试版本来源：设置 `--plugin-alive-version`、`targetClusterVersions` 命中、仅使用 `latestVersion`。
+8. 临时把 `ModuleConfig/alive-<version>` 置为未 ready 或删除，观察 controller 行为。
 
 **预期**：
 - 名称、label、annotation、config 与设计一致，`spec.config` 不含 `masterIPs`。
-- 手工改动被 patch 回期望值。
-- 所有权 label 不匹配时 controller 返回错误、不接管该对象、condition 置 False。
-- 版本按「启动参数 → targetClusterVersions → latestVersion」优先级解析。
+- CAPV 管理的 minfo 目标版本高于当前版本时只 patch `spec.version`，保留 config、label 和 annotation；目标版本相同或更低时不修改。
+- 不带 provider label 的同名 minfo 不被接管和 patch，CAPV 按该对象自身 `spec.version` 等待 status 和 runtime 收敛。
+- 版本按「启动参数 → targetClusterVersions → latestVersion」优先级解析，并在每轮 reconcile 校验目标 `ModuleConfig` 是否 ready。
 - `ModuleConfig` 缺失或未 ready 时返回错误并在 condition message 中体现，而不是静默等待。
 
 **清理**：恢复被改动的对象。
@@ -236,7 +266,7 @@ spec:
 5. 临时停止一个非 VIP 持有节点的 alive pod，观察 condition 变化。
 
 **预期**：
-- 任一层未就绪时 condition 为 False 且 message 指明具体层级，controller 按 10 秒 requeue。
+- 任一层未就绪时 condition 为 False 且 message 指明具体层级，controller 按显式 10 秒 requeue；一次 reconcile 成功且没有显式等待结果时，controller 统一按 30 秒 requeue。
 - `conntrack=0` 时 minfo 与 AppRelease 仍可 Ready，但 VIP probe 失败，condition 不为 True。
 - 恢复后 condition 回到 True。
 - probe 使用标准 TLS 校验，不跳过证书校验。

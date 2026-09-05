@@ -540,19 +540,24 @@ func getPoweredoffVM(ctx context.Context, c *vim25.Client) (*object.VirtualMachi
 func TestDetachPersistentDisksIgnoresEphemeralDisks(t *testing.T) {
 	vms := &VMService{}
 
-	dataDiskCount := func(ctx context.Context, vm *object.VirtualMachine) (int, int32) {
+	dataDiskInfo := func(ctx context.Context, vm *object.VirtualMachine) (int, int32, string) {
 		devices, err := vm.Device(ctx)
 		if err != nil {
-			return -1, 0
+			return -1, 0, ""
 		}
 		disks := devices.SelectByType((*types.VirtualDisk)(nil))
 		var unit int32
+		var path string
 		if len(disks) > 0 {
-			if u := disks[0].(*types.VirtualDisk).UnitNumber; u != nil {
+			disk := disks[0].(*types.VirtualDisk)
+			if u := disk.UnitNumber; u != nil {
 				unit = *u
 			}
+			if backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo); ok {
+				path = backing.FileName
+			}
 		}
-		return len(disks), unit
+		return len(disks), unit, path
 	}
 
 	newVMCtx := func(vm *object.VirtualMachine, slot *infrav1.MachineConfigSlot) *virtualMachineContext {
@@ -571,7 +576,7 @@ func TestDetachPersistentDisksIgnoresEphemeralDisks(t *testing.T) {
 			vm, err := getPoweredoffVM(ctx, c)
 			g.Expect(err).ToNot(HaveOccurred())
 
-			before, unit := dataDiskCount(ctx, vm)
+			before, unit, _ := dataDiskInfo(ctx, vm)
 			g.Expect(before).To(BeNumerically(">", 0))
 
 			// The ephemeral disk even names the attached disk's unit; detach must
@@ -583,7 +588,7 @@ func TestDetachPersistentDisksIgnoresEphemeralDisks(t *testing.T) {
 			}
 			g.Expect(vms.detachPersistentDisks(ctx, newVMCtx(vm, slot))).To(Succeed())
 
-			after, _ := dataDiskCount(ctx, vm)
+			after, _, _ := dataDiskInfo(ctx, vm)
 			g.Expect(after).To(Equal(before), "ephemeral disks must not be detached")
 			return nil
 		})
@@ -595,16 +600,16 @@ func TestDetachPersistentDisksIgnoresEphemeralDisks(t *testing.T) {
 			vm, err := getPoweredoffVM(ctx, c)
 			g.Expect(err).ToNot(HaveOccurred())
 
-			before, unit := dataDiskCount(ctx, vm)
+			before, unit, path := dataDiskInfo(ctx, vm)
 			g.Expect(before).To(BeNumerically(">", 0))
 
 			slot := &infrav1.MachineConfigSlot{
 				Hostname:        "worker-01",
-				PersistentDisks: []infrav1.PersistentDisk{{Name: "data-1", SizeGiB: 10, UnitNumber: ptr.To(unit)}},
+				PersistentDisks: []infrav1.PersistentDisk{{Name: "data-1", SizeGiB: 10, UnitNumber: ptr.To(unit), VolumePath: path}},
 			}
 			g.Expect(vms.detachPersistentDisks(ctx, newVMCtx(vm, slot))).To(Succeed())
 
-			after, _ := dataDiskCount(ctx, vm)
+			after, _, _ := dataDiskInfo(ctx, vm)
 			g.Expect(after).To(Equal(before-1), "the persistent disk at the matched unit should be detached")
 			return nil
 		})
@@ -656,6 +661,44 @@ func TestReconcilePersistentDiskStatusesRequiresCompleteMetadata(t *testing.T) {
 		g.Expect(err.Error()).To(ContainSubstring("unitNumber"))
 		g.Expect(err.Error()).To(ContainSubstring("volumePath"))
 		g.Expect(err.Error()).To(ContainSubstring("diskUUID"))
+		return nil
+	})
+}
+
+func TestPersistentDiskBackingExists(t *testing.T) {
+	g := NewWithT(t)
+	simulator.Run(func(ctx context.Context, c *vim25.Client) error {
+		password, _ := simulator.DefaultLogin.Password()
+		authSession, err := session.GetOrCreate(ctx, session.NewParams().
+			WithServer(fmt.Sprintf("https://%s", c.Client.URL().Host)).
+			WithUserInfo(simulator.DefaultLogin.Username(), password).
+			WithDatacenter("*"))
+		g.Expect(err).ToNot(HaveOccurred())
+		vm, err := getPoweredoffVM(ctx, c)
+		g.Expect(err).ToNot(HaveOccurred())
+		devices, err := vm.Device(ctx)
+		g.Expect(err).ToNot(HaveOccurred())
+		var existingPath string
+		for _, device := range devices.SelectByType((*types.VirtualDisk)(nil)) {
+			backing, ok := device.(*types.VirtualDisk).Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+			if ok {
+				existingPath = backing.FileName
+				break
+			}
+		}
+		g.Expect(existingPath).NotTo(BeEmpty())
+
+		vmCtx := &virtualMachineContext{VMContext: capvcontext.VMContext{Session: authSession}}
+		exists, err := persistentDiskBackingExists(ctx, vmCtx, existingPath)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(exists).To(BeTrue())
+
+		var missing object.DatastorePath
+		g.Expect(missing.FromString(existingPath)).To(BeTrue())
+		missing.Path = "does-not-exist/missing.vmdk"
+		exists, err = persistentDiskBackingExists(ctx, vmCtx, missing.String())
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(exists).To(BeFalse())
 		return nil
 	})
 }

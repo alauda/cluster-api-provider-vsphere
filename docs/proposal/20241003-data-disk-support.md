@@ -91,9 +91,11 @@ CAPV will not be responsible for any custom mounting of the data disks.  CAPV wi
 
 CAPV will create the new disks for control plane nodes during cluster creation.  
 
-The new disks will be placed in the same location as the primary disk (datastore) and will use the controller as the primary disk.  
+> **Historical design note:** This proposal describes the original data-disk design. In the current implementation, `UnitNumber` is an observation of the most recent SCSI attachment. VM rebuilds recalculate it from the template's occupied devices, so it is not guaranteed to remain stable across rebuilds.
 
-Creating new controllers is out of scope for this enhancement.  The new disk will use the same controller as the primary disks.  The unit number for the disks on that controller will be in the order in which the disks are defined in the machine spec configuration.
+The new disks will be placed in the same location as the primary disk (datastore) and will use an available SCSI controller.
+
+Creating new controllers is out of scope for this enhancement. The original design used the primary disk controller and assigned unit numbers by declaration order; that behavior is superseded by the current template-aware allocation described above.
 
 #### For User Story 2
 
@@ -155,7 +157,7 @@ type VirtualMachineCloneSpec struct {
 
 ### Implementation Details
 
-The cloning process will now be able to add data disks to a VM.  Using the config provided in the VSphereCloneTemplate, the defined disks will be added to the virtual machine.  Each disk is added to the controller used by the primary disk.  Currently, there are no plans to allow the user to define a new controller (SCSI/IDE/etc) for these disks. 
+The cloning process will now be able to add data disks to a VM. Using the config provided in the VSphereCloneTemplate, the defined disks will be added to the virtual machine. Each disk is added to an available SCSI controller selected from the template. Currently, there are no plans to allow the user to define a new controller (SCSI/IDE/etc) for these disks.
 
 An example of what the VSphereMachineTemplate looks like when data disks are desired:
 ```yaml
@@ -226,7 +228,7 @@ In the above examples, two data disks will be created during the clone process a
 
 For each `dataDisks` definition, the clone procedure will attempt to generate a device VirtualDeviceConfigSpec that will be used to create the new disk device.  Each disk will be attached in the order in which they are defined in the template.  All disks defined in the vSphere OVA template will come first with the new disks being attached after.
 
-The clone procedure will assign each new disk to the same controller being used by the primary (OS) disk of the OVA template.  The current behavior of the clone procedure will not be able to create any new controllers; however, in the future, the template may be enhanced to define new controllers and then assign them during the disk creation portion of the clone procedure. 
+The original clone procedure assigned each new disk to the same controller being used by the primary (OS) disk of the OVA template and used declaration order for unit numbers. That placement rule is historical: the current procedure scans the selected SCSI controller's occupied units and assigns a free unit for each rebuild. It still does not create new controllers.
 
 ### Notes/Constraints
 
