@@ -254,6 +254,35 @@ func (r *clusterReconciler) reconcileDelete(ctx context.Context, clusterCtx *cap
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	clusterForPools := clusterCtx.Cluster
+	if clusterForPools == nil {
+		for _, ownerRef := range clusterCtx.VSphereCluster.OwnerReferences {
+			if ownerRef.Kind == "Cluster" && ownerRef.Name != "" {
+				clusterForPools = &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{
+					Name:      ownerRef.Name,
+					Namespace: clusterCtx.VSphereCluster.Namespace,
+				}}
+				break
+			}
+		}
+	}
+	if clusterForPools == nil {
+		log.Info("Skipping VSphereMachineConfigPool deletion gate because the CAPI Cluster cannot be identified")
+	} else {
+		machineConfigPools, err := r.getMachineConfigPoolsForCluster(ctx, clusterForPools)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if len(machineConfigPools) > 0 {
+			poolNames := make([]string, 0, len(machineConfigPools))
+			for i := range machineConfigPools {
+				poolNames = append(poolNames, klog.KObj(&machineConfigPools[i]).String())
+			}
+			log.Info("Waiting for VSphereMachineConfigPools to be deleted", "count", len(machineConfigPools), "pools", poolNames)
+			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+	}
+
 	// The cluster module info needs to be reconciled before the secret deletion
 	// since it needs access to the vCenter instance to be able to perform LCM operations
 	// on the cluster modules.
@@ -1386,6 +1415,33 @@ func (r *clusterReconciler) computeAvailableDatacenters(ctx context.Context, clu
 	}
 
 	return services.DatacentersWithAvailableSlots(clusterPools), true, nil
+}
+
+// getMachineConfigPoolsForCluster lists pools associated with a CAPI Cluster.
+// A pool with a deletion timestamp remains a blocker until it is gone from the
+// API server, because its finalizer may still be reclaiming persistent disks.
+func (r *clusterReconciler) getMachineConfigPoolsForCluster(ctx context.Context, cluster *clusterv1.Cluster) ([]infrav1.VSphereMachineConfigPool, error) {
+	if cluster == nil {
+		return nil, pkgerrors.New("CAPI Cluster is required to list associated VSphereMachineConfigPools")
+	}
+
+	var poolList infrav1.VSphereMachineConfigPoolList
+	if err := r.Client.List(ctx, &poolList, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, pkgerrors.Wrap(err, "failed to list VSphereMachineConfigPools for cluster deletion")
+	}
+
+	pools := make([]infrav1.VSphereMachineConfigPool, 0, len(poolList.Items))
+	for i := range poolList.Items {
+		pool := &poolList.Items[i]
+		if pool.Spec.ClusterRef.Name != cluster.Name {
+			continue
+		}
+		if pool.Spec.ClusterRef.Namespace != "" && pool.Spec.ClusterRef.Namespace != cluster.Namespace {
+			continue
+		}
+		pools = append(pools, *pool)
+	}
+	return pools, nil
 }
 
 // zoneHasAvailableSlots checks whether the given deployment zone's datacenter

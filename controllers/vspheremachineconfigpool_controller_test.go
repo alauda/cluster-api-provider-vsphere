@@ -303,6 +303,145 @@ func TestMachineConfigPoolReconcileDeleteRemovesFinalizerAfterSafeReclaim(t *tes
 	g.Expect(pool.Status.ConfigStatuses[0].State).To(Equal(infrav1.MachineConfigSlotStateAvailable))
 }
 
+func TestMachineConfigPoolReconcileDeleteBlocksWhenPersistentDiskAttached(t *testing.T) {
+	g := NewWithT(t)
+	simr, err := vcsim.NewBuilder().Build()
+	g.Expect(err).NotTo(HaveOccurred())
+	defer simr.Destroy()
+
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+
+	password, _ := simr.ServerURL().User.Password()
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec:       clusterv1.ClusterSpec{InfrastructureRef: &corev1.ObjectReference{Name: "test-vsphere-cluster"}},
+	}
+	vsphereCluster := &infrav1.VSphereCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-vsphere-cluster", Namespace: "default"},
+		Spec: infrav1.VSphereClusterSpec{
+			Server:     simr.ServerURL().Host,
+			Thumbprint: "",
+		},
+	}
+	attachedPath := firstAttachedDiskPath(context.Background(), g, &vcenterParams{
+		server:   simr.ServerURL().Host,
+		username: simr.ServerURL().User.Username(),
+		password: password,
+	})
+	now := metav1.Now()
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pool",
+			Namespace:  "default",
+			Finalizers: []string{MachineConfigPoolFinalizer},
+		},
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
+			Datacenter: "DC0",
+			Configs: []infrav1.MachineConfigSlot{{
+				Hostname:        "host-1",
+				PersistentDisks: []infrav1.PersistentDisk{{Name: "data-0", SizeGiB: 20}},
+			}},
+		},
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
+				Hostname:         "host-1",
+				State:            infrav1.MachineConfigSlotStateReleased,
+				LastReleasedTime: &now,
+			}},
+			PersistentDiskStatuses: []infrav1.PersistentDiskStatus{{
+				Hostname:   "host-1",
+				Name:       "data-0",
+				VolumePath: attachedPath,
+				Phase:      infrav1.PersistentDiskPhaseAttached,
+			}},
+		},
+	}
+
+	r := machineConfigPoolReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, vsphereCluster, pool).Build(),
+		ControllerManagerContext: &capvcontext.ControllerManagerContext{
+			Username: simr.ServerURL().User.Username(),
+			Password: password,
+		},
+	}
+
+	result, err := r.reconcileDelete(context.Background(), pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+	g.Expect(pool.Finalizers).To(ContainElement(MachineConfigPoolFinalizer))
+	g.Expect(pool.Status.PersistentDiskStatuses[0].Phase).To(Equal(infrav1.PersistentDiskPhaseError))
+}
+
+func TestMachineConfigPoolReconcileDeleteReclaimsBackingFromAvailableSlot(t *testing.T) {
+	g := NewWithT(t)
+	simr, err := vcsim.NewBuilder().Build()
+	g.Expect(err).NotTo(HaveOccurred())
+	defer simr.Destroy()
+
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+
+	password, _ := simr.ServerURL().User.Password()
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec:       clusterv1.ClusterSpec{InfrastructureRef: &corev1.ObjectReference{Name: "test-vsphere-cluster"}},
+	}
+	vsphereCluster := &infrav1.VSphereCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-vsphere-cluster", Namespace: "default"},
+		Spec:       infrav1.VSphereClusterSpec{Server: simr.ServerURL().Host},
+	}
+	attachedPath := firstAttachedDiskPath(context.Background(), g, &vcenterParams{
+		server:   simr.ServerURL().Host,
+		username: simr.ServerURL().User.Username(),
+		password: password,
+	})
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pool",
+			Namespace:  "default",
+			Finalizers: []string{MachineConfigPoolFinalizer},
+		},
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
+			Datacenter: "DC0",
+			Configs: []infrav1.MachineConfigSlot{{
+				Hostname:        "host-1",
+				PersistentDisks: []infrav1.PersistentDisk{{Name: "data-0", SizeGiB: 20}},
+			}},
+		},
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
+				Hostname: "host-1",
+				State:    infrav1.MachineConfigSlotStateAvailable,
+			}},
+			PersistentDiskStatuses: []infrav1.PersistentDiskStatus{{
+				Hostname:   "host-1",
+				Name:       "data-0",
+				VolumePath: attachedPath,
+				Phase:      infrav1.PersistentDiskPhaseAttached,
+			}},
+		},
+	}
+
+	r := machineConfigPoolReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, vsphereCluster, pool).Build(),
+		ControllerManagerContext: &capvcontext.ControllerManagerContext{
+			Username: simr.ServerURL().User.Username(),
+			Password: password,
+		},
+	}
+
+	result, err := r.reconcileDelete(context.Background(), pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+	g.Expect(pool.Finalizers).To(ContainElement(MachineConfigPoolFinalizer))
+	g.Expect(pool.Status.PersistentDiskStatuses[0].Phase).To(Equal(infrav1.PersistentDiskPhaseError))
+}
+
 // TestMachineConfigPoolReconcileDeleteMigratedPoolConverges exercises the full
 // reconcileDelete path for a pool upgraded from before the status migration: the
 // disk's observed VolumePath is still frozen on spec and status starts empty.

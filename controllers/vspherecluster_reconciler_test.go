@@ -54,6 +54,7 @@ import (
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/context/fake"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 )
 
 func TestRequeueAfterSuccessfulReconcile(t *testing.T) {
@@ -1238,6 +1239,124 @@ func TestClusterReconciler_ReconcileDeploymentZonesReturnsMachineConfigPoolListE
 	g.Expect(err.Error()).To(ContainSubstring(poolErr.Error()))
 	g.Expect(clusterCtx.VSphereCluster.Status.FailureDomains).To(BeEmpty())
 	g.Expect(conditions.IsFalse(clusterCtx.VSphereCluster, infrav1.FailureDomainsAvailableCondition)).To(BeTrue())
+}
+
+func TestClusterReconciler_GetMachineConfigPoolsForCluster(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster-a", Namespace: "default"}}
+	matching := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "cluster-a"},
+		},
+	}
+	deleting := matching.DeepCopy()
+	deleting.Name = "pool-deleting"
+	deleting.Finalizers = []string{"test.finalizer"}
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+	otherCluster := matching.DeepCopy()
+	otherCluster.Name = "pool-other"
+	otherCluster.Spec.ClusterRef.Name = "cluster-b"
+
+	r := clusterReconciler{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, matching, deleting, otherCluster).Build()}
+	pools, err := r.getMachineConfigPoolsForCluster(context.Background(), cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pools).To(HaveLen(2))
+	g.Expect([]string{pools[0].Name, pools[1].Name}).To(ConsistOf("pool-a", "pool-deleting"))
+}
+
+func TestClusterReconciler_GetMachineConfigPoolsForClusterReturnsListError(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	listErr := errors.New("machine config pool list failed")
+	client := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, underlying client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*infrav1.VSphereMachineConfigPoolList); ok {
+				return listErr
+			}
+			return underlying.List(ctx, list, opts...)
+		},
+	}).Build()
+
+	r := clusterReconciler{Client: client}
+	_, err := r.getMachineConfigPoolsForCluster(context.Background(), &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster-a", Namespace: "default"}})
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring(listErr.Error()))
+}
+
+func TestClusterReconciler_ReconcileDeleteBlocksForMachineConfigPool(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster-a", Namespace: "default"}}
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
+		Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "cluster-a"}},
+	}
+	client := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, pool).Build()
+	r := clusterReconciler{
+		Client:    client,
+		vmService: services.VimMachineService{Client: client},
+	}
+	clusterCtx := &capvcontext.ClusterContext{
+		Cluster: cluster,
+		VSphereCluster: &infrav1.VSphereCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "vsphere-cluster-a",
+				Namespace:  "default",
+				Finalizers: []string{infrav1.ClusterFinalizer},
+			},
+			Spec: infrav1.VSphereClusterSpec{DisableClusterModule: true},
+		},
+	}
+
+	result, err := r.reconcileDelete(context.Background(), clusterCtx)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+	g.Expect(clusterCtx.VSphereCluster.Finalizers).To(ContainElement(infrav1.ClusterFinalizer))
+}
+
+func TestClusterReconciler_ReconcileDeleteIgnoresPoolForAnotherCluster(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster-a", Namespace: "default"}}
+	otherPool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-for-cluster-b", Namespace: "default"},
+		Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "cluster-b"}},
+	}
+	client := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, otherPool).Build()
+	r := clusterReconciler{
+		Client:    client,
+		vmService: services.VimMachineService{Client: client},
+	}
+	clusterCtx := &capvcontext.ClusterContext{
+		Cluster: cluster,
+		VSphereCluster: &infrav1.VSphereCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "vsphere-cluster-a",
+				Namespace:  "default",
+				Finalizers: []string{infrav1.ClusterFinalizer},
+			},
+			Spec: infrav1.VSphereClusterSpec{DisableClusterModule: true},
+		},
+	}
+
+	result, err := r.reconcileDelete(context.Background(), clusterCtx)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result).To(Equal(reconcile.Result{}))
+	g.Expect(clusterCtx.VSphereCluster.Finalizers).NotTo(ContainElement(infrav1.ClusterFinalizer))
 }
 
 func TestClusterReconciler_ReconcileDeploymentZonesReturnsFailureDomainLookupError(t *testing.T) {
