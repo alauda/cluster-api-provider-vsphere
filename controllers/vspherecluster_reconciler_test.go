@@ -28,11 +28,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/vmware/govmomi/simulator"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	apirecord "k8s.io/client-go/tools/record"
@@ -54,6 +56,7 @@ import (
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/context/fake"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/identity"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util/ovn"
 )
 
 func TestRequeueAfterSuccessfulReconcile(t *testing.T) {
@@ -635,7 +638,7 @@ func TestClusterReconciler_ControlPlaneNodesRegistered(t *testing.T) {
 			}
 			g.Expect(ready).To(Equal(tt.wantReady))
 			if tt.wantReady {
-				g.Expect(controlPlaneNodes).To(Equal([]string{"test-control-plane-0", "test-control-plane-1", "test-control-plane-2"}))
+				g.Expect(nodeNames(controlPlaneNodes)).To(Equal([]string{"test-control-plane-0", "test-control-plane-1", "test-control-plane-2"}))
 			}
 		})
 	}
@@ -721,6 +724,200 @@ func TestBuildKubeOvnAppReleaseSetsControlPlaneNodes(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
 	g.Expect(controlPlaneNodes).To(Equal([]any{"cp-0", "cp-1", "cp-2"}))
+}
+
+// The revision is what a render is recognised by, so the two halves have to
+// round-trip: the control plane it was produced from, and the retries counted
+// against that control plane.
+func TestKubeOvnRenderRevision(t *testing.T) {
+	appRelease := func(values map[string]any) *unstructured.Unstructured {
+		spec := map[string]any{}
+		if values != nil {
+			spec["values"] = values
+		}
+		return &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
+	}
+
+	tests := []struct {
+		name         string
+		appRelease   *unstructured.Unstructured
+		wantFrom     string
+		wantAttempts int
+	}{
+		{
+			name:         "counted up by an earlier reconcile",
+			appRelease:   appRelease(map[string]any{"renderRevision": "1a2b3c4d-7"}),
+			wantFrom:     "1a2b3c4d",
+			wantAttempts: 7,
+		},
+		{
+			name:       "created before this controller wrote the field",
+			appRelease: appRelease(nil),
+		},
+		{
+			// What an older version of this controller wrote: a bare count. It
+			// names no control plane, so it matches none and renders once.
+			name:       "a count without a control plane",
+			appRelease: appRelease(map[string]any{"renderRevision": "3"}),
+		},
+		{
+			name:       "not a revision this controller wrote",
+			appRelease: appRelease(map[string]any{"renderRevision": "1a2b3c4d-x"}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			from, attempts := parseKubeOvnRenderRevision(kubeOvnRenderRevision(tt.appRelease))
+			g.Expect(from).To(Equal(tt.wantFrom))
+			g.Expect(attempts).To(Equal(tt.wantAttempts))
+
+			// A count-up has to be an actual spec change, and the control plane
+			// it counts against has to survive it.
+			revision := formatKubeOvnRenderRevision("1a2b3c4d", attempts+1)
+			g.Expect(revision).NotTo(Equal(kubeOvnRenderRevision(tt.appRelease)))
+			setKubeOvnRenderRevision(tt.appRelease, revision)
+			countedFrom, countedAttempts := parseKubeOvnRenderRevision(kubeOvnRenderRevision(tt.appRelease))
+			g.Expect(countedFrom).To(Equal("1a2b3c4d"))
+			g.Expect(countedAttempts).To(Equal(attempts + 1))
+		})
+	}
+}
+
+// The incident this exists for: KCP replaces a control plane Machine with one
+// that rejoins under the same Node name, so a hash over the names would not
+// change and the chart would never be rendered again.
+func TestControlPlaneRenderHash(t *testing.T) {
+	node := func(name, uid string) corev1.Node {
+		return corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uid)}}
+	}
+	registered := []corev1.Node{node("cp-0", "uid-0"), node("cp-1", "uid-1"), node("cp-2", "uid-2")}
+
+	g := NewWithT(t)
+	hash := controlPlaneRenderHash(registered)
+	g.Expect(hash).To(HaveLen(kubeOvnRenderRevisionHashLength))
+
+	rolled := []corev1.Node{node("cp-0", "uid-0"), node("cp-1", "uid-1"), node("cp-2", "uid-2-replacement")}
+	g.Expect(controlPlaneRenderHash(rolled)).NotTo(Equal(hash), "a replacement Node keeps its name")
+
+	shuffled := []corev1.Node{registered[2], registered[0], registered[1]}
+	g.Expect(controlPlaneRenderHash(shuffled)).To(Equal(hash), "listing order is not a change")
+}
+
+// A re-render that does not fix the raft must not be retried forever at the
+// reconcile interval: the wait grows, and it stops growing at a bound.
+func TestKubeOvnRenderBackoff(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(kubeOvnRenderBackoff(0)).To(Equal(kubeOvnRenderBackoffBase))
+	g.Expect(kubeOvnRenderBackoff(1)).To(Equal(2 * kubeOvnRenderBackoffBase))
+
+	previous := time.Duration(0)
+	for attempts := range 1000 {
+		backoff := kubeOvnRenderBackoff(attempts)
+		g.Expect(backoff).To(BeNumerically(">=", previous), "a retry never waits less than the one before it")
+		g.Expect(backoff).To(BeNumerically("<=", kubeOvnRenderBackoffMax))
+		previous = backoff
+	}
+	g.Expect(previous).To(Equal(kubeOvnRenderBackoffMax))
+}
+
+// The wait is held against what the AppRelease records, because a requeue only
+// bounds how late the next reconcile is, not how early.
+func TestKubeOvnRenderAttemptTime(t *testing.T) {
+	g := NewWithT(t)
+	appRelease := &unstructured.Unstructured{Object: map[string]any{}}
+	appRelease.SetAnnotations(map[string]string{"interval-sync": "true"})
+
+	g.Expect(kubeOvnRenderAttemptTime(appRelease)).To(BeZero(), "never counted up is long enough ago to retry now")
+
+	countedUpAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	setKubeOvnRenderAttemptTime(appRelease, countedUpAt, true)
+	g.Expect(kubeOvnRenderAttemptTime(appRelease).Equal(countedUpAt)).To(BeTrue())
+
+	// A render that is not a count-up clears the record, so the control plane it
+	// renders does not inherit the wait the previous one had grown to.
+	setKubeOvnRenderAttemptTime(appRelease, time.Now(), false)
+	g.Expect(kubeOvnRenderAttemptTime(appRelease)).To(BeZero())
+	g.Expect(appRelease.GetAnnotations()).To(HaveKeyWithValue("interval-sync", "true"))
+
+	appRelease.SetAnnotations(map[string]string{kubeOvnRenderAttemptAnnotation: "yesterday"})
+	g.Expect(kubeOvnRenderAttemptTime(appRelease)).To(BeZero())
+}
+func TestRenderedOvnCentralReplicas(t *testing.T) {
+	deployment := func(replicas *int32) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ovn.CentralNamespace, Name: ovnCentralName},
+			Spec:       appsv1.DeploymentSpec{Replicas: replicas},
+		}
+	}
+	tests := []struct {
+		name         string
+		objects      []runtime.Object
+		wantReplicas int32
+		wantRendered bool
+	}{
+		{
+			name:         "rendered with a full raft",
+			objects:      []runtime.Object{deployment(ptr.To(int32(3)))},
+			wantReplicas: 3,
+			wantRendered: true,
+		},
+		{
+			// What the incident left behind: rendered while a rolled control
+			// plane Node was gone, so the raft came back one member short.
+			name:         "rendered while a control plane Node was missing",
+			objects:      []runtime.Object{deployment(ptr.To(int32(2)))},
+			wantReplicas: 2,
+			wantRendered: true,
+		},
+		{
+			name:         "replicas left to the Deployment default",
+			objects:      []runtime.Object{deployment(nil)},
+			wantReplicas: 1,
+			wantRendered: true,
+		},
+		{
+			name:         "scaled to zero",
+			objects:      []runtime.Object{deployment(ptr.To(int32(0)))},
+			wantReplicas: 0,
+			wantRendered: true,
+		},
+		{
+			// An install that has only just begun is not a short render, and
+			// neither is a chart that renders ovn-central under another name:
+			// counting either as zero replicas renders on top of itself.
+			name: "not rendered yet",
+		},
+		{
+			name: "a Deployment of the same name elsewhere is not it",
+			objects: []runtime.Object{&appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "cpaas-system", Name: ovnCentralName},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(3))},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			replicas, rendered, err := renderedOvnCentralReplicas(ctx, kubernetesfake.NewSimpleClientset(tt.objects...))
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(replicas).To(Equal(tt.wantReplicas))
+			g.Expect(rendered).To(Equal(tt.wantRendered))
+		})
+	}
+}
+
+func TestRenderedOvnCentralReplicasSurfacesErrors(t *testing.T) {
+	g := NewWithT(t)
+	workloadClient := kubernetesfake.NewSimpleClientset()
+	workloadClient.PrependReactor("get", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("workload cluster is not ready")
+	})
+
+	_, _, err := renderedOvnCentralReplicas(ctx, workloadClient)
+	g.Expect(err).To(MatchError(ContainSubstring("workload cluster is not ready")))
 }
 
 func TestKubeOvnAppReleaseReadiness(t *testing.T) {
