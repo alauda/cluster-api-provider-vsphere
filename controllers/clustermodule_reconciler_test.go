@@ -364,6 +364,36 @@ func TestReconciler_Reconcile(t *testing.T) {
 			},
 		},
 		{
+			name: "when removing a deleted machine deployment cluster module fails",
+			beforeFn: func(client.Object) {
+				tym := metav1.NewTime(time.Now())
+				md.ObjectMeta.DeletionTimestamp = &tym
+				md.ObjectMeta.Finalizers = append(md.ObjectMeta.Finalizers, "keep-this-for-the-test")
+			},
+			clusterModules: []infrav1.ClusterModule{
+				{
+					ControlPlane:     true,
+					TargetObjectName: "kcp",
+					ModuleUUID:       kcpUUID,
+				},
+				{
+					ControlPlane:     false,
+					TargetObjectName: "md",
+					ModuleUUID:       mdUUID,
+				},
+			},
+			haveError: true,
+			setupMocks: func(svc *cmodfake.CMService) {
+				svc.On("DoesExist", mock.Anything, mock.Anything, mock.Anything, kcpUUID).Return(true, nil)
+				svc.On("Remove", mock.Anything, mock.Anything, mdUUID).Return(vCenter500err)
+			},
+			customAssert: func(g *gomega.WithT, clusterCtx *capvcontext.ClusterContext) {
+				g.Expect(clusterCtx.VSphereCluster.Spec.ClusterModules).To(gomega.HaveLen(2))
+				g.Expect(clusterCtx.VSphereCluster.Spec.ClusterModules[1].ModuleUUID).To(gomega.Equal(mdUUID))
+				g.Expect(conditions.Get(clusterCtx.VSphereCluster, infrav1.ClusterModulesAvailableCondition).Message).To(gomega.ContainSubstring(vCenter500err.Error()))
+			},
+		},
+		{
 			name: "when control plane & machine deployment are being deleted & cluster module info is set in object",
 			beforeFn: func(client.Object) {
 				tym := metav1.NewTime(time.Now())

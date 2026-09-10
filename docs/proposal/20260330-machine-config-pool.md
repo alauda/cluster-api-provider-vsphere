@@ -97,8 +97,8 @@ type PersistentDisk struct {
     // StoragePolicy is the vSphere storage policy name.
     StoragePolicy string `json:"storagePolicy,omitempty"`
     
-    // UnitNumber is the SCSI unit number for the disk (0-15, excluding 7).
-    // This ensures consistent disk ordering across VM recreations.
+    // UnitNumber is the last observed SCSI unit number for the disk (0-15,
+    // excluding 7). It is refreshed when the VM is recreated.
     // +optional
     UnitNumber *int32 `json:"unitNumber,omitempty"`
 
@@ -271,7 +271,7 @@ Important semantics:
 - Clearing `status.consumerRef` is rejected while the referenced consumer still exists or while the pool is not fully reusable.
 - User-initiated rebinding from one consumer to another should be rejected unless the pool is already unbound.
 - `spec.configs[*].hostname` should remain immutable after creation.
-- `spec.configs[*].network` and `spec.configs[*].persistentDisks` remain declarative inputs, except for controller-managed backfill fields such as `volumePath`, `diskUUID`, and `unitNumber`.
+- `spec.configs[*].network` and `spec.configs[*].persistentDisks` remain declarative inputs. Persistent disk identity and the latest observed `UnitNumber` are maintained in pool status; they are overlaid onto the in-memory slot for clone and guest configuration.
 
 ## Workflow
 
@@ -344,12 +344,11 @@ When a `VSphereMachine` is created and it references a `VSphereMachineConfigPool
     - If `MountPath` is set: the reconcile script formats the disk (if no filesystem detected) and mounts it. If `WipeFilesystem` is true, the script wipes the directory content on the first boot of a new VM (detected via a marker file on the system disk at `/var/lib/capv/disk-initialized-<name>`). The marker survives reboots and manual service restarts but is absent on a freshly cloned VM, ensuring cleanup only happens once per VM lifecycle.
     - If `MountPath` is empty: the disk is attached and a symlink is created at `/dev/disk/by-capv/<name>`, but no formatting or mounting is performed. This supports raw disk use cases where an external process manages the disk at runtime. On rolling updates, the same VMDK is re-attached and the symlink is recreated.
 - **Persistent disk provisioning**: If `VolumePath` is empty, CAPV creates a new disk and fills `VolumePath`. If not empty, CAPV attaches the existing disk.
-- **Persistent disk discovery and backfill**: After the VM is created, CAPV discovers attached disks using a three-tier matching strategy:
-    1. **VolumePath**: Exact VMDK file path match (globally unique, most reliable, matches against any controller type).
-    2. **UnitNumber**: SCSI unit number match (stable across VM recreations, restricted to SCSI controllers).
-    3. **Capacity**: Disk size match on SCSI controllers (last resort, returns no match if ambiguous).
-    - Tiers 2 and 3 are restricted to SCSI controllers to prevent false matches against OS disks on IDE or SATA controllers.
-    - Discovered `UnitNumber`, `VolumePath`, and `DiskUUID` are backfilled into the machine config pool spec for persistence across VM recreations.
+- **Persistent disk discovery and backfill**: After the VM is created, CAPV identifies attached persistent disks by durable VMDK identity:
+    1. **VolumePath**: Exact VMDK file path match (most reliable, matches against any controller type).
+    2. **Deterministic basename**: When the recorded path is unavailable, match the uniquely generated VMDK basename.
+    - `UnitNumber`, `VolumePath`, and `DiskUUID` are observed device state. `UnitNumber` is refreshed from the current VM hardware and is not an identity fallback or a stable placement constraint.
+    - Persistent disk identity is not inferred from unit number, capacity, or controller type.
 
 ### 2. Rolling Update (maxSurge=0)
 - `MachineDeployment` deletes `Machine-v1`.
@@ -359,6 +358,7 @@ When a `VSphereMachine` is created and it references a `VSphereMachineConfigPool
 - `MachineDeployment` creates `Machine-v2`.
 - `Machine-v2` requests a slot. The controller prefers `Released` slots before `Available` slots, so in a serial rolling update it will typically reuse the first released slot.
 - `Machine-v2` therefore usually reuses the released slot's IP, Hostname, and existing `PersistentDisk` via `VolumePath`, but the current implementation does not guarantee an identity-based match back to a specific previous machine instance.
+- The replacement VM recalculates each data disk's SCSI `UnitNumber` against the new template hardware. The value may change when the template's system disk or controller layout changes; after observation, the current value is written to pool status.
 - On first boot, the guest-side reconcile script processes `WipeFilesystem` for each persistent disk:
     - `false` (default): existing data is preserved. Suitable for disks like `/var/cpaas` and `/var/lib/containerd` where data continuity across rolling updates is desired.
     - `true`: the script detects first boot via a marker file on the system disk (`/var/lib/capv/disk-initialized-<name>`) and wipes the disk content before use. This prevents stale data from blocking guest-side initialization (e.g., kubeadm requires `/var/lib/etcd` to be empty when joining as a new etcd member).
@@ -462,7 +462,7 @@ This should be checked as early as possible in admission, but must also be re-ch
 The original fields in `proposal.go` are largely sufficient but require vSphere-specific adaptations:
 - `DatastoreUrn/Name` -> Simplified to `Datastore` (string) as commonly used in CAPV.
 - `VolumeUrn` -> Replaced with `VolumePath` and `DiskUUID` to align with vSphere's file-based storage and identification.
-- `SequenceNum` -> Renamed to `UnitNumber` to align with vSphere SCSI controller terminology, which is critical for consistent disk ordering.
+- `SequenceNum` -> Renamed to `UnitNumber` to align with vSphere SCSI controller terminology. The field records the latest observed attachment position; it does not guarantee stable ordering across VM recreations.
 - `DVSwitchName/PortGroupName` -> Unified into `NetworkName`, which is the standard CAPV field for both standard and distributed portgroups.
 - `AdditionNic` -> Integrated into `MachineConfigSlot.Network.additional`, with `MachineConfigSlot.Network.primary` representing the kubelet registration NIC.
 
@@ -528,7 +528,7 @@ strategy:
     - The current implementation merges disk metadata into the VM's `guestinfo.userdata` by generating additional cloud-config content.
     - CAPV merges `disk_setup`, `fs_setup`, `mounts`, `write_files`, and helper commands into the VM user-data based on the `PersistentDisk` list.
     - This means the behavior is currently tied to the cloud-config bootstrap format; the document should not imply a generic mount implementation independent of bootstrap format.
-    - **UnitNumber Device Resolution**: `UnitNumber` is used as the durable identifier for resolving data disks inside the guest, but CAPV does not rely on kernel-assigned names like `/dev/sdb` or `/dev/sdc`.
+    - **UnitNumber Device Resolution**: `UnitNumber` is used as the current SCSI address for resolving data disks inside the guest. It is not the durable identity of a persistent VMDK, and CAPV does not rely on kernel-assigned names like `/dev/sdb` or `/dev/sdc`.
     - The guest-side helper scripts resolve disks primarily through `/dev/disk/by-path` (and related symlink discovery) instead of assuming stable `/dev/sdX` names.
 
 | UnitNumber | Guest-side lookup behavior | Note |

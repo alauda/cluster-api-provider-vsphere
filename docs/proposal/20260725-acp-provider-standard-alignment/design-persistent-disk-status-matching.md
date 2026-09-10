@@ -60,13 +60,19 @@ datastore、vCenter 默认 datastore；返回值同时包含名称和 `types.Man
 
 ### 观测(reconcile 第 2 轮,update 路径)
 
-`HydrateSlotFromStatus`(`machineconfigpool.go:565/571`)把 status 里的 VolumePath / UnitNumber 填回内存。
+`HydrateSlotFromStatus`(`machineconfigpool.go:565/571`)把 status 里的 VolumePath / UnitNumber 填回内存。这里的
+`UnitNumber` 只是上一次实际挂载位置的观测值，用于展示和生成 guest 盘表，不是下一次 clone 的 pinned placement；
+新 VM 的模板硬件布局可以覆盖该值。
 `reconcilePersistentDiskStatuses` 随后调用 `findPersistentDiskDevice`：
 
 - status 有 VolumePath → **完整 `backing.FileName` 精确命中**；
 - VolumePath 为空 → 生成确定 basename，按 `path.Base(backing.FileName)` 精确命中；
 - basename 命中多个或没有命中 → 返回 nil，不使用 unit/capacity fallback；
 - 命中后回填 vCenter 返回的完整 VolumePath、DiskUUID、UnitNumber，`ApplyDiskBackfill` 将记录标为 `Attached`。
+
+即使 `VolumePath` / `DiskUUID` 保持不变，重建后的 SCSI controller 或其占用情况也可能使 `UnitNumber` 改变；
+status 应以新 VM 的 vCenter 观测值覆盖旧值。持久盘身份只依赖 `VolumePath`、`DiskUUID` 或确定性 VMDK 名称，
+不依赖该可变寻址位置。
 
 ### 闸门改法(`ApplyDiskBackfill` 持久盘分支)
 

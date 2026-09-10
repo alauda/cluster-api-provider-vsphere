@@ -131,7 +131,7 @@ func (r *clusterReconciler) reconcileWorkloadSystemComponentRepositories(ctx con
 	restConfig, err := r.newRemoteRestConfig(ctx, cluster)
 	if err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "Skipping workload system component reconcile because workload cluster client is unavailable")
-		return reconcile.Result{RequeueAfter: systemComponentRequeueAfter}, nil
+		return reconcile.Result{}, err
 	}
 	remoteClient, err := client.New(restConfig, client.Options{Scheme: r.Client.Scheme()})
 	if err != nil {

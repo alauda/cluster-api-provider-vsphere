@@ -1295,12 +1295,20 @@ func capvDiskPath(name string) string {
 // trusted verbatim (it originates from vSphere and is already used unguarded
 // elsewhere).
 //
+// An optional clusterName prefixes the parent directory to avoid collisions
+// between clusters that reuse the same slot hostname and IP. The optional form
+// preserves the legacy four-argument behavior for callers that do not have a
+// cluster identity.
+//
 // Returns "" when a required input (hostname, datastore, diskName) is empty.
 // An empty primaryIP is valid for DHCP slots and produces a stable hostname-disk name.
-func DeterministicDiskPath(hostname, primaryIP, datastore, diskName string) string {
+func DeterministicDiskPath(hostname, primaryIP, datastore, diskName string, clusterNames ...string) string {
 	ds := strings.TrimSpace(datastore)
 	host := strings.TrimSpace(hostname)
 	ip := strings.TrimSpace(primaryIP)
+	if parsed, _, err := net.ParseCIDR(ip); err == nil {
+		ip = parsed.String()
+	}
 	if ds == "" || host == "" || strings.TrimSpace(diskName) == "" {
 		return ""
 	}
@@ -1308,7 +1316,11 @@ func DeterministicDiskPath(hostname, primaryIP, datastore, diskName string) stri
 	if ip != "" {
 		identity += "-" + ip
 	}
-	return DatastorePrefix(ds) + " " + identity + "/" + DeterministicDiskName(host, ip, diskName) + ".vmdk"
+	directory := identity
+	if len(clusterNames) > 0 && strings.TrimSpace(clusterNames[0]) != "" {
+		directory = strings.TrimSpace(clusterNames[0]) + "-" + identity
+	}
+	return DatastorePrefix(ds) + " " + directory + "/" + DeterministicDiskName(host, ip, diskName) + ".vmdk"
 }
 
 // PrimarySlotIP returns the configured primary address used for deterministic
@@ -1319,9 +1331,16 @@ func PrimarySlotIP(network *infrav1.MachineConfigSlotNetwork) string {
 		return ""
 	}
 	if ip := strings.TrimSpace(network.Primary.IP); ip != "" {
+		if host, _, err := net.ParseCIDR(ip); err == nil {
+			return host.String()
+		}
 		return ip
 	}
-	return strings.TrimSpace(network.Primary.IPv6)
+	ipv6 := strings.TrimSpace(network.Primary.IPv6)
+	if host, _, err := net.ParseCIDR(ipv6); err == nil {
+		return host.String()
+	}
+	return ipv6
 }
 
 // DatastorePrefix returns the "[datastore]" token that opens a datastore path, or

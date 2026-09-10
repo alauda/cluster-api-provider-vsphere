@@ -729,11 +729,17 @@ Old behavior:
 
 Fixed behavior:
 
-- If the primary disk controller is already SCSI, keep using it.
-- If the primary disk controller is not SCSI, search the VM hardware for an
-  existing SCSI controller and use that for data disks.
-- If no SCSI controller exists, fail early with a clear CAPV error instead of
-  a vSphere task failure.
+- The upgrade template in the current incident has one SCSI controller, and
+  the system disk already occupies SCSI unit `0` on it. CAPV selects that
+  existing SCSI controller for data disks.
+- Before submitting the clone, CAPV scans the template's currently occupied
+  units and assigns each new data disk an available unit. The previous VM's
+  observed unit `0` is not a placement constraint.
+- The current failure message (`unit number 0 is already in use`) is returned
+  from `createDataDisks` before `tpl.Clone` submits a vCenter clone task, so no
+  target VM is created.
+- If no SCSI controller exists, CAPV fails early with a clear error instead of
+  submitting an invalid vSphere task.
 
 ## Code Touchpoints
 

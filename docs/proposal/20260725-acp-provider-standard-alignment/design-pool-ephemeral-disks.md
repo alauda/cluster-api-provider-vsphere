@@ -15,7 +15,7 @@ reconcile 脚本，仅在「如何认盘」与「生命周期」两处不同。
 非持久盘与持久盘共用同一套建盘 / 并盘 / 盘表 / guest 挂载代码，两点不同：
 
 1. **认盘机制不同**：持久盘按记录的 vmdk 真实路径匹配，路径为空时按确定 basename 匹配；非持久盘恒新建、不记录 VolumePath，靠 clone
-   分配并落到 `status.ephemeralDiskStatuses` 的 **SCSI unit** 跨 reconcile 匹配。两条机制彼此独立。
+   分配并落到 `status.ephemeralDiskStatuses` 的 **SCSI unit** 记录当前 guest 寻址位置。unit 在 VM 重建时可变化，不承担持久身份匹配。两条机制彼此独立。
 2. **生命周期不同**：持久盘销毁 VM 时先 detach 保留、可跨 VM 重挂、参与 reclaim 与释放门禁；非持久盘随 VM 一起
    删除、每次新建空盘、不 reclaim。
 
@@ -57,8 +57,8 @@ status 的唯一理由**。
 观测（clone 后同轮 `ApplyDiskBackfill`）：`ed.UnitNumber` 已知则 upsert 到 `status.ephemeralDiskStatuses`（无
 VolumePath 门禁）。
 
-hydrate（后续每轮 `HydrateSlotFromStatus`）：从 `ephemeralDiskStatuses` 读回 unit 到内存 slot 的
-`ed.UnitNumber`（作 clone 的 pinned unit 与盘表的 unit 来源）。
+hydrate（后续每轮 `HydrateSlotFromStatus`）：从 `ephemeralDiskStatuses` 读回最近观测的 unit 到内存 slot 的
+`ed.UnitNumber`，供 guest 盘表使用；下一次 clone 会根据模板当前占用重新分配，不会把该值作为 pinned unit。
 
 盘表（`GetPersistentDiskCloudConfig`）：持久盘、非持久盘归一为同一写循环产出 `/etc/capv/persistent-disks.tsv`；
 非持久盘行 DiskUUID 列留空、wipe 恒 false。guest 侧 `blkid` 探测空盘则 `mkfs` 挂载。
@@ -79,13 +79,12 @@ hydrate（后续每轮 `HydrateSlotFromStatus`）：从 `ephemeralDiskStatuses` 
 
 **clone（`pkg/services/govmomi/vcenter/clone.go: createDataDisks`）**
 - 按 name 同时匹配 `PersistentDisks` / `EphemeralDisks`（name 全局唯一）。命中非持久盘：`backing.FileName` =
-  `datastoreFileHint(slotDatastore)`（经 `util.DatastorePrefix`，评审 #7），恒 `FileOperationCreate`，unit 用
-  hydrate 回来的 `ed.UnitNumber`（有则 `markUsed`）或 `assign()`（无则分配后回填 `ed.UnitNumber`）。持久盘
-  pinned/observed unit 先 `markUsed`、非持久盘后 `assign`，不冲突。
+  `datastoreFileHint(slotDatastore)`（经 `util.DatastorePrefix`，评审 #7），恒 `FileOperationCreate`，每次 clone 都根据
+  模板当前设备占用调用 `assign()`，不复用 hydrate 回来的旧 unit。持久盘与非持久盘按本轮分配顺序取得不同 unit。
 
 **观测 / hydrate（`pkg/services/machineconfigpool.go`）**
 - `ApplyDiskBackfill`：非持久盘 `ed.UnitNumber != nil` 时 upsert 到 `ephemeralDiskStatuses`（无 VolumePath 门禁）。
-- `HydrateSlotFromStatus`：从 `ephemeralDiskStatuses` 读回 unit 到 `ed.UnitNumber`。
+- `HydrateSlotFromStatus`：从 `ephemeralDiskStatuses` 读回最近观测的 unit 到 `ed.UnitNumber`，仅用于展示和 guest 盘表。
 
 **校验（并入 P1-3，`ValidateSlotFields`）**
 - name / mountPath 唯一性、sizeGiB≥1 跨持久盘与非持久盘同一命名空间校验。非持久盘无 spec unit，跨两类不冲突由

@@ -88,15 +88,15 @@ P2-2（govmomi 控制面 LB/VIP）已暂缓，其用例见 [self-built LB 测试
 
 **步骤**（逐条提交非法对象，记录拒绝方与错误信息）：
 1. CRD 层：`configs` 为空数组；`sizeGiB=0`；`unitNumber=-1`、`16`、`7`。
-2. webhook 池内唯一：重复 hostname；重复 primary IP/IPv6；重复的数据盘 name / unitNumber / mountPath（持久与非持久盘跨两类去重）。
-3. webhook immutable：修改 `status.configStatuses` 中已分配（InUse/Released）槽位的 hostname、IP、盘 sizeGiB、unitNumber；删除该槽位条目；作为对照，修改未分配槽位的同名字段。
+2. webhook 池内唯一：重复 hostname；重复 primary IP/IPv6；重复的数据盘 name / mountPath（持久与非持久盘跨两类去重）。同一槽位内允许声明相同的 `unitNumber`，因为实际挂载时由 controller 根据模板设备占用重新分配。
+3. webhook immutable：修改 `status.configStatuses` 中已分配（InUse/Released）槽位的 hostname、IP、盘 sizeGiB；删除该槽位条目；作为对照，修改未分配槽位的同名字段。另验证已分配槽位修改 `unitNumber` 可以通过。
 4. webhook 跨池唯一：同 namespace 同 `clusterRef` 的另一个池写入重复 hostname/IP。
 5. 网络存在性：填一个格式合法但不存在的网络名。
 
 **预期**：
 - 步骤 1 由 apiserver（schema 与 CEL）拒绝，错误来自 CRD 而非 webhook。
 - 步骤 2、4 由 webhook 拒绝，错误信息带首个冲突方的位置。
-- 步骤 3 中已分配槽位的修改与删除被拒绝，未分配槽位的修改通过。
+- 步骤 3 中已分配槽位的 hostname、IP、盘 sizeGiB 修改与删除被拒绝，未分配槽位的修改通过；已分配槽位的 `unitNumber` 修改通过。
 - 步骤 5 写入通过，reconcile 期落 `MembersValid=False`/`NetworkNotFound`（见 TC-CAPV-ACP-02）。
 - `make manifests` 后 CRD 含新 marker，且已同步交付仓库 chart。
 
@@ -154,7 +154,7 @@ P2-2（govmomi 控制面 LB/VIP）已暂缓，其用例见 [self-built LB 测试
 
 **目标**：验证 `ephemeralDisks` 随 VM 创建/删除，按 unit 认盘，不进入 reclaim 与槽位释放门禁。
 
-**前置**：一个槽位同时声明持久盘与非持久盘（不同 name / unitNumber / mountPath），非持久盘声明 `sizeGiB`、`mountPath`、`fsFormat`。
+**前置**：一个槽位同时声明持久盘与非持久盘（不同 name / mountPath），非持久盘声明 `sizeGiB`、`mountPath`、`fsFormat`。不要求为槽位预先声明固定 `unitNumber`；若声明该字段，仅作为当前观测值。
 
 **步骤**：
 1. 创建引用该槽位的机器，等待 Ready。
@@ -162,14 +162,14 @@ P2-2（govmomi 控制面 LB/VIP）已暂缓，其用例见 [self-built LB 测试
 3. 在非持久盘上写一个哨兵文件，重启节点（VM 级 reboot）。
 4. 检查 pool `status.ephemeralDiskStatuses` 中该盘的 SCSI unit 是否与 vCenter 实际一致。
 5. 删除机器，检查 vCenter 上非持久盘是否随 VM 一并删除、槽位是否直接释放。
-6. 触发滚动升级重建同一槽位的机器，检查新盘。
+6. 触发滚动升级重建同一槽位的机器，检查新盘及重新分配的 unit。
 
 **预期**：
 - 非持久盘随 clone 创建、格式化并按 `LABEL=` 挂载到声明的 `mountPath`。
 - 步骤 3 重启后哨兵文件仍在（不重刷格式化）。
-- 步骤 4 中 unit 与 vCenter 一致，且与持久盘 unit 不冲突。
+- 步骤 4 中 `status.ephemeralDiskStatuses[].unitNumber` 与 vCenter 当前实际值一致，且与持久盘 unit 不冲突。
 - 步骤 5 中盘随 VM 删除，不产生 reclaim 记录，槽位释放不被该盘阻塞。
-- 步骤 6 重建出的是空盘（哨兵文件消失），持久盘则被认回。
+- 步骤 6 重建出的是空盘（哨兵文件消失），ephemeral unit 允许变化但 status 必须更新为新 VM 的实际值；持久盘的 `VolumePath` / `DiskUUID` 保持不变，unit 允许变化且盘仍被认回。
 - 存量 pool 无 `ephemeralDisks` 字段时行为不变，`PersistentDisksReady` 语义不变。
 
 **清理**：删除测试机器与池。

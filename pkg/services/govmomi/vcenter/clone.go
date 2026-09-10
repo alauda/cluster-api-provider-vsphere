@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"path"
 	"time"
 
 	"github.com/pkg/errors"
@@ -31,6 +32,7 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -162,6 +164,9 @@ func Clone(ctx context.Context, vmCtx *capvcontext.VMContext, bootstrapData []by
 
 	effectiveDatastore, err := resolveEffectiveDatastore(ctx, vmCtx, pool)
 	if err != nil {
+		return err
+	}
+	if err := ensurePersistentDiskDirectories(ctx, vmCtx, effectiveDatastore); err != nil {
 		return err
 	}
 
@@ -376,6 +381,73 @@ func resolveEffectiveDatastore(ctx context.Context, vmCtx *capvcontext.VMContext
 	return &effectiveDatastore{Name: name, Ref: *datastoreRef}, nil
 }
 
+// ensurePersistentDiskDirectories creates the parent directories used by fresh
+// persistent disks before the asynchronous CloneVM task is submitted. FileOperationCreate
+// creates a VMDK but does not recursively create its parent directory.
+func ensurePersistentDiskDirectories(ctx context.Context, vmCtx *capvcontext.VMContext, effective *effectiveDatastore) error {
+	if vmCtx == nil || vmCtx.Session == nil || vmCtx.MachineConfigSlot == nil || effective == nil {
+		return nil
+	}
+
+	directories := map[string]struct{}{}
+	hostname := vmCtx.MachineConfigSlot.Hostname
+	primaryIP := util.PrimarySlotIP(vmCtx.MachineConfigSlot.Network)
+	clusterName := vmCtx.VSphereVM.Labels[clusterv1.ClusterNameLabel]
+	for _, pd := range vmCtx.MachineConfigSlot.PersistentDisks {
+		if pd.VolumePath != "" {
+			continue
+		}
+		datastoreName := pd.Datastore
+		if datastoreName == "" && pd.StoragePolicy != "" {
+			// A disk-level policy chooses the datastore; its deterministic basename
+			// is created under the VM directory and needs no custom directory.
+			continue
+		}
+		if datastoreName == "" {
+			datastoreName = effective.Name
+		}
+		diskPath := util.DeterministicDiskPath(hostname, primaryIP, datastoreName, pd.Name, clusterName)
+		if diskPath == "" {
+			continue
+		}
+		var datastorePath object.DatastorePath
+		if !datastorePath.FromString(diskPath) {
+			return errors.Errorf("invalid deterministic persistent disk path %q", diskPath)
+		}
+		datastorePath.Path = path.Dir(datastorePath.Path)
+		directories[datastorePath.String()] = struct{}{}
+	}
+	if len(directories) == 0 {
+		return nil
+	}
+
+	dc, err := vmCtx.Session.Finder.DatacenterOrDefault(ctx, vmCtx.VSphereVM.Spec.Datacenter)
+	if err != nil {
+		return errors.Wrap(err, "failed to find datacenter for persistent disk directory creation")
+	}
+	fileManager := object.NewFileManager(vmCtx.Session.Client.Client)
+	for directory := range directories {
+		if err := fileManager.MakeDirectory(ctx, directory, dc, true); err == nil {
+			continue
+		} else {
+			// MakeDirectory reports an already-existing directory as an error. Verify
+			// it exists before treating that race as success.
+			var datastorePath object.DatastorePath
+			if !datastorePath.FromString(directory) {
+				return errors.Wrapf(err, "failed to create persistent disk directory %q", directory)
+			}
+			datastore, statErr := vmCtx.Session.Finder.Datastore(ctx, datastorePath.Datastore)
+			if statErr != nil {
+				return errors.Wrapf(err, "failed to create persistent disk directory %q", directory)
+			}
+			if _, statErr = datastore.Stat(ctx, datastorePath.Path); statErr != nil {
+				return errors.Wrapf(err, "failed to create persistent disk directory %q", directory)
+			}
+		}
+	}
+	return nil
+}
+
 func newVMFlagInfo() *types.VirtualMachineFlagInfo {
 	diskUUIDEnabled := true
 	return &types.VirtualMachineFlagInfo{
@@ -491,7 +563,7 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 		// ADDITION: Check for a slot-managed disk (persistent or ephemeral) in the
 		// MachineConfigSlot. Disk names are unique across both lists, so a data
 		// disk matches at most one of them. Persistent disks may carry a
-		// backfilled VolumePath (reuse an existing vmdk) and a pinned/observed
+		// backfilled VolumePath (reuse an existing vmdk) and an observed
 		// UnitNumber; ephemeral disks never have a VolumePath (always created
 		// fresh) but do carry a controller-observed UnitNumber hydrated from
 		// status. slotDisk captures the placement/unit shared by both.
@@ -514,15 +586,14 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 			}
 		}
 
-		// Placement/unit shared by both disk kinds. VolumePath stays empty for
+		// Placement shared by both disk kinds. VolumePath stays empty for
 		// ephemeral disks, forcing a fresh create below.
 		var slotDatastore, slotStoragePolicy, slotVolumePath string
-		var slotPinnedUnit *int32
 		switch {
 		case pd != nil:
-			slotDatastore, slotStoragePolicy, slotVolumePath, slotPinnedUnit = pd.Datastore, pd.StoragePolicy, pd.VolumePath, pd.UnitNumber
+			slotDatastore, slotStoragePolicy, slotVolumePath = pd.Datastore, pd.StoragePolicy, pd.VolumePath
 		case ed != nil:
-			slotDatastore, slotStoragePolicy, slotPinnedUnit = ed.Datastore, ed.StoragePolicy, ed.UnitNumber
+			slotDatastore, slotStoragePolicy = ed.Datastore, ed.StoragePolicy
 		}
 		if slotDatastore == "" && slotStoragePolicy == "" && effective != nil {
 			slotDatastore = effective.Name
@@ -542,8 +613,9 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 			backing.FileName = slotVolumePath
 		case pd != nil && slotDatastore != "":
 			// Fresh persistent disk on a known datastore: name the vmdk
-			// deterministically and record it on the slot so status carries a Tier-1
-			// VolumePath from the moment of clone, instead of relying on vCenter's
+			// deterministically and record it on the slot as a provisional Tier-1
+			// identity. The pool status remains Creating until observation verifies
+			// that vCenter created the backing, instead of relying on vCenter's
 			// auto-generated name and a later identity guess. DeterministicDiskName
 			// sanitizes/hashes any disk name (it never rejects), so even an unsafe or
 			// over-long name yields a stable, unique path rather than falling back to an
@@ -552,7 +624,8 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 			// time.
 			hostname := vmCtx.MachineConfigSlot.Hostname
 			primaryIP := util.PrimarySlotIP(vmCtx.MachineConfigSlot.Network)
-			path := util.DeterministicDiskPath(hostname, primaryIP, slotDatastore, dataDisk.Name)
+			clusterName := vmCtx.VSphereVM.Labels[clusterv1.ClusterNameLabel]
+			path := util.DeterministicDiskPath(hostname, primaryIP, slotDatastore, dataDisk.Name, clusterName)
 			backing.FileName = path
 			pd.VolumePath = path
 		case pd != nil && slotStoragePolicy != "":
@@ -597,27 +670,19 @@ func createDataDisks(ctx context.Context, vmCtx *capvcontext.VMContext, devices 
 		vd := dev.GetVirtualDevice()
 		vd.ControllerKey = controllerKey
 
-		// Assign unit number, favoring a pinned (persistent spec) or observed
-		// (persistent/ephemeral status) unit if provided; otherwise assign a free
-		// unit and backfill it onto the matched slot disk so it persists to status
-		// and stays stable across VM recreations.
-		var unitNumber int32
-		if slotPinnedUnit != nil {
-			unitNumber = *slotPinnedUnit
-			if err := unitNumberAssigner.markUsed(unitNumber); err != nil {
-				return nil, errors.Wrapf(err, "invalid unit number for data disk %q", dataDisk.Name)
-			}
-		} else {
-			unitNumber, err = unitNumberAssigner.assign()
-			if err != nil {
-				return nil, err
-			}
-			switch {
-			case pd != nil:
-				pd.UnitNumber = &unitNumber
-			case ed != nil:
-				ed.UnitNumber = &unitNumber
-			}
+		// UnitNumber is an observation of the current VM layout, not a stable
+		// disk identity or a placement constraint. Reassign it from the template's
+		// currently occupied slots on every rebuild, then persist the new value
+		// after the VM is successfully observed.
+		unitNumber, err := unitNumberAssigner.assign()
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case pd != nil:
+			pd.UnitNumber = &unitNumber
+		case ed != nil:
+			ed.UnitNumber = &unitNumber
 		}
 		vd.UnitNumber = &unitNumber
 

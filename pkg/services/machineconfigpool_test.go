@@ -879,6 +879,25 @@ func TestApplyDiskBackfill(t *testing.T) {
 		g.Expect(rec.VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
 	})
 
+	t.Run("does not mark an unverified expected path as Attached", func(t *testing.T) {
+		g := NewWithT(t)
+		pool := newPool(infrav1.PersistentDisk{Name: "disk-a", SizeGiB: 20})
+		updated := ApplyDiskBackfill(pool, &infrav1.MachineConfigSlot{
+			Hostname: "host-1",
+			PersistentDisks: []infrav1.PersistentDisk{
+				// createDataDisks sets the expected path before CloneVM completes;
+				// no UUID means the backing has not been observed yet.
+				{Name: "disk-a", SizeGiB: 20, VolumePath: "[ds] host-1/disk-a.vmdk", UnitNumber: int32Ptr(2)},
+			},
+		}, "machine-1", "machine-1-uid")
+		g.Expect(updated).To(BeTrue())
+		rec, _ := infrav1.FindDiskStatus(pool, "host-1", "disk-a")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseCreating))
+		g.Expect(rec.VolumePath).To(BeEmpty())
+		g.Expect(rec.DiskUUID).To(BeEmpty())
+	})
+
 	t.Run("does not downgrade an active disk to Creating", func(t *testing.T) {
 		g := NewWithT(t)
 		for _, phase := range []infrav1.PersistentDiskPhase{
@@ -1080,7 +1099,7 @@ func TestValidateSlotFields(t *testing.T) {
 		g.Expect(errs).To(HaveLen(3)) // sizeGiB<1, unit 7 reserved, unit 16 out of range
 	})
 
-	t.Run("flags intra-slot duplicate name unit and mountPath", func(t *testing.T) {
+	t.Run("flags intra-slot duplicate name and mountPath", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := &infrav1.VSphereMachineConfigPool{
 			Spec: infrav1.VSphereMachineConfigPoolSpec{
@@ -1095,7 +1114,7 @@ func TestValidateSlotFields(t *testing.T) {
 			},
 		}
 		errs := ValidateSlotFields(pool)
-		g.Expect(errs).To(HaveLen(3)) // duplicate name, unitNumber, mountPath
+		g.Expect(errs).To(HaveLen(2)) // duplicate name, mountPath
 	})
 
 	t.Run("flags normalized duplicate mountPath", func(t *testing.T) {
@@ -1310,7 +1329,7 @@ func TestValidateAllocatedSlotsImmutable(t *testing.T) {
 		g.Expect(errs[0].Detail).To(ContainSubstring("cannot remove allocated slot"))
 	})
 
-	t.Run("rejects changing IP, disk size, mountPath and unit number", func(t *testing.T) {
+	t.Run("rejects changing IP, disk size and mountPath but allows unit number", func(t *testing.T) {
 		g := NewWithT(t)
 		oldPool := allocatedPool()
 		newPool := oldPool.DeepCopy()
@@ -1319,7 +1338,7 @@ func TestValidateAllocatedSlotsImmutable(t *testing.T) {
 		newPool.Spec.Configs[0].PersistentDisks[0].MountPath = "/other"
 		newPool.Spec.Configs[0].PersistentDisks[0].UnitNumber = int32Ptr(3)
 		errs := ValidateAllocatedSlotsImmutable(oldPool, newPool)
-		g.Expect(errs).To(HaveLen(4))
+		g.Expect(errs).To(HaveLen(3))
 	})
 
 	t.Run("rejects removing an allocated disk", func(t *testing.T) {
@@ -1398,7 +1417,7 @@ func TestHydrateSlotFromStatus(t *testing.T) {
 		g.Expect(*slot.PersistentDisks[0].UnitNumber).To(Equal(int32(2)))
 	})
 
-	t.Run("explicit spec UnitNumber is preserved, other observed values still overlaid", func(t *testing.T) {
+	t.Run("observed UnitNumber overlays spec value", func(t *testing.T) {
 		g := NewWithT(t)
 		pool := poolWith(infrav1.PersistentDiskStatus{
 			Hostname: "host-1", Name: "disk-a",
@@ -1409,7 +1428,7 @@ func TestHydrateSlotFromStatus(t *testing.T) {
 			PersistentDisks: []infrav1.PersistentDisk{{Name: "disk-a", SizeGiB: 20, UnitNumber: toInt32Ptr(3)}},
 		}
 		HydrateSlotFromStatus(pool, slot)
-		g.Expect(*slot.PersistentDisks[0].UnitNumber).To(Equal(int32(3)), "pinned spec unit number wins")
+		g.Expect(*slot.PersistentDisks[0].UnitNumber).To(Equal(int32(9)), "latest observed unit number wins")
 		g.Expect(slot.PersistentDisks[0].VolumePath).To(Equal("[ds] vm/disk-a.vmdk"))
 	})
 

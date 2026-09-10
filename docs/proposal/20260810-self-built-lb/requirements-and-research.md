@@ -180,7 +180,7 @@ vSphere 侧需要新增的能力：
 
 - 新增 `spec.controlPlaneLoadBalancer` 字段与 `VSphereCluster` 校验 webhook（本仓目前没有 `VSphereCluster` webhook，只有 `VSphereClusterTemplate`）。
 - 在 `reconcileBootstrapUserData()` 注入 bootstrap 临时 VIP。
-- 在 `reconcileNormal()` 接入 `ensureSelfBuiltLB`：前置对象校验、版本解析、minfo create/patch、readiness gate、VIP probe、kube-proxy IPVS 配置。
+- 在 `reconcileNormal()` 接入 `ensureSelfBuiltLB`：前置对象校验、版本解析、minfo create、readiness gate、VIP probe、kube-proxy IPVS 配置；已存在 minfo 的版本和配置由平台管理。
 - 新增 `SelfBuiltLoadBalancerReady` condition（v1beta1 与 v1beta2 两套）。
 - 管理集群 RBAC：`moduleinfoes`、`moduleplugins`、`moduleconfigs`、`clustermodules`、platform Cluster、clusterregistry Cluster。
 
