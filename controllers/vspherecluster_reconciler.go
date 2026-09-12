@@ -19,10 +19,14 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	pkgerrors "github.com/pkg/errors"
@@ -62,6 +66,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
 	infrautilv1 "sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util/ovn"
 )
 
 const clusterRequeueAfter = 30 * time.Second
@@ -78,6 +83,27 @@ func requeueAfterSuccessfulReconcile(result reconcile.Result, err error, paused 
 	}
 	return result
 }
+
+const (
+	// ovnCentralName names the Deployment, in ovn.CentralNamespace, that the
+	// kube-ovn chart renders the OVN raft members into. The chart is not part of
+	// this repository and the AppRelease does not report what it rendered, so
+	// this is an observed value rather than a contract.
+	ovnCentralName = "ovn-central"
+
+	// kubeOvnRenderRevisionHashLength only has to tell one control plane from
+	// another on the same cluster.
+	kubeOvnRenderRevisionHashLength = 8
+
+	// kubeOvnRenderAttemptAnnotation records, on the AppRelease itself, when a
+	// short render was last counted up.
+	kubeOvnRenderAttemptAnnotation = "cpaas.io/kube-ovn-render-attempt"
+
+	// kubeOvnRenderBackoffBase and kubeOvnRenderBackoffMax bound how often a
+	// render that keeps coming back short is rendered again.
+	kubeOvnRenderBackoffBase = 30 * time.Second
+	kubeOvnRenderBackoffMax  = 30 * time.Minute
+)
 
 var (
 	modulePluginGVK = schema.GroupVersionKind{
@@ -490,7 +516,7 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{}, err
 	}
 
-	appRelease := buildKubeOvnAppRelease(cluster, registry, chartName, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets, controlPlaneNodes)
+	appRelease := buildKubeOvnAppRelease(cluster, registry, chartName, targetVersion, podCIDR, serviceCIDR, joinCIDR, chartPullSecret, imagePullSecrets, nodeNames(controlPlaneNodes))
 	dc, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		msg := "failed to create dynamic client for workload cluster"
@@ -514,15 +540,101 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 		return reconcile.Result{}, pkgerrors.Wrap(err, msg)
 	}
 
+	// The chart renders ovn-central from the control plane Nodes it can see, so a
+	// render that landed while a rolled Node was missing comes back with a raft
+	// one member short, and nothing in the AppRelease spec says so: the
+	// replacement Machine rejoins under the same Node name and the same IP, so
+	// everything the spec carries compares equal and the chart is never rendered
+	// again. While the raft is short, write renderRevision, which is what turns
+	// the next reconcile into a real spec update and renders the chart again.
+	//
+	// The revision is <control plane hash>-<retries>. The hash is over the Node
+	// UIDs, which a replacement Machine does change, so a render that keeps
+	// coming back short for the same control plane counts up and waits longer
+	// each time - up to kubeOvnRenderBackoffMax, because the counts compared here
+	// are read across a chart this repository does not own and a difference no
+	// re-render can close must not cost a render per reconcile - while a control
+	// plane that has changed since starts over and is retried straight away.
+	shortRender := ""
+	renderBackoff := time.Duration(0)
+	holdOff := time.Duration(0)
+	countedUp := false
+	renderRevision := kubeOvnRenderRevision(current)
+	stale, _, err := appReleaseStale(current, "kube-ovn")
+	if err != nil {
+		r.setReadinessUnknown(clusterCtx.VSphereCluster, kubeOvnAppReleaseConditionSpec, err)
+		return reconcile.Result{}, err
+	}
+	if !stale {
+		ovnCentralReplicas, rendered, err := renderedOvnCentralReplicas(ctx, clientset)
+		if err != nil {
+			r.setReadinessUnknown(clusterCtx.VSphereCluster, kubeOvnAppReleaseConditionSpec, err)
+			return reconcile.Result{}, err
+		}
+		if rendered && ovnCentralReplicas < int32(len(controlPlaneNodes)) {
+			shortRender = fmt.Sprintf("ovn-central is rendered with %d of the %d registered control plane Nodes", ovnCentralReplicas, len(controlPlaneNodes))
+			controlPlaneHash := controlPlaneRenderHash(controlPlaneNodes)
+			renderedFrom, renderAttempts := parseKubeOvnRenderRevision(renderRevision)
+			if renderedFrom != controlPlaneHash {
+				renderRevision = formatKubeOvnRenderRevision(controlPlaneHash, 0)
+				countedUp = true
+			} else {
+				renderBackoff = kubeOvnRenderBackoff(renderAttempts)
+				// Measured from what the AppRelease records, not from the requeue
+				// below: a requeue bounds how late the next reconcile is, not how
+				// early, and the objects this controller watches wake it sooner.
+				//
+				// A recorded time in the future means the clock moved backwards
+				// between the write and this read - another controller process, a
+				// corrected clock, a resumed VM. Reading that as long enough ago
+				// would count up on every reconcile for as long as the clock is
+				// behind, which is the render per reconcile this backoff exists to
+				// stop, so it waits the full backoff instead.
+				elapsed := max(time.Since(kubeOvnRenderAttemptTime(current)), 0)
+				if elapsed < renderBackoff {
+					holdOff = renderBackoff - elapsed
+				} else {
+					renderRevision = formatKubeOvnRenderRevision(controlPlaneHash, renderAttempts+1)
+					countedUp = true
+				}
+			}
+		}
+	}
+	setKubeOvnRenderRevision(appRelease, renderRevision)
+
 	if !reflect.DeepEqual(current.Object["spec"], appRelease.Object["spec"]) {
 		current.Object["spec"] = appRelease.Object["spec"]
+		setKubeOvnRenderAttemptTime(current, time.Now(), countedUp)
 		_, err = dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Update(ctx, current, metav1.UpdateOptions{})
 		if err != nil {
 			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseNotReadyReason, clusterv1.ConditionSeverityWarning, err.Error())
 			return reconcile.Result{}, pkgerrors.Wrap(err, "failed to update kube-ovn AppRelease")
 		}
-		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, "updated kube-ovn AppRelease, waiting for it to sync and become healthy")
+		message := "updated kube-ovn AppRelease, waiting for it to sync and become healthy"
+		if shortRender != "" {
+			message = fmt.Sprintf("%s, rendering kube-ovn again", shortRender)
+			ctrl.LoggerFrom(ctx).Info(message, "renderRevision", renderRevision)
+		}
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, message)
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if holdOff > 0 {
+		// Warn once the backoff has grown to its bound: by then re-rendering has
+		// stopped being a fix and someone has to look. The message carries the
+		// backoff and not the time left, because a message that changes every
+		// reconcile is a status patch every reconcile, and this controller
+		// watches what it patches.
+		severity := clusterv1.ConditionSeverityInfo
+		if renderBackoff >= kubeOvnRenderBackoffMax {
+			severity = clusterv1.ConditionSeverityWarning
+		}
+		message := fmt.Sprintf("%s, rendering kube-ovn again in at most %s", shortRender, renderBackoff)
+		ctrl.LoggerFrom(ctx).V(4).Info(message, "renderRevision", renderRevision, "holdOff", holdOff)
+		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseNotReadyReason, severity, message)
+		// Zero so the rest of the cluster keeps reconciling: the wait is held by
+		// the recorded count-up time, not by this requeue.
+		return reconcile.Result{}, nil
 	}
 
 	readiness := kubeOvnAppReleaseReadiness(current)
@@ -763,11 +875,11 @@ func conditionString(condition map[string]any, field string) (string, error) {
 	return valueString, nil
 }
 
-// controlPlaneNodesRegistered lists the workload cluster's control plane Node
-// names and reports whether the whole expected set has registered. Callers that
-// need a complete view of the control plane (kube-ovn, the self-built load
-// balancer) use it to hold off until then.
-func (r *clusterReconciler) controlPlaneNodesRegistered(ctx context.Context, cluster *clusterv1.Cluster, workloadClient kubernetes.Interface) ([]string, bool, error) {
+// controlPlaneNodesRegistered lists the workload cluster's control plane Nodes,
+// ordered by name, and reports whether the whole expected set has registered.
+// Callers that need a complete view of the control plane (kube-ovn, the
+// self-built load balancer) use it to hold off until then.
+func (r *clusterReconciler) controlPlaneNodesRegistered(ctx context.Context, cluster *clusterv1.Cluster, workloadClient kubernetes.Interface) ([]corev1.Node, bool, error) {
 	log := ctrl.LoggerFrom(ctx)
 	if cluster.Spec.ControlPlaneRef == nil || cluster.Spec.ControlPlaneRef.Kind != kubeadmControlPlaneKind || cluster.Spec.ControlPlaneRef.APIVersion != controlplanev1.GroupVersion.String() {
 		return nil, true, nil
@@ -783,11 +895,10 @@ func (r *clusterReconciler) controlPlaneNodesRegistered(ctx context.Context, clu
 		return nil, false, pkgerrors.Wrap(err, "failed to list control plane Nodes")
 	}
 
-	controlPlaneNodes := make([]string, 0, len(nodes.Items))
-	for _, node := range nodes.Items {
-		controlPlaneNodes = append(controlPlaneNodes, node.Name)
-	}
-	sort.Strings(controlPlaneNodes)
+	controlPlaneNodes := nodes.Items
+	sort.Slice(controlPlaneNodes, func(i, j int) bool {
+		return controlPlaneNodes[i].Name < controlPlaneNodes[j].Name
+	})
 
 	kcp, err := r.kubeadmControlPlaneForCluster(ctx, cluster)
 	if err != nil {
@@ -810,6 +921,139 @@ func (r *clusterReconciler) controlPlaneNodesRegistered(ctx context.Context, clu
 		return controlPlaneNodes, false, nil
 	}
 	return controlPlaneNodes, true, nil
+}
+
+// nodeNames names the Nodes, for the callers that identify the control plane by
+// name rather than by identity.
+func nodeNames(controlPlaneNodes []corev1.Node) []string {
+	names := make([]string, 0, len(controlPlaneNodes))
+	for _, node := range controlPlaneNodes {
+		names = append(names, node.Name)
+	}
+	return names
+}
+
+// kubeOvnRenderRevision reads what the AppRelease says its last render was
+// produced from. Anything unreadable reads as unset, which renders again.
+func kubeOvnRenderRevision(appRelease *unstructured.Unstructured) string {
+	revision, _, err := unstructured.NestedString(appRelease.Object, "spec", "values", "renderRevision")
+	if err != nil {
+		return ""
+	}
+	return revision
+}
+
+// setKubeOvnRenderRevision writes the revision into the values the chart is
+// rendered with. It is not read by the chart: it only has to differ from the
+// value the AppRelease was last updated with, so that a render that has to
+// happen again turns into an actual spec change.
+func setKubeOvnRenderRevision(appRelease *unstructured.Unstructured, revision string) {
+	if revision == "" {
+		return
+	}
+	_ = unstructured.SetNestedField(appRelease.Object, revision, "spec", "values", "renderRevision")
+}
+
+// formatKubeOvnRenderRevision builds "<control plane hash>-<retries>".
+func formatKubeOvnRenderRevision(controlPlaneHash string, attempts int) string {
+	return controlPlaneHash + "-" + strconv.Itoa(attempts)
+}
+
+// parseKubeOvnRenderRevision splits a revision back up. Anything this controller
+// did not write - nothing stored yet, or a bare count from an earlier version -
+// parses as a control plane that matches none, so it renders once and counts
+// from there.
+func parseKubeOvnRenderRevision(revision string) (string, int) {
+	controlPlaneHash, count, found := strings.Cut(revision, "-")
+	if !found || controlPlaneHash == "" {
+		return "", 0
+	}
+	attempts, err := strconv.Atoi(count)
+	if err != nil || attempts < 0 {
+		return "", 0
+	}
+	return controlPlaneHash, attempts
+}
+
+// controlPlaneRenderHash identifies the control plane a render was produced
+// from. It hashes the Node UIDs and not the names: a replacement Machine rejoins
+// under the same name, so the UID is the only part that says this is a different
+// Node and that what was rendered from the old one has to be rendered again.
+func controlPlaneRenderHash(controlPlaneNodes []corev1.Node) string {
+	uids := make([]string, 0, len(controlPlaneNodes))
+	for _, node := range controlPlaneNodes {
+		uids = append(uids, string(node.UID))
+	}
+	sort.Strings(uids)
+	sum := sha256.Sum256([]byte(strings.Join(uids, ",")))
+	return hex.EncodeToString(sum[:])[:kubeOvnRenderRevisionHashLength]
+}
+
+// kubeOvnRenderBackoff doubles the wait per retry, up to
+// kubeOvnRenderBackoffMax. The count comes from the AppRelease rather than from
+// memory, so the wait survives a controller restart - which is what rules out
+// the k8s helpers (wait.Backoff, flowcontrol.Backoff, the workqueue rate
+// limiters): all of them keep the count in the process.
+func kubeOvnRenderBackoff(attempts int) time.Duration {
+	backoff := kubeOvnRenderBackoffBase
+	for i := 0; i < attempts && backoff < kubeOvnRenderBackoffMax; i++ {
+		backoff *= 2
+	}
+	return min(backoff, kubeOvnRenderBackoffMax)
+}
+
+// kubeOvnRenderAttemptTime reads when a short render was last counted up. A
+// count-up that was never recorded reads as the zero time, which is long enough
+// ago to retry now.
+func kubeOvnRenderAttemptTime(appRelease *unstructured.Unstructured) time.Time {
+	attemptedAt, err := time.Parse(time.RFC3339, appRelease.GetAnnotations()[kubeOvnRenderAttemptAnnotation])
+	if err != nil {
+		return time.Time{}
+	}
+	return attemptedAt
+}
+
+// setKubeOvnRenderAttemptTime records a count-up, and clears the record for a
+// render that is not one, so a control plane that has just changed starts its
+// own backoff instead of inheriting the previous one.
+func setKubeOvnRenderAttemptTime(appRelease *unstructured.Unstructured, attemptedAt time.Time, countedUp bool) {
+	annotations := appRelease.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	if countedUp {
+		annotations[kubeOvnRenderAttemptAnnotation] = attemptedAt.UTC().Format(time.RFC3339)
+	} else {
+		delete(annotations, kubeOvnRenderAttemptAnnotation)
+	}
+	appRelease.SetAnnotations(annotations)
+}
+
+// renderedOvnCentralReplicas reads how many OVN raft members the kube-ovn chart
+// rendered ovn-central with, and whether it rendered it at all.
+//
+// The chart renders one ovn-central replica per control plane Node it can see,
+// so a count below the number of registered control plane Nodes is a raft that
+// came back short. That is what makes the two comparable at all.
+//
+// It reads spec.replicas, the render result, and not the ready replicas: Pods
+// that are not up yet are not something a re-render would fix. A Deployment that
+// is not there reads as not rendered rather than as zero replicas, so an install
+// that has only just begun is not counted as a raft that came back short. The
+// field is not owned by this controller, so scaling ovn-central by hand does
+// read as a short render and is rendered back up.
+func renderedOvnCentralReplicas(ctx context.Context, workloadClient kubernetes.Interface) (int32, bool, error) {
+	deployment, err := workloadClient.AppsV1().Deployments(ovn.CentralNamespace).Get(ctx, ovnCentralName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, pkgerrors.Wrapf(err, "failed to get %s/%s Deployment", ovn.CentralNamespace, ovnCentralName)
+	}
+	if deployment.Spec.Replicas == nil {
+		return 1, true, nil
+	}
+	return *deployment.Spec.Replicas, true, nil
 }
 
 func (r *clusterReconciler) kubeadmControlPlaneForCluster(ctx context.Context, cluster *clusterv1.Cluster) (*controlplanev1.KubeadmControlPlane, error) {

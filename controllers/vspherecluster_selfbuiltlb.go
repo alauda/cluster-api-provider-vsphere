@@ -222,7 +222,7 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 
 	// alive's backend list is generated from the registered control plane Nodes, so
 	// the ModuleInfo is only created once they are all there.
-	controlPlaneNodeNames, ready, err := r.controlPlaneNodesRegistered(ctx, cluster, clientset)
+	controlPlaneNodes, ready, err := r.controlPlaneNodesRegistered(ctx, cluster, clientset)
 	if err != nil {
 		r.setReadinessUnknown(vsphereCluster, selfBuiltLBConditionSpec, err)
 		return reconcile.Result{}, err
@@ -301,7 +301,7 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 		return reconcile.Result{RequeueAfter: selfBuiltLBRequeueAfter}, nil
 	}
 
-	podsReady, message, err := alivePodsReadyOnNodes(ctx, clientset, controlPlaneNodeNames)
+	podsReady, message, err := alivePodsReadyOnNodes(ctx, clientset, nodeNames(controlPlaneNodes))
 	if err != nil {
 		return reconcile.Result{}, err
 	}
