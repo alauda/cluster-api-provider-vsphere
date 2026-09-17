@@ -339,6 +339,19 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 		return reconcile.Result{}, err
 	}
 
+	// The workload system components only need the registry annotation and a
+	// workload client, so they are reconciled ahead of the vCenter, cluster
+	// module, CNI and load balancer steps below. Those steps can requeue for a
+	// long time on a cluster whose nodes are not coming up, which is exactly
+	// when a stale cloud controller manager image has to be repointed.
+	//
+	// The dependency does not run the other way: a failure here is logged and
+	// the infrastructure reconcile continues, because this step is auxiliary
+	// and the requeue on a successful reconcile retries it.
+	if _, err := r.reconcileWorkloadSystemComponentRepositories(ctx, clusterCtx); err != nil {
+		log.Error(err, "Failed to reconcile workload system component repositories")
+	}
+
 	// Reconcile failure domains.
 	ok, err := r.reconcileDeploymentZones(ctx, clusterCtx)
 	if err != nil {
@@ -437,7 +450,7 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 		return result, err
 	}
 
-	return r.reconcileWorkloadSystemComponentRepositories(ctx, clusterCtx)
+	return reconcile.Result{}, nil
 }
 
 func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clusterCtx *capvcontext.ClusterContext) (reconcile.Result, error) {

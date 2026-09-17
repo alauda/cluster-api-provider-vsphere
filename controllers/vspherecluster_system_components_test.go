@@ -27,6 +27,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1beta1"
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -348,4 +349,248 @@ func systemComponentTestClusterAndKCP(kubernetesVersion, coreDNSTag string) (*cl
 		Status: controlplanev1.KubeadmControlPlaneStatus{Replicas: 1, UpdatedReplicas: 1},
 	}
 	return cluster, kcp
+}
+
+func TestRepointImageRegistry(t *testing.T) {
+	tests := []struct {
+		name    string
+		image   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "host and path",
+			image: "10.161.4.6:11443/ait/cloud-provider-vsphere:v1.33.0",
+			want:  "registry.example.com/ait/cloud-provider-vsphere:v1.33.0",
+		},
+		{
+			name:  "host only",
+			image: "10.161.4.6:11443/cloud-provider-vsphere:v1.33.0",
+			want:  "registry.example.com/cloud-provider-vsphere:v1.33.0",
+		},
+		{
+			name:  "nested path",
+			image: "10.161.4.6:11443/acp/vsphere/cloud-provider-vsphere:v1.33.0",
+			want:  "registry.example.com/acp/vsphere/cloud-provider-vsphere:v1.33.0",
+		},
+		{
+			name:  "digest is kept",
+			image: "10.161.4.6:11443/ait/cloud-provider-vsphere:v1.33.0@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+			want:  "registry.example.com/ait/cloud-provider-vsphere:v1.33.0@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		},
+		{
+			name:  "already repointed",
+			image: "registry.example.com/ait/cloud-provider-vsphere:v1.33.0",
+			want:  "registry.example.com/ait/cloud-provider-vsphere:v1.33.0",
+		},
+		{
+			name:    "no registry host",
+			image:   "ait/cloud-provider-vsphere:v1.33.0",
+			wantErr: true,
+		},
+		{
+			name:    "unparsable",
+			image:   "NOT A VALID IMAGE",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := repointImageRegistry(tt.image, "registry.example.com")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("repoint %q: %v", tt.image, err)
+			}
+			if got != tt.want {
+				t.Fatalf("repointed image = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReconcileCloudControllerManagerRegistry(t *testing.T) {
+	// The container is named vsphere-cpi in the current upstream manifests, so
+	// the reconcile must not look containers up by the DaemonSet name.
+	tests := []struct {
+		name          string
+		containerName string
+	}{
+		{name: "upstream container name", containerName: "vsphere-cpi"},
+		{name: "legacy container name", containerName: "vsphere-cloud-controller-manager"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			scheme := newSystemComponentTestScheme(t)
+			cluster, _ := systemComponentTestClusterAndKCP("v1.35.0", "1.14.2-v4.4.0")
+			daemonSet := &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "vsphere-cloud-controller-manager", Namespace: "kube-system"},
+				Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name: tt.containerName, Image: "10.161.4.6:11443/ait/cloud-provider-vsphere:v1.33.0",
+				}}}}},
+			}
+			remoteClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(daemonSet).Build()
+			r := &clusterReconciler{Client: remoteClient}
+			pullSecret := &corev1.LocalObjectReference{Name: "global-registry-auth"}
+
+			if err := r.reconcileCloudControllerManagerRegistry(ctx, cluster, remoteClient, pullSecret); err != nil {
+				t.Fatalf("reconcile cloud controller manager: %v", err)
+			}
+
+			got := &appsv1.DaemonSet{}
+			if err := remoteClient.Get(ctx, client.ObjectKeyFromObject(daemonSet), got); err != nil {
+				t.Fatalf("get cloud controller manager: %v", err)
+			}
+			wantImage := "registry.example.com/ait/cloud-provider-vsphere:v1.33.0"
+			if got.Spec.Template.Spec.Containers[0].Image != wantImage {
+				t.Fatalf("image = %q, want %q", got.Spec.Template.Spec.Containers[0].Image, wantImage)
+			}
+			if len(got.Spec.Template.Spec.ImagePullSecrets) != 1 || got.Spec.Template.Spec.ImagePullSecrets[0].Name != "global-registry-auth" {
+				t.Fatalf("imagePullSecrets = %v", got.Spec.Template.Spec.ImagePullSecrets)
+			}
+
+			// A second pass must be a no-op.
+			resourceVersion := got.ResourceVersion
+			if err := r.reconcileCloudControllerManagerRegistry(ctx, cluster, remoteClient, pullSecret); err != nil {
+				t.Fatalf("second reconcile cloud controller manager: %v", err)
+			}
+			again := &appsv1.DaemonSet{}
+			if err := remoteClient.Get(ctx, client.ObjectKeyFromObject(daemonSet), again); err != nil {
+				t.Fatalf("get cloud controller manager: %v", err)
+			}
+			if again.ResourceVersion != resourceVersion {
+				t.Fatalf("second reconcile patched the DaemonSet again: %q -> %q", resourceVersion, again.ResourceVersion)
+			}
+		})
+	}
+}
+
+func TestReconcileCloudControllerManagerRegistryKeepsGoingOnUnparsableImage(t *testing.T) {
+	ctx := context.Background()
+	scheme := newSystemComponentTestScheme(t)
+	cluster, _ := systemComponentTestClusterAndKCP("v1.35.0", "1.14.2-v4.4.0")
+	daemonSet := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "vsphere-cloud-controller-manager", Namespace: "kube-system"},
+		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "sidecar", Image: "NOT A VALID IMAGE"},
+			{Name: "vsphere-cpi", Image: "10.161.4.6:11443/ait/cloud-provider-vsphere:v1.33.0"},
+		}}}},
+	}
+	remoteClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(daemonSet).Build()
+	r := &clusterReconciler{Client: remoteClient}
+
+	if err := r.reconcileCloudControllerManagerRegistry(ctx, cluster, remoteClient, nil); err != nil {
+		t.Fatalf("reconcile cloud controller manager: %v", err)
+	}
+
+	got := &appsv1.DaemonSet{}
+	if err := remoteClient.Get(ctx, client.ObjectKeyFromObject(daemonSet), got); err != nil {
+		t.Fatalf("get cloud controller manager: %v", err)
+	}
+	if got.Spec.Template.Spec.Containers[0].Image != "NOT A VALID IMAGE" {
+		t.Fatalf("unparsable image was rewritten: %q", got.Spec.Template.Spec.Containers[0].Image)
+	}
+	wantImage := "registry.example.com/ait/cloud-provider-vsphere:v1.33.0"
+	if got.Spec.Template.Spec.Containers[1].Image != wantImage {
+		t.Fatalf("image = %q, want %q", got.Spec.Template.Spec.Containers[1].Image, wantImage)
+	}
+}
+
+func TestReconcileCloudControllerManagerRegistrySkipsMissingDaemonSet(t *testing.T) {
+	ctx := context.Background()
+	scheme := newSystemComponentTestScheme(t)
+	cluster, _ := systemComponentTestClusterAndKCP("v1.35.0", "1.14.2-v4.4.0")
+	remoteClient := clientfake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &clusterReconciler{Client: remoteClient}
+
+	if err := r.reconcileCloudControllerManagerRegistry(ctx, cluster, remoteClient, nil); err != nil {
+		t.Fatalf("reconcile cloud controller manager: %v", err)
+	}
+}
+
+// TestRepointImageRegistryRejectsInvalidRegistry pins the validation of the
+// computed image: the registry comes from an annotation, and an image nothing
+// can pull must not reach the live DaemonSet.
+func TestRepointImageRegistryRejectsInvalidRegistry(t *testing.T) {
+	registries := []string{
+		"https://reg.example.com",
+		"reg.example.com:",
+		"reg example.com",
+	}
+
+	for _, registry := range registries {
+		t.Run(registry, func(t *testing.T) {
+			got, err := repointImageRegistry("10.161.4.6:11443/ait/cloud-provider-vsphere:v1.33.0", registry)
+			if err == nil {
+				t.Fatalf("expected an error, got %q", got)
+			}
+		})
+	}
+}
+
+func TestReconcileCloudControllerManagerRegistryRepointsInitContainers(t *testing.T) {
+	ctx := context.Background()
+	scheme := newSystemComponentTestScheme(t)
+	cluster, _ := systemComponentTestClusterAndKCP("v1.35.0", "1.14.2-v4.4.0")
+	daemonSet := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "vsphere-cloud-controller-manager", Namespace: "kube-system"},
+		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{Name: "wait-for-node", Image: "10.161.4.6:11443/ait/kubectl:v1.33.0"}},
+			Containers:     []corev1.Container{{Name: "vsphere-cpi", Image: "10.161.4.6:11443/ait/cloud-provider-vsphere:v1.33.0"}},
+		}}},
+	}
+	remoteClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(daemonSet).Build()
+	r := &clusterReconciler{Client: remoteClient}
+
+	if err := r.reconcileCloudControllerManagerRegistry(ctx, cluster, remoteClient, nil); err != nil {
+		t.Fatalf("reconcile cloud controller manager: %v", err)
+	}
+
+	got := &appsv1.DaemonSet{}
+	if err := remoteClient.Get(ctx, client.ObjectKeyFromObject(daemonSet), got); err != nil {
+		t.Fatalf("get cloud controller manager: %v", err)
+	}
+	wantInitImage := "registry.example.com/ait/kubectl:v1.33.0"
+	if image := got.Spec.Template.Spec.InitContainers[0].Image; image != wantInitImage {
+		t.Fatalf("init container image = %q, want %q", image, wantInitImage)
+	}
+	wantImage := "registry.example.com/ait/cloud-provider-vsphere:v1.33.0"
+	if image := got.Spec.Template.Spec.Containers[0].Image; image != wantImage {
+		t.Fatalf("container image = %q, want %q", image, wantImage)
+	}
+}
+
+// TestReconcileWorkloadSystemComponentRepositoriesWaitsForControlPlaneInitialized
+// pins the gate that keeps this step, which runs ahead of the infrastructure
+// ones, from building a workload client and blocking on its dial timeouts
+// before the workload API server answers.
+func TestReconcileWorkloadSystemComponentRepositoriesWaitsForControlPlaneInitialized(t *testing.T) {
+	ctx := context.Background()
+	scheme := newSystemComponentTestScheme(t)
+	cluster, _ := systemComponentTestClusterAndKCP("v1.35.0", "1.14.2-v4.4.0")
+	// The KubeadmControlPlane is deliberately absent: its lookup is the first
+	// step past the gate, so reaching it is what tells a skip apart from a
+	// reconcile that carried on.
+	r := &clusterReconciler{Client: clientfake.NewClientBuilder().WithScheme(scheme).Build()}
+	clusterCtx := &capvcontext.ClusterContext{Cluster: cluster}
+
+	result, err := r.reconcileWorkloadSystemComponentRepositories(ctx, clusterCtx)
+	if err != nil {
+		t.Fatalf("reconcile before the control plane is initialized: %v", err)
+	}
+	if !result.IsZero() {
+		t.Fatalf("result = %v, want zero", result)
+	}
+
+	conditions.MarkTrue(cluster, clusterv1.ControlPlaneInitializedCondition)
+	if _, err := r.reconcileWorkloadSystemComponentRepositories(ctx, clusterCtx); err == nil {
+		t.Fatal("expected the missing KubeadmControlPlane to surface once the control plane is initialized")
+	}
 }
