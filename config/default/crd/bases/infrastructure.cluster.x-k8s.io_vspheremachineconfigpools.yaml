@@ -147,8 +147,12 @@ spec:
                             description: Datastore is the vSphere datastore name.
                             type: string
                           fsFormat:
-                            description: FSFormat is the filesystem format (default
-                              "ext4").
+                            description: |-
+                              FSFormat is the filesystem format of the disk. Supported values are
+                              "ext4" (default) and "xfs".
+                            enum:
+                            - ext4
+                            - xfs
                             type: string
                           mountOptions:
                             description: MountOptions for the filesystem mount.
@@ -271,8 +275,12 @@ spec:
                             description: DiskUUID is backfilled by the controller.
                             type: string
                           fsFormat:
-                            description: FSFormat is the filesystem format (default
-                              "ext4").
+                            description: |-
+                              FSFormat is the filesystem format of the disk. Supported values are
+                              "ext4" (default) and "xfs".
+                            enum:
+                            - ext4
+                            - xfs
                             type: string
                           mountOptions:
                             description: MountOptions for the filesystem mount.

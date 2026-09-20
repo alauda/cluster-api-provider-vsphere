@@ -1627,12 +1627,22 @@ while true; do
 
     if [ -n "${mount_path}" ]; then
       if ! blkid "${device_path}" >/dev/null 2>&1; then
+        # The force flag differs per filesystem family: mkfs.ext* takes -F,
+        # mkfs.xfs takes -f. Both mean "overwrite whatever is on the device".
+        case "${fs_format}" in
+          ext4) force_flag="-F" ;;
+          xfs) force_flag="-f" ;;
+          *)
+            echo "unsupported fs format ${fs_format} for disk ${disk_name}" >&2
+            continue
+            ;;
+        esac
         mkfs_cmd="mkfs.${fs_format}"
         if ! command -v "${mkfs_cmd}" >/dev/null 2>&1; then
           echo "missing formatter ${mkfs_cmd} for disk ${disk_name}" >&2
           continue
         fi
-        if ! "${mkfs_cmd}" -F "${device_path}"; then
+        if ! "${mkfs_cmd}" "${force_flag}" "${device_path}"; then
           echo "failed to format ${device_path} for disk ${disk_name}" >&2
           continue
         fi
