@@ -20,6 +20,7 @@ import (
 )
 
 // +kubebuilder:webhook:verbs=create;update,path=/validate-cluster-x-k8s-io-v1beta1-machinedeployment-capv,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,groups=cluster.x-k8s.io,resources=machinedeployments,versions=v1beta1,name=validation.machinedeployment.capv.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1beta1
+
 type MachineDeployment struct {
 	Client client.Client
 }
@@ -57,7 +58,7 @@ func (webhook *MachineDeployment) ValidateDelete(_ context.Context, _ runtime.Ob
 func (webhook *MachineDeployment) validatePoolRef(ctx context.Context, obj *clusterv1.MachineDeployment) field.ErrorList {
 	var allErrs field.ErrorList
 	templatePath := field.NewPath("spec", "template", "spec", "infrastructureRef")
-	if obj.Spec.Template.Spec.InfrastructureRef.Name == "" {
+	if !isVSphereMachineTemplateRef(&obj.Spec.Template.Spec.InfrastructureRef) {
 		return allErrs
 	}
 	template := &infrav1.VSphereMachineTemplate{}
