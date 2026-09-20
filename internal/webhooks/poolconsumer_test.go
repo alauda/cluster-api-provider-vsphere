@@ -12,10 +12,21 @@ import (
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 )
+
+// vsphereTemplateRef builds the infrastructureRef a govmomi vSphere cluster carries. The webhooks only
+// validate refs that carry this group and kind, so the tests have to spell it out.
+func vsphereTemplateRef(name string) corev1.ObjectReference {
+	return corev1.ObjectReference{
+		APIVersion: infrav1.GroupVersion.String(),
+		Kind:       "VSphereMachineTemplate",
+		Name:       name,
+	}
+}
 
 func zeroMaxSurgeRolloutStrategy() *controlplanev1.RolloutStrategy {
 	return &controlplanev1.RolloutStrategy{
@@ -55,7 +66,7 @@ func TestKubeadmControlPlaneValidatePoolRef(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "cp-a", Namespace: "default"},
 		Spec: controlplanev1.KubeadmControlPlaneSpec{
 			MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{
-				InfrastructureRef: corev1.ObjectReference{Name: "cp-template"},
+				InfrastructureRef: vsphereTemplateRef("cp-template"),
 			},
 			Replicas:        ptr.To(int32(3)),
 			RolloutStrategy: zeroMaxSurgeRolloutStrategy(),
@@ -131,7 +142,7 @@ func TestMachineDeploymentValidatePoolRef(t *testing.T) {
 		Spec: clusterv1.MachineDeploymentSpec{
 			Template: clusterv1.MachineTemplateSpec{
 				Spec: clusterv1.MachineSpec{
-					InfrastructureRef: corev1.ObjectReference{Name: "md-template"},
+					InfrastructureRef: vsphereTemplateRef("md-template"),
 				},
 			},
 			Strategy: zeroMaxSurgeMDStrategy(),
@@ -207,7 +218,7 @@ func TestKubeadmControlPlaneMaxSurge(t *testing.T) {
 		return &controlplanev1.KubeadmControlPlane{
 			ObjectMeta: metav1.ObjectMeta{Name: "cp-a", Namespace: "default"},
 			Spec: controlplanev1.KubeadmControlPlaneSpec{
-				MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{InfrastructureRef: corev1.ObjectReference{Name: "cp-template"}},
+				MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{InfrastructureRef: vsphereTemplateRef("cp-template")},
 				Replicas:        ptr.To(int32(3)),
 				RolloutStrategy: strategy,
 			},
@@ -268,7 +279,7 @@ func TestKubeadmControlPlaneReplicas(t *testing.T) {
 		return &controlplanev1.KubeadmControlPlane{
 			ObjectMeta: metav1.ObjectMeta{Name: "cp-a", Namespace: "default"},
 			Spec: controlplanev1.KubeadmControlPlaneSpec{
-				MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{InfrastructureRef: corev1.ObjectReference{Name: "cp-template"}},
+				MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{InfrastructureRef: vsphereTemplateRef("cp-template")},
 				Replicas:        replicas,
 				RolloutStrategy: zeroMaxSurgeRolloutStrategy(),
 			},
@@ -327,7 +338,7 @@ func TestMachineDeploymentMaxSurge(t *testing.T) {
 		return &clusterv1.MachineDeployment{
 			ObjectMeta: metav1.ObjectMeta{Name: "md-a", Namespace: "default"},
 			Spec: clusterv1.MachineDeploymentSpec{
-				Template: clusterv1.MachineTemplateSpec{Spec: clusterv1.MachineSpec{InfrastructureRef: corev1.ObjectReference{Name: "md-template"}}},
+				Template: clusterv1.MachineTemplateSpec{Spec: clusterv1.MachineSpec{InfrastructureRef: vsphereTemplateRef("md-template")}},
 				Strategy: strategy,
 			},
 		}
@@ -391,7 +402,7 @@ func TestMachineDeploymentMaxUnavailable(t *testing.T) {
 		return &clusterv1.MachineDeployment{
 			ObjectMeta: metav1.ObjectMeta{Name: "md-a", Namespace: "default"},
 			Spec: clusterv1.MachineDeploymentSpec{
-				Template: clusterv1.MachineTemplateSpec{Spec: clusterv1.MachineSpec{InfrastructureRef: corev1.ObjectReference{Name: "md-template"}}},
+				Template: clusterv1.MachineTemplateSpec{Spec: clusterv1.MachineSpec{InfrastructureRef: vsphereTemplateRef("md-template")}},
 				Strategy: strategy,
 			},
 		}
@@ -430,4 +441,144 @@ func TestMachineDeploymentMaxUnavailable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidatePoolRefIgnoresForeignInfrastructureRef pins the provider-agnostic contract: a KubeadmControlPlane
+// or MachineDeployment belonging to another infrastructure provider must pass untouched, even when a vSphere
+// machine template of the same name exists and its pool is bound elsewhere. Resolving such a ref by name alone
+// used to reject every non-vSphere cluster in a management cluster that has CAPV installed.
+func TestValidatePoolRefIgnoresForeignInfrastructureRef(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
+	_ = controlplanev1.AddToScheme(scheme)
+
+	// Same names as the refs below, bound to a pool that is already taken: resolving by name would reject.
+	decoys := []client.Object{
+		&infrav1.VSphereMachineTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "cp-template", Namespace: "default"},
+			Spec: infrav1.VSphereMachineTemplateSpec{Template: infrav1.VSphereMachineTemplateResource{Spec: infrav1.VSphereMachineSpec{
+				MachineConfigPoolRef: &corev1.ObjectReference{Name: "pool-a", Namespace: "default"},
+			}}},
+		},
+		&infrav1.VSphereMachineTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "md-template", Namespace: "default"},
+			Spec: infrav1.VSphereMachineTemplateSpec{Template: infrav1.VSphereMachineTemplateResource{Spec: infrav1.VSphereMachineSpec{
+				MachineConfigPoolRef: &corev1.ObjectReference{Name: "pool-a", Namespace: "default"},
+			}}},
+		},
+		&infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
+			Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
+			Status: infrav1.VSphereMachineConfigPoolStatus{ConsumerRef: &corev1.ObjectReference{
+				APIVersion: clusterv1.GroupVersion.String(),
+				Kind:       "MachineDeployment",
+				Namespace:  "default",
+				Name:       "someone-else",
+			}},
+		},
+	}
+
+	foreignRefs := map[string]corev1.ObjectReference{
+		"another provider": {
+			APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+			Kind:       "DCSMachineTemplate",
+		},
+		// The supervisor API has a VSphereMachineTemplate of its own; only the group tells them apart.
+		"supervisor vSphere": {
+			APIVersion: "vmware.infrastructure.cluster.x-k8s.io/v1beta1",
+			Kind:       "VSphereMachineTemplate",
+		},
+	}
+
+	for name, ref := range foreignRefs {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(decoys...).Build()
+
+			cpRef := ref
+			cpRef.Name = "cp-template"
+			kcp := &controlplanev1.KubeadmControlPlane{
+				ObjectMeta: metav1.ObjectMeta{Name: "cp-a", Namespace: "default"},
+				Spec: controlplanev1.KubeadmControlPlaneSpec{
+					MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{InfrastructureRef: cpRef},
+					// Left at the defaults the vSphere rules would reject: 1 replica and a surging rollout.
+					Replicas: ptr.To(int32(1)),
+				},
+			}
+			_, err := (&KubeadmControlPlane{Client: c}).ValidateCreate(context.Background(), kcp)
+			g.Expect(err).NotTo(HaveOccurred())
+			_, err = (&KubeadmControlPlane{Client: c}).ValidateUpdate(context.Background(), kcp, kcp)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			mdRef := ref
+			mdRef.Name = "md-template"
+			md := &clusterv1.MachineDeployment{
+				ObjectMeta: metav1.ObjectMeta{Name: "md-a", Namespace: "default"},
+				Spec: clusterv1.MachineDeploymentSpec{
+					Template: clusterv1.MachineTemplateSpec{Spec: clusterv1.MachineSpec{InfrastructureRef: mdRef}},
+				},
+			}
+			_, err = (&MachineDeployment{Client: c}).ValidateCreate(context.Background(), md)
+			g.Expect(err).NotTo(HaveOccurred())
+			_, err = (&MachineDeployment{Client: c}).ValidateUpdate(context.Background(), md, md)
+			g.Expect(err).NotTo(HaveOccurred())
+		})
+	}
+}
+
+// TestValidatePoolRefSkipsForeignPeers covers the pool-occupancy scan: a foreign KubeadmControlPlane or
+// MachineDeployment whose ref happens to share a name with a vSphere template must not be mistaken for a
+// peer competing for the same pool.
+func TestValidatePoolRefSkipsForeignPeers(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
+	_ = controlplanev1.AddToScheme(scheme)
+
+	template := &infrav1.VSphereMachineTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-name", Namespace: "default"},
+		Spec: infrav1.VSphereMachineTemplateSpec{Template: infrav1.VSphereMachineTemplateResource{Spec: infrav1.VSphereMachineSpec{
+			MachineConfigPoolRef: &corev1.ObjectReference{Name: "pool-a", Namespace: "default"},
+		}}},
+	}
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
+		Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
+	}
+	// A DCS MachineDeployment whose template name collides with the vSphere one above.
+	foreignMD := &clusterv1.MachineDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "dcs-md", Namespace: "default"},
+		Spec: clusterv1.MachineDeploymentSpec{Template: clusterv1.MachineTemplateSpec{Spec: clusterv1.MachineSpec{
+			InfrastructureRef: corev1.ObjectReference{
+				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+				Kind:       "DCSMachineTemplate",
+				Name:       "shared-name",
+			},
+		}}},
+	}
+	// A DCS KubeadmControlPlane with the same name collision, covering the control plane arm of the scan.
+	foreignKCP := &controlplanev1.KubeadmControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Name: "dcs-cp", Namespace: "default"},
+		Spec: controlplanev1.KubeadmControlPlaneSpec{
+			MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{InfrastructureRef: corev1.ObjectReference{
+				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+				Kind:       "DCSMachineTemplate",
+				Name:       "shared-name",
+			}},
+		},
+	}
+	kcp := &controlplanev1.KubeadmControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-a", Namespace: "default"},
+		Spec: controlplanev1.KubeadmControlPlaneSpec{
+			MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{InfrastructureRef: vsphereTemplateRef("shared-name")},
+			Replicas:        ptr.To(int32(3)),
+			RolloutStrategy: zeroMaxSurgeRolloutStrategy(),
+		},
+	}
+
+	c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(template, pool, foreignMD, foreignKCP, kcp).Build()
+	_, err := (&KubeadmControlPlane{Client: c}).ValidateCreate(context.Background(), kcp)
+	g.Expect(err).NotTo(HaveOccurred())
 }
