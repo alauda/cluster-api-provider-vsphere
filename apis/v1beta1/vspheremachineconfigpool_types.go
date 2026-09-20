@@ -198,8 +198,10 @@ type PersistentDisk struct {
 	// +optional
 	MountOptions []string `json:"mountOptions,omitempty"`
 
-	// FSFormat is the filesystem format (default "ext4").
+	// FSFormat is the filesystem format of the disk. Supported values are
+	// "ext4" (default) and "xfs".
 	// +optional
+	// +kubebuilder:validation:Enum=ext4;xfs
 	FSFormat string `json:"fsFormat,omitempty"`
 
 	// WipeFilesystem controls whether to wipe the filesystem content when the
@@ -249,8 +251,10 @@ type EphemeralDisk struct {
 	// +optional
 	MountOptions []string `json:"mountOptions,omitempty"`
 
-	// FSFormat is the filesystem format (default "ext4").
+	// FSFormat is the filesystem format of the disk. Supported values are
+	// "ext4" (default) and "xfs".
 	// +optional
+	// +kubebuilder:validation:Enum=ext4;xfs
 	FSFormat string `json:"fsFormat,omitempty"`
 
 	// UnitNumber carries the controller-observed SCSI unit number in memory only
