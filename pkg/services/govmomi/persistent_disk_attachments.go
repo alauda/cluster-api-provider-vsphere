@@ -18,6 +18,7 @@ package govmomi
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/vmware/govmomi/view"
@@ -44,6 +45,30 @@ func FindAttachedPersistentDisks(ctx context.Context, s *session.Session, datace
 	if len(volumePaths) == 0 {
 		return nil, nil
 	}
+	return findAttachedDisks(ctx, s, datacenter, func(volumePath string) bool {
+		_, ok := volumePaths[volumePath]
+		return ok
+	})
+}
+
+// FindAttachedDisksUnderDirectory returns the disks any visible VM in datacenter
+// still has backed by a file inside directory. Reclaiming a slot's disk directory
+// deletes everything in it, so this is the check that the directory holds nothing
+// a VM is using — including disks this pool does not know about, which is what
+// makes a directory-name collision with a VM folder harmless rather than fatal.
+func FindAttachedDisksUnderDirectory(ctx context.Context, s *session.Session, datacenter, directory string) ([]services.PersistentDiskAttachment, error) {
+	if directory == "" {
+		return nil, errors.New("directory is required for persistent disk attachment scan")
+	}
+	prefix := directory + "/"
+	return findAttachedDisks(ctx, s, datacenter, func(volumePath string) bool {
+		return strings.HasPrefix(volumePath, prefix)
+	})
+}
+
+// findAttachedDisks scans every visible VM in datacenter and reports the disks
+// whose backing file satisfies match.
+func findAttachedDisks(ctx context.Context, s *session.Session, datacenter string, match func(volumePath string) bool) ([]services.PersistentDiskAttachment, error) {
 	if s == nil || s.Client == nil {
 		return nil, errors.New("vSphere session is required to find persistent disk attachments")
 	}
@@ -74,7 +99,7 @@ func FindAttachedPersistentDisks(ctx context.Context, s *session.Session, datace
 
 	attachments := []services.PersistentDiskAttachment{}
 	for i := range vms {
-		attachments = append(attachments, persistentDiskAttachmentsFromVM(vms[i], volumePaths)...)
+		attachments = append(attachments, persistentDiskAttachmentsFromVM(vms[i], match)...)
 	}
 	return attachments, nil
 }
@@ -90,7 +115,7 @@ func persistentDiskVolumePaths(disks []infrav1.PersistentDisk) map[string]struct
 	return volumePaths
 }
 
-func persistentDiskAttachmentsFromVM(vm mo.VirtualMachine, volumePaths map[string]struct{}) []services.PersistentDiskAttachment {
+func persistentDiskAttachmentsFromVM(vm mo.VirtualMachine, match func(volumePath string) bool) []services.PersistentDiskAttachment {
 	if vm.Config == nil || vm.Config.Hardware.Device == nil {
 		return nil
 	}
@@ -105,7 +130,7 @@ func persistentDiskAttachmentsFromVM(vm mo.VirtualMachine, volumePaths map[strin
 		if volumePath == "" {
 			continue
 		}
-		if _, ok := volumePaths[volumePath]; !ok {
+		if !match(volumePath) {
 			continue
 		}
 		attachments = append(attachments, services.PersistentDiskAttachment{

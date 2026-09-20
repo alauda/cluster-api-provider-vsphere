@@ -55,7 +55,10 @@ func TestPersistentDiskAttachmentsFromVM(t *testing.T) {
 		{Name: "empty"},
 		{Name: "etcd", VolumePath: "[datastore] old-master/var-lib-etcd.vmdk"},
 	})
-	attachments := persistentDiskAttachmentsFromVM(vm, paths)
+	attachments := persistentDiskAttachmentsFromVM(vm, func(volumePath string) bool {
+		_, ok := paths[volumePath]
+		return ok
+	})
 
 	g.Expect(attachments).To(HaveLen(1))
 	g.Expect(attachments[0].VolumePath).To(Equal("[datastore] old-master/var-lib-etcd.vmdk"))
@@ -76,7 +79,10 @@ func TestPersistentDiskAttachmentsFromVMNoMatches(t *testing.T) {
 	}
 
 	paths := persistentDiskVolumePaths([]infrav1.PersistentDisk{{Name: "etcd", VolumePath: "[datastore] old-master/var-lib-etcd.vmdk"}})
-	attachments := persistentDiskAttachmentsFromVM(vm, paths)
+	attachments := persistentDiskAttachmentsFromVM(vm, func(volumePath string) bool {
+		_, ok := paths[volumePath]
+		return ok
+	})
 
 	g.Expect(attachments).To(BeEmpty())
 }
