@@ -83,6 +83,12 @@ const (
 	// ModuleInfo without it is never adopted.
 	selfBuiltLBManagedLabel = "infrastructure.cluster.x-k8s.io/self-built-lb-managed"
 
+	// aliveHALoadBalancerTypeLabel is how ModulePlugin/alive selects its clusters.
+	// The platform evaluates that affinity against the Cluster, so the label has to
+	// live there rather than on the platform Cluster.
+	aliveHALoadBalancerTypeLabel = "ha-load-balancer-type"
+	aliveHALoadBalancerTypeAlive = "Alive"
+
 	// kubeProxyConfigHashAnnotation carries the hash of the kube-proxy config.conf
 	// this provider wrote, so a config change rolls the DaemonSet. kube-proxy only
 	// reads its configuration at startup.
@@ -199,6 +205,13 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 	cluster := clusterCtx.Cluster
 	if cluster == nil {
 		return reconcile.Result{}, nil
+	}
+
+	// Label ahead of every gate below. The platform plans module upgrades on its
+	// own schedule, long after this reconcile last got as far as the ModuleInfo.
+	if err := r.ensureAliveHALoadBalancerLabel(ctx, cluster); err != nil {
+		r.setReadinessUnknown(vsphereCluster, selfBuiltLBConditionSpec, err)
+		return reconcile.Result{}, err
 	}
 
 	// Defensive input validation. The webhook rejects both of these, so reaching
@@ -320,6 +333,35 @@ func (r *clusterReconciler) ensureSelfBuiltLB(ctx context.Context, clusterCtx *c
 
 	r.setSelfBuiltLBCondition(vsphereCluster, corev1.ConditionTrue, infrav1.SelfBuiltLoadBalancerReadyReason, clusterv1.ConditionSeverityInfo, "")
 	return reconcile.Result{}, nil
+}
+
+// ensureAliveHALoadBalancerLabel records on the Cluster that alive owns the
+// control plane VIP.
+//
+// The platform only upgrades a module whose ModulePlugin affinity matches the
+// Cluster's labels, and it tests that affinity before it looks at whether the
+// module is installed: a mismatch is skipped at INFO level while the upgrade
+// still reports success. cluster-transformer writes this label only for
+// platform-installed baremetal clusters, so for a self-built load balancer
+// nothing else writes it, and alive would stay pinned to the version this
+// provider first installed (ACP-56059).
+func (r *clusterReconciler) ensureAliveHALoadBalancerLabel(ctx context.Context, cluster *clusterv1.Cluster) error {
+	if cluster.Labels[aliveHALoadBalancerTypeLabel] == aliveHALoadBalancerTypeAlive {
+		return nil
+	}
+
+	origin := cluster.DeepCopy()
+	if cluster.Labels == nil {
+		cluster.Labels = map[string]string{}
+	}
+	cluster.Labels[aliveHALoadBalancerTypeLabel] = aliveHALoadBalancerTypeAlive
+	if err := r.Client.Patch(ctx, cluster, client.MergeFrom(origin)); err != nil {
+		return pkgerrors.Wrapf(err, "failed to label Cluster %q with %s=%s",
+			client.ObjectKeyFromObject(cluster), aliveHALoadBalancerTypeLabel, aliveHALoadBalancerTypeAlive)
+	}
+	ctrl.LoggerFrom(ctx).Info("Labelled Cluster for the alive HA load balancer",
+		"label", aliveHALoadBalancerTypeLabel, "value", aliveHALoadBalancerTypeAlive)
+	return nil
 }
 
 // resolveAliveModuleForReconcile preserves the platform-owned ModuleInfo path.

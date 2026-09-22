@@ -116,6 +116,76 @@ func TestEnsureSelfBuiltLBClearsConditionWhenNotInternal(t *testing.T) {
 	g.Expect(v1beta2conditions.Get(vsphereCluster, infrav1.VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition)).To(BeNil())
 }
 
+func TestEnsureAliveHALoadBalancerLabel(t *testing.T) {
+	newCluster := func(labels map[string]string) *clusterv1.Cluster {
+		return &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Labels: labels}}
+	}
+
+	t.Run("labels a cluster that does not carry it", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := newCluster(map[string]string{"cluster-type": "ProviderVSphere"})
+		c := ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(cluster).Build()
+		reconciler := &clusterReconciler{Client: c}
+
+		g.Expect(reconciler.ensureAliveHALoadBalancerLabel(context.Background(), cluster)).To(Succeed())
+
+		got := &clusterv1.Cluster{}
+		g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(cluster), got)).To(Succeed())
+		g.Expect(got.Labels).To(HaveKeyWithValue(aliveHALoadBalancerTypeLabel, aliveHALoadBalancerTypeAlive))
+		g.Expect(got.Labels).To(HaveKeyWithValue("cluster-type", "ProviderVSphere"))
+	})
+
+	t.Run("does not write again once the label is set", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := newCluster(map[string]string{aliveHALoadBalancerTypeLabel: aliveHALoadBalancerTypeAlive})
+		c := ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(cluster).Build()
+		reconciler := &clusterReconciler{Client: c}
+
+		before := &clusterv1.Cluster{}
+		g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(cluster), before)).To(Succeed())
+		g.Expect(reconciler.ensureAliveHALoadBalancerLabel(context.Background(), cluster)).To(Succeed())
+
+		after := &clusterv1.Cluster{}
+		g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(cluster), after)).To(Succeed())
+		g.Expect(after.ResourceVersion).To(Equal(before.ResourceVersion))
+	})
+
+	t.Run("labels a cluster with no labels at all", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := newCluster(nil)
+		c := ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(cluster).Build()
+		reconciler := &clusterReconciler{Client: c}
+
+		g.Expect(reconciler.ensureAliveHALoadBalancerLabel(context.Background(), cluster)).To(Succeed())
+
+		got := &clusterv1.Cluster{}
+		g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(cluster), got)).To(Succeed())
+		g.Expect(got.Labels).To(HaveKeyWithValue(aliveHALoadBalancerTypeLabel, aliveHALoadBalancerTypeAlive))
+	})
+}
+
+func TestEnsureSelfBuiltLBLabelsClusterBeforeReadinessGates(t *testing.T) {
+	// The platform plans module upgrades on its own schedule, so the label has to
+	// be written even on a reconcile that cannot get as far as the ModuleInfo.
+	// Here the workload client is unavailable, which is as far as this reconcile
+	// will ever get.
+	g := NewWithT(t)
+	vsphereCluster := selfBuiltLBCluster()
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"}}
+	c := ctrlclientfake.NewClientBuilder().WithScheme(selfBuiltLBScheme()).WithObjects(cluster, vsphereCluster).Build()
+	reconciler := &clusterReconciler{Client: c}
+
+	_, err := reconciler.ensureSelfBuiltLB(context.Background(), &capvcontext.ClusterContext{
+		Cluster:        cluster,
+		VSphereCluster: vsphereCluster,
+	})
+	g.Expect(err).To(HaveOccurred())
+
+	got := &clusterv1.Cluster{}
+	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(cluster), got)).To(Succeed())
+	g.Expect(got.Labels).To(HaveKeyWithValue(aliveHALoadBalancerTypeLabel, aliveHALoadBalancerTypeAlive))
+}
+
 func TestValidateVIPNotClaimedBySlot(t *testing.T) {
 	pool := func(ip string) *infrav1.VSphereMachineConfigPool {
 		return &infrav1.VSphereMachineConfigPool{
