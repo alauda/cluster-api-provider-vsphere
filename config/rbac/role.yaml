@@ -138,6 +138,15 @@ rules:
   - cluster.x-k8s.io
   resources:
   - clusters
+  - machines
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
   - clusters/status
   - machinedeployments
   - machines/status
@@ -145,15 +154,6 @@ rules:
   verbs:
   - get
   - list
-  - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - machines
-  verbs:
-  - get
-  - list
-  - patch
   - watch
 - apiGroups:
   - clusterregistry.k8s.io
