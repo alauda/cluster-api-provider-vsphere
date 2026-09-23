@@ -1096,6 +1096,52 @@ func Test_GetPersistentDiskCloudConfig(t *testing.T) {
 	}
 }
 
+func Test_GetPersistentDiskCloudConfigSupportsXFS(t *testing.T) {
+	actual, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
+		Name:       "data-1",
+		UnitNumber: toInt32Ptr(2),
+		MountPath:  "/var/lib/data",
+		FSFormat:   "xfs",
+		VolumePath: "[ds] vm/data-1.vmdk",
+		DiskUUID:   "6000C29d-45cb-2787-e901-a2a0131b2e82",
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var actualObj interface{}
+	if err := yaml.Unmarshal(actual, &actualObj); err != nil {
+		t.Fatalf("failed to parse actual cloud-config: %v", err)
+	}
+	writeFiles := actualObj.(map[interface{}]interface{})["write_files"].([]interface{})
+	decodedConfig, err := base64.StdEncoding.DecodeString(writeFiles[0].(map[interface{}]interface{})["content"].(string))
+	if err != nil {
+		t.Fatalf("failed to decode persistent disk config: %v", err)
+	}
+	if !strings.Contains(string(decodedConfig), "data-1\t2\t/var/lib/data\txfs") {
+		t.Fatalf("expected disk table to carry the xfs format, got: %s", string(decodedConfig))
+	}
+
+	decodedScript, err := base64.StdEncoding.DecodeString(writeFiles[1].(map[interface{}]interface{})["content"].(string))
+	if err != nil {
+		t.Fatalf("failed to decode persistent disk reconcile script: %v", err)
+	}
+	scriptText := string(decodedScript)
+	// mkfs.ext4 forces with -F, mkfs.xfs with -f; the script must pick per format.
+	for _, expected := range []string{
+		`ext4) force_flag="-F" ;;`,
+		`xfs) force_flag="-f" ;;`,
+		`"${mkfs_cmd}" "${force_flag}" "${device_path}"`,
+	} {
+		if !strings.Contains(scriptText, expected) {
+			t.Fatalf("expected reconcile script to contain %q, got: %s", expected, scriptText)
+		}
+	}
+	if strings.Contains(scriptText, `"${mkfs_cmd}" -F `) {
+		t.Fatalf("expected reconcile script to stop hardcoding the ext4 force flag, got: %s", scriptText)
+	}
+}
+
 func Test_GetPersistentDiskCloudConfigCreatesPodLogSymlinkForPersistentContainerdDisk(t *testing.T) {
 	actual, err := util.GetPersistentDiskCloudConfig([]infrav1.PersistentDisk{{
 		Name:       "containerd-data",

@@ -2,9 +2,13 @@ package controllers
 
 import (
 	"context"
+	"path"
+	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/types"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,7 +23,9 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/internal/test/helpers/vcsim"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
 func TestResolveVCenterParams(t *testing.T) {
@@ -303,6 +309,62 @@ func TestMachineConfigPoolReconcileDeleteRemovesFinalizerAfterSafeReclaim(t *tes
 	g.Expect(pool.Status.ConfigStatuses[0].State).To(Equal(infrav1.MachineConfigSlotStateAvailable))
 }
 
+// TestMachineConfigPoolReconcileDeleteResolvesVCenterForOrphanedInUseSlot covers
+// the slot that only reconcileDelete's own loop moves to Released: the pool is
+// deleted while the slot is still InUse and its VSphereMachine is already gone.
+// A pre-loop scan of the slot states cannot see that slot, so the reclaim it
+// needs vCenter credentials for must resolve them on first use instead.
+func TestMachineConfigPoolReconcileDeleteResolvesVCenterForOrphanedInUseSlot(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	_ = infrav1.AddToScheme(scheme)
+
+	pool := &infrav1.VSphereMachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pool",
+			Namespace:  "default",
+			Finalizers: []string{MachineConfigPoolFinalizer},
+		},
+		Spec: infrav1.VSphereMachineConfigPoolSpec{
+			ClusterRef: corev1.ObjectReference{Name: "test-cluster"},
+			Configs: []infrav1.MachineConfigSlot{{
+				Hostname:   "host-1",
+				Datacenter: "dc0",
+				PersistentDisks: []infrav1.PersistentDisk{{
+					Name:       "data",
+					VolumePath: "[ds0] test-cluster-host-1/host-1-data.vmdk",
+				}},
+			}},
+		},
+		Status: infrav1.VSphereMachineConfigPoolStatus{
+			ConfigStatuses: []infrav1.MachineConfigSlotStatus{{
+				Hostname: "host-1",
+				State:    infrav1.MachineConfigSlotStateInUse,
+				MachineRef: &corev1.ObjectReference{
+					Name:      "cp-0",
+					Namespace: "default",
+				},
+			}},
+		},
+	}
+
+	r := machineConfigPoolReconciler{
+		Client: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(pool).
+			Build(),
+	}
+
+	// The Cluster the pool references does not exist, so credential resolution
+	// fails and the pool requeues. What matters is that reclaim asked for the
+	// credentials at all: before they were resolved on first use, this slot
+	// reached reclaimSlotDisks with nil params and panicked.
+	result, err := r.reconcileDelete(context.Background(), pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+	g.Expect(pool.Finalizers).To(ContainElement(MachineConfigPoolFinalizer))
+}
+
 // TestMachineConfigPoolReconcileDeleteMigratedPoolConverges exercises the full
 // reconcileDelete path for a pool upgraded from before the status migration: the
 // disk's observed VolumePath is still frozen on spec and status starts empty.
@@ -514,6 +576,208 @@ func TestReclaimSlotDisks(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(reclaimedAgain).To(BeTrue())
 	})
+	// A freshly provisioned slot: the disk sits at exactly the path clone derives
+	// for it. This pins the round trip reclamation depends on - the directory
+	// clone creates must be the one the reclaim guard re-derives and deletes - so
+	// a change to either side that breaks new environments fails here.
+	t.Run("freshly provisioned slot reclaims its disks and directory", func(t *testing.T) {
+		g := NewWithT(t)
+		ctx := context.Background()
+
+		const (
+			clusterName = "cl1"
+			hostname    = "host-fresh"
+			primaryIP   = "10.0.0.7"
+			datastore   = "LocalDS_0"
+		)
+		// Exactly what clone writes into the backing file name at creation time.
+		volumePath := util.DeterministicDiskPath(hostname, primaryIP, datastore, "data-0", clusterName)
+		g.Expect(volumePath).NotTo(BeEmpty())
+
+		s := newReclaimSession(ctx, g, vcp)
+		createSlotDisk(ctx, g, s, volumePath)
+		expectDatastorePath(ctx, g, s, volumePath, true)
+
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Datacenter: "DC0",
+				ClusterRef: corev1.ObjectReference{Name: clusterName},
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: hostname,
+					Network: &infrav1.MachineConfigSlotNetwork{
+						Primary: infrav1.NetworkConfig{IP: primaryIP},
+					},
+					PersistentDisks: []infrav1.PersistentDisk{{Name: "data-0", SizeGiB: 20}},
+				}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				PersistentDiskStatuses: []infrav1.PersistentDiskStatus{{
+					Hostname: hostname, Name: "data-0",
+					VolumePath: volumePath,
+					Phase:      infrav1.PersistentDiskPhaseAvailable,
+				}},
+			},
+		}
+		r := machineConfigPoolReconciler{}
+
+		reclaimed, _, err := r.reclaimSlotDisks(ctx, pool, &pool.Spec.Configs[0], vcp)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(reclaimed).To(BeTrue(), "a fresh slot's disks must reclaim in one pass")
+
+		rec, _ := infrav1.FindDiskStatus(pool, hostname, "data-0")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseReclaimed))
+		g.Expect(rec.VolumePath).To(BeEmpty())
+
+		// The descriptor, its extent, and the directory are all gone from the datastore.
+		expectDatastorePath(ctx, g, s, volumePath, false)
+		expectDatastorePath(ctx, g, s, strings.TrimSuffix(volumePath, ".vmdk")+"-flat.vmdk", false)
+		expectDatastorePath(ctx, g, s, "["+datastore+"] "+util.DeterministicDiskDirectoryName(hostname, primaryIP, clusterName), false)
+	})
+
+	// The dangerous shape for a wholesale directory delete: a slot whose disks
+	// share one directory, where one of them is still attached. The attached disk
+	// never joins the directory batch, but its siblings do - and deleting the
+	// directory would take the attached vmdk with them. The scan must refuse the
+	// whole directory while anything in it is in use.
+	t.Run("directory holding an attached disk is refused whole", func(t *testing.T) {
+		g := NewWithT(t)
+		ctx := context.Background()
+
+		// An existing simulator VM's disk, and the directory it lives in. Naming the
+		// slot after that directory makes the guard derive exactly this directory,
+		// which is what puts it in reach of the delete at all.
+		attachedPath := firstAttachedDiskPath(ctx, g, vcp)
+		var attachedDS object.DatastorePath
+		g.Expect(attachedDS.FromString(attachedPath)).To(BeTrue())
+		hostname := path.Dir(attachedDS.Path)
+		g.Expect(hostname).NotTo(ContainSubstring("/"), "test needs a single-segment VM directory")
+
+		s := newReclaimSession(ctx, g, vcp)
+		sibling := (&object.DatastorePath{Datastore: attachedDS.Datastore, Path: path.Join(hostname, "data-0.vmdk")}).String()
+		createSlotDisk(ctx, g, s, sibling)
+
+		pool := &infrav1.VSphereMachineConfigPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+			Spec: infrav1.VSphereMachineConfigPoolSpec{
+				Datacenter: "DC0",
+				Configs: []infrav1.MachineConfigSlot{{
+					Hostname: hostname,
+					PersistentDisks: []infrav1.PersistentDisk{
+						{Name: "data-0", SizeGiB: 20},
+						{Name: "attached", SizeGiB: 20},
+					},
+				}},
+			},
+			Status: infrav1.VSphereMachineConfigPoolStatus{
+				PersistentDiskStatuses: []infrav1.PersistentDiskStatus{
+					{Hostname: hostname, Name: "data-0", VolumePath: sibling, Phase: infrav1.PersistentDiskPhaseAvailable},
+					{Hostname: hostname, Name: "attached", VolumePath: attachedPath, Phase: infrav1.PersistentDiskPhaseAttached},
+				},
+			},
+		}
+		r := machineConfigPoolReconciler{}
+
+		// The guard derives this very directory, so the refusal below is the guard
+		// working, not the slot being out of scope.
+		_, ok := govmomi.SlotDiskDirectory(sibling, "", hostname, "")
+		g.Expect(ok).To(BeTrue())
+
+		reclaimed, wait, err := r.reclaimSlotDisks(ctx, pool, &pool.Spec.Configs[0], vcp)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(reclaimed).To(BeFalse())
+		g.Expect(wait).To(BeNumerically(">", 0))
+
+		// Nothing in the directory was touched - least of all the attached disk.
+		expectDatastorePath(ctx, g, s, attachedPath, true)
+		expectDatastorePath(ctx, g, s, sibling, true)
+
+		// The batched disk is parked with the reason, and stays reclaimable.
+		rec, _ := infrav1.FindDiskStatus(pool, hostname, "data-0")
+		g.Expect(rec).NotTo(BeNil())
+		g.Expect(rec.Phase).To(Equal(infrav1.PersistentDiskPhaseError))
+		g.Expect(rec.VolumePath).To(Equal(sibling))
+		g.Expect(rec.LastError).To(ContainSubstring("attached"))
+	})
+
+	// A slot whose disk is not in a directory of its own - what a disk-level
+	// storage policy produces, since vCenter then places the vmdk in the VM home
+	// directory. It must still be reclaimed, one disk at a time.
+	t.Run("disk outside a slot directory reclaims through VirtualDiskManager", func(t *testing.T) {
+		g := NewWithT(t)
+		ctx := context.Background()
+
+		volumePath := "[LocalDS_0] some-vm/host-policy_1.vmdk"
+		s := newReclaimSession(ctx, g, vcp)
+		createSlotDisk(ctx, g, s, volumePath)
+
+		pool := newPool(
+			[]infrav1.PersistentDisk{{Name: "data-0", SizeGiB: 20}},
+			[]infrav1.PersistentDiskStatus{{
+				Hostname: "host-1", Name: "data-0",
+				VolumePath: volumePath,
+				Phase:      infrav1.PersistentDiskPhaseAvailable,
+			}},
+		)
+		r := machineConfigPoolReconciler{}
+
+		var reclaimed bool
+		for i := 0; i < 5 && !reclaimed; i++ {
+			reclaimed, _, err = r.reclaimSlotDisks(ctx, pool, &pool.Spec.Configs[0], vcp)
+			g.Expect(err).NotTo(HaveOccurred())
+		}
+		g.Expect(reclaimed).To(BeTrue())
+
+		expectDatastorePath(ctx, g, s, volumePath, false)
+		expectDatastorePath(ctx, g, s, "[LocalDS_0] some-vm/host-policy_1-flat.vmdk", false)
+		// The VM home directory it lived in is not ours and must survive.
+		expectDatastorePath(ctx, g, s, "[LocalDS_0] some-vm", true)
+	})
+}
+
+func newReclaimSession(ctx context.Context, g *WithT, vcp *vcenterParams) *session.Session {
+	s, err := session.GetOrCreate(ctx, session.NewParams().
+		WithUserInfo(vcp.username, vcp.password).
+		WithServer(vcp.server).
+		WithThumbprint(vcp.thumbprint).
+		WithDatacenter("DC0"))
+	g.Expect(err).NotTo(HaveOccurred())
+	return s
+}
+
+// createSlotDisk creates a virtual disk at volumePath, creating its directory
+// first the way clone's ensurePersistentDiskDirectories does.
+func createSlotDisk(ctx context.Context, g *WithT, s *session.Session, volumePath string) {
+	dc, err := s.Finder.Datacenter(ctx, "DC0")
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var dsPath object.DatastorePath
+	g.Expect(dsPath.FromString(volumePath)).To(BeTrue())
+	directory := (&object.DatastorePath{Datastore: dsPath.Datastore, Path: path.Dir(dsPath.Path)}).String()
+	g.Expect(object.NewFileManager(s.Client.Client).MakeDirectory(ctx, directory, dc, true)).To(Succeed())
+
+	task, err := object.NewVirtualDiskManager(s.Client.Client).CreateVirtualDisk(ctx, volumePath, dc, &types.FileBackedVirtualDiskSpec{
+		VirtualDiskSpec: types.VirtualDiskSpec{AdapterType: "lsiLogic", DiskType: "thick"},
+		CapacityKb:      1024,
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(task.Wait(ctx)).To(Succeed())
+}
+
+// expectDatastorePath asserts whether a datastore path exists.
+func expectDatastorePath(ctx context.Context, g *WithT, s *session.Session, datastorePath string, want bool) {
+	var dsPath object.DatastorePath
+	g.Expect(dsPath.FromString(datastorePath)).To(BeTrue())
+	datastore, err := s.Finder.Datastore(ctx, dsPath.Datastore)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	_, err = datastore.Stat(ctx, dsPath.Path)
+	if want {
+		g.Expect(err).NotTo(HaveOccurred(), "expected %q to exist", datastorePath)
+		return
+	}
+	g.Expect(err).To(HaveOccurred(), "expected %q to be gone", datastorePath)
 }
 
 // firstAttachedDiskPath returns the datastore path of the first virtual disk

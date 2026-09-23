@@ -17,9 +17,12 @@ limitations under the License.
 package webhooks
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+
+	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 )
 
 // AggregateObjErrors aggregates a list of field errors into a single Invalid API error.
@@ -33,4 +36,23 @@ func AggregateObjErrors(gk schema.GroupKind, name string, allErrs field.ErrorLis
 		name,
 		allErrs,
 	)
+}
+
+// isVSphereMachineTemplateRef reports whether ref points at a govmomi VSphereMachineTemplate.
+//
+// KubeadmControlPlane and MachineDeployment are provider-agnostic Cluster API objects, so these
+// webhooks see every one of them in the cluster, including those of clusters backed by another
+// infrastructure provider. The machine config pool rules only apply to our own machine templates:
+// anything else must be left alone rather than resolved by name, which would either reject a
+// perfectly valid object or silently read the pool reference off an unrelated same-named template.
+// The group is compared as well as the kind, because the supervisor API shares the kind name.
+func isVSphereMachineTemplateRef(ref *corev1.ObjectReference) bool {
+	if ref == nil || ref.Kind != "VSphereMachineTemplate" {
+		return false
+	}
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return false
+	}
+	return gv.Group == infrav1.GroupVersion.Group
 }

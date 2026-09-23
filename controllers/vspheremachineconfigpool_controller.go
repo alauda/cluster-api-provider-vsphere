@@ -19,12 +19,13 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 	corev1 "k8s.io/api/core/v1"
@@ -51,6 +52,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/session"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/standby"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
 const (
@@ -370,7 +372,14 @@ func (r machineConfigPoolReconciler) reconcileNormal(ctx context.Context, pool *
 				log.Info("Reclaiming stale slot", "hostname", slot.Hostname, "persistentDiskCount", len(slot.PersistentDisks))
 				reclaimed, wait, err := r.reclaimSlotDisks(ctx, pool, slot, vcp)
 				if err != nil {
+					// Reclamation is best-effort within this pass: the slot keeps its
+					// records and is retried. Requeue explicitly, because the error is not
+					// returned and the status may be unchanged, leaving nothing else to
+					// trigger the next attempt before the cache resync.
 					log.Error(err, "failed to reclaim persistent disks for slot", "hostname", slot.Hostname)
+					if wait == 0 {
+						wait = time.Minute
+					}
 				}
 				if reclaimed {
 					status.State = infrav1.MachineConfigSlotStateAvailable
@@ -669,9 +678,17 @@ func (r machineConfigPoolReconciler) reconcileConsumerBinding(ctx context.Contex
 
 // reclaimSlotDisks drives reclamation of a released slot's persistent disks,
 // tracking per-disk progress in pool.Status.PersistentDiskStatuses (Phase,
-// TaskRef, RetryAfter, LastError). It processes every disk of the slot, deleting
-// or polling as needed, and returns reclaimed=true only once the slot has no
-// remaining reclaimable backing. wait is the shortest requeue any disk requested.
+// TaskRef, RetryAfter, LastError). It returns reclaimed=true only once the slot
+// has no remaining reclaimable backing; wait is the shortest requeue any disk
+// requested.
+//
+// Disks that clone placed in the slot's own directory are reclaimed by deleting
+// that directory, which releases the descriptor and every extent backing it.
+// Deleting the files individually would mean enumerating them, and a vmdk's
+// extents cannot be enumerated reliably from its name. Disks that live elsewhere
+// - a disk-level storage policy puts the vmdk in the VM home directory, and a
+// VolumePath can be set by hand - are deleted one at a time through
+// VirtualDiskManager instead.
 func (r machineConfigPoolReconciler) reclaimSlotDisks(ctx context.Context, pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot, vcp *vcenterParams) (bool, time.Duration, error) {
 	log := ctrl.LoggerFrom(ctx)
 	slotDatacenter := services.ResolveMachineConfigPoolDatacenter(pool, slot)
@@ -695,6 +712,12 @@ func (r machineConfigPoolReconciler) reclaimSlotDisks(ctx context.Context, pool 
 			requeue = w
 		}
 	}
+	// Disks that live in a per-slot disk directory, grouped by directory. They are
+	// reclaimed by deleting the directory itself once the loop below has cleared
+	// every one of them, which releases each descriptor together with its extents.
+	covered := map[string][]string{}
+	clusterName := pool.Spec.ClusterRef.Name
+	primaryIP := util.PrimarySlotIP(slot.Network)
 
 	for i := range slot.PersistentDisks {
 		pd := &slot.PersistentDisks[i]
@@ -708,14 +731,20 @@ func (r machineConfigPoolReconciler) reclaimSlotDisks(ctx context.Context, pool 
 			continue
 		}
 
-		// In-flight reclaim task: poll it.
+		// In-flight reclaim task: poll it. A disk in its slot's own directory is
+		// never reclaimed by a task, so a task recorded against one was recorded
+		// by an older controller through FileManager and deleted only the
+		// descriptor; ignore it and let the directory delete below reclaim the
+		// extents it left behind.
 		if rec != nil && rec.TaskRef != "" {
-			wait, err := r.pollReclaimTask(ctx, s, pool, slot, pd.Name, rec)
-			if err != nil {
-				return false, 0, err
+			if _, inSlotDirectory := govmomi.SlotDiskDirectory(volumePath, clusterName, slot.Hostname, primaryIP); !inSlotDirectory {
+				wait, err := r.pollReclaimTask(ctx, s, pool, slot, pd.Name, rec)
+				if err != nil {
+					return false, requeue, err
+				}
+				accumulate(wait)
+				continue
 			}
-			accumulate(wait)
-			continue
 		}
 
 		if volumePath == "" {
@@ -735,7 +764,7 @@ func (r machineConfigPoolReconciler) reclaimSlotDisks(ctx context.Context, pool 
 		// Safety: never reclaim a disk still attached to a VM.
 		attachments, err := govmomi.FindAttachedPersistentDisks(ctx, s, slotDatacenter, []infrav1.PersistentDisk{{Name: pd.Name, VolumePath: volumePath}})
 		if err != nil {
-			return false, 0, errors.Wrapf(err, "failed to check persistent disk attachments before reclaiming %s", volumePath)
+			return false, requeue, errors.Wrapf(err, "failed to check persistent disk attachments before reclaiming %s", volumePath)
 		}
 		if len(attachments) > 0 {
 			attachmentText := formatPersistentDiskAttachments(attachments)
@@ -743,35 +772,33 @@ func (r machineConfigPoolReconciler) reclaimSlotDisks(ctx context.Context, pool 
 			if r.Recorder != nil {
 				r.Recorder.Eventf(pool, corev1.EventTypeWarning, "PersistentDiskStillAttached", "Waiting to reclaim persistent disk backing %s because it is still attached: %v", volumePath, attachmentText)
 			}
-			retryAfter := metav1.NewTime(time.Now().Add(30 * time.Second))
-			rs := diskRecordBase(pool, slot.Hostname, pd, volumePath)
-			rs.Phase = infrav1.PersistentDiskPhaseError
-			rs.RetryAfter = &retryAfter
-			rs.LastError = fmt.Sprintf("persistent disk is still attached: %v", attachmentText)
-			infrav1.UpsertDiskStatus(pool, rs)
-			accumulate(time.Until(retryAfter.Time))
+			accumulate(recordReclaimError(pool, diskRecordBase(pool, slot.Hostname, pd, volumePath),
+				fmt.Sprintf("persistent disk is still attached: %v", attachmentText), 30*time.Second))
 			continue
 		}
 
-		// Start deletion.
+		// A disk in its slot's own directory is reclaimed with the directory after
+		// the loop. It is deliberately not tombstoned here: the record is what keeps
+		// the slot un-reclaimed if the directory delete fails, and it still carries
+		// the VolumePath the next attempt derives the directory from.
+		if directory, ok := govmomi.SlotDiskDirectory(volumePath, clusterName, slot.Hostname, primaryIP); ok {
+			covered[directory] = append(covered[directory], pd.Name)
+			continue
+		}
+
+		// Everything else - a disk placed in a VM home directory by a disk-level
+		// storage policy, or a VolumePath set by hand - is deleted on its own through
+		// VirtualDiskManager, which understands that a virtual disk is a descriptor
+		// plus its extents. FileManager would delete only the descriptor and leak
+		// the extents, which is the bug this path used to have.
 		log.Info("Deleting persistent disk backing for released slot", "hostname", slot.Hostname, "disk", pd.Name, "path", volumePath)
-		m := object.NewFileManager(s.Client.Client)
-		dc, err := s.Finder.Datacenter(ctx, slotDatacenter)
+		task, err := govmomi.DeletePersistentDiskBacking(ctx, s, slotDatacenter, volumePath)
 		if err != nil {
-			return false, 0, errors.Wrapf(err, "failed to find datacenter %s for reclamation", slotDatacenter)
+			log.Error(err, "Failed to start persistent disk deletion", "hostname", slot.Hostname, "disk", pd.Name, "path", volumePath)
+			accumulate(recordReclaimError(pool, diskRecordBase(pool, slot.Hostname, pd, volumePath), err.Error(), time.Minute))
+			continue
 		}
-		task, err := m.DeleteDatastoreFile(ctx, volumePath, dc)
-		if err != nil {
-			if types.IsFileNotFound(err) {
-				log.Info("Datastore file already gone, treating as reclaimed", "hostname", slot.Hostname, "disk", pd.Name, "path", volumePath)
-				infrav1.TombstoneDiskStatus(pool, slot.Hostname, pd.Name)
-				accumulate(1 * time.Second)
-				continue
-			}
-			log.Error(err, "Failed to start datastore file deletion", "hostname", slot.Hostname, "disk", pd.Name, "path", volumePath)
-			return false, 0, err
-		}
-		log.Info("Started datastore file deletion task", "hostname", slot.Hostname, "disk", pd.Name, "path", volumePath, "task", task.Reference().Value)
+		log.Info("Started persistent disk deletion task", "hostname", slot.Hostname, "disk", pd.Name, "path", volumePath, "task", task.Reference().Value)
 		rs := diskRecordBase(pool, slot.Hostname, pd, volumePath)
 		rs.Phase = infrav1.PersistentDiskPhaseReclaiming
 		rs.TaskRef = task.Reference().Value
@@ -779,19 +806,63 @@ func (r machineConfigPoolReconciler) reclaimSlotDisks(ctx context.Context, pool 
 		accumulate(15 * time.Second)
 	}
 
+	for _, directory := range slices.Sorted(maps.Keys(covered)) {
+		names := covered[directory]
+		if err := r.reclaimSlotDiskDirectory(ctx, s, slotDatacenter, directory); err != nil {
+			log.Error(err, "Failed to reclaim persistent disk directory", "hostname", slot.Hostname, "directory", directory, "disks", names)
+			for _, name := range names {
+				if rec, _ := infrav1.FindDiskStatus(pool, slot.Hostname, name); rec != nil {
+					accumulate(recordReclaimError(pool, *rec, err.Error(), time.Minute))
+				}
+			}
+			continue
+		}
+		log.Info("Reclaimed persistent disk directory", "hostname", slot.Hostname, "directory", directory, "disks", names)
+		for _, name := range names {
+			infrav1.TombstoneDiskStatus(pool, slot.Hostname, name)
+		}
+		accumulate(1 * time.Second)
+	}
+
 	return !services.HasReclaimablePersistentDiskBacking(pool, slot), requeue, nil
 }
 
+// reclaimSlotDiskDirectory deletes a slot's disk directory and everything in it.
+// The directory is only reached here when every disk of the slot that lives in it
+// has passed its own attachment check; the scan below additionally refuses a
+// directory holding a disk attached to any VM at all, so a directory whose name
+// collides with a VM folder is never destroyed under a running VM.
+func (r machineConfigPoolReconciler) reclaimSlotDiskDirectory(ctx context.Context, s *session.Session, datacenter, directory string) error {
+	attachments, err := govmomi.FindAttachedDisksUnderDirectory(ctx, s, datacenter, directory)
+	if err != nil {
+		return errors.Wrapf(err, "failed to check attachments under persistent disk directory %s", directory)
+	}
+	if len(attachments) > 0 {
+		return errors.Errorf("persistent disk directory %s still holds attached disks: %v", directory, formatPersistentDiskAttachments(attachments))
+	}
+	return govmomi.DeleteDatastoreDirectory(ctx, s, datacenter, directory)
+}
+
 // pollReclaimTask checks the in-flight vCenter delete task recorded on rec and
-// advances the disk's status: on success it tombstones the record as Reclaimed,
-// on failure it moves the disk to Error with a retry window.
+// advances the disk's status. The task deletes a single disk through
+// VirtualDiskManager, which removes the descriptor and its extents together, so
+// a successful task does mean the space was released. A failed task moves the
+// disk to Error with a retry window.
 func (r machineConfigPoolReconciler) pollReclaimTask(ctx context.Context, s *session.Session, pool *infrav1.VSphereMachineConfigPool, slot *infrav1.MachineConfigSlot, diskName string, rec *infrav1.PersistentDiskStatus) (time.Duration, error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("hostname", slot.Hostname, "disk", diskName, "task", rec.TaskRef)
 
 	task := &mo.Task{}
 	taskRef := types.ManagedObjectReference{Type: "Task", Value: rec.TaskRef}
 	if err := s.RetrieveOne(ctx, taskRef, []string{"info"}, task); err != nil {
-		return 0, err
+		// vCenter ages task objects out, so a task recorded before a long outage (or
+		// a vCenter restart) can no longer be retrieved. Drop the reference and let
+		// the next pass restart the delete, which is idempotent; erroring here
+		// instead would retry forever and hold up pool deletion. The retry is rate
+		// limited because the same branch also catches a retrieval that keeps
+		// failing for another reason, which would otherwise start a fresh delete
+		// task every pass.
+		log.Info("Reclaim task is no longer retrievable, restarting deletion", "err", err.Error())
+		return recordReclaimError(pool, *rec, "reclaim task is no longer retrievable: "+err.Error(), time.Minute), nil
 	}
 
 	switch task.Info.State {
@@ -815,17 +886,22 @@ func (r machineConfigPoolReconciler) pollReclaimTask(ctx context.Context, s *ses
 			errMessage = task.Info.Error.LocalizedMessage
 		}
 		log.Error(errors.New(errMessage), "Reclaim task failed")
-		retryAfter := metav1.NewTime(time.Now().Add(1 * time.Minute))
-		updated := *rec
-		updated.Phase = infrav1.PersistentDiskPhaseError
-		updated.TaskRef = ""
-		updated.RetryAfter = &retryAfter
-		updated.LastError = errMessage
-		infrav1.UpsertDiskStatus(pool, updated)
-		return time.Until(retryAfter.Time), nil
+		return recordReclaimError(pool, *rec, errMessage, time.Minute), nil
 	default:
 		return 0, errors.Errorf("unknown reclaim task state %q", task.Info.State)
 	}
+}
+
+// recordReclaimError parks a disk's reclaim record in Error with a retry window
+// and returns how long to wait before the next attempt.
+func recordReclaimError(pool *infrav1.VSphereMachineConfigPool, rec infrav1.PersistentDiskStatus, message string, backoff time.Duration) time.Duration {
+	retryAfter := metav1.NewTime(time.Now().Add(backoff))
+	rec.Phase = infrav1.PersistentDiskPhaseError
+	rec.TaskRef = ""
+	rec.RetryAfter = &retryAfter
+	rec.LastError = message
+	infrav1.UpsertDiskStatus(pool, rec)
+	return time.Until(retryAfter.Time)
 }
 
 // diskRecordBase returns a status record for (hostname, disk) carrying forward
@@ -849,31 +925,20 @@ func (r machineConfigPoolReconciler) reconcileDelete(ctx context.Context, pool *
 	// pool.Status.PersistentDiskStatuses before reclaiming against it.
 	services.SeedPersistentDiskStatuses(pool)
 
-	// Check if any vCenter operations are needed (released slots with reclaimable disks)
-	needsVCenter := false
-	for i := range pool.Spec.Configs {
-		slot := &pool.Spec.Configs[i]
-		for _, s := range pool.Status.ConfigStatuses {
-			if s.Hostname == slot.Hostname && s.State == infrav1.MachineConfigSlotStateReleased {
-				if services.HasReclaimablePersistentDiskBacking(pool, slot) {
-					needsVCenter = true
-					break
-				}
-			}
-		}
-		if needsVCenter {
-			break
-		}
-	}
-
+	// vCenter credentials are resolved on first use rather than from a pre-loop
+	// scan of the slot states: the loop below moves an InUse slot to Released
+	// when its VSphereMachine is already gone, so whether any slot needs vCenter
+	// is not knowable before the loop has run.
 	var vcp *vcenterParams
-	if needsVCenter {
-		var err error
-		vcp, err = r.resolveVCenterParams(ctx, pool)
-		if err != nil {
-			log.Error(err, "Cannot resolve vCenter credentials for deletion reclaim, will retry")
-			return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+	resolveVCenter := func() (*vcenterParams, error) {
+		if vcp == nil {
+			params, err := r.resolveVCenterParams(ctx, pool)
+			if err != nil {
+				return nil, err
+			}
+			vcp = params
 		}
+		return vcp, nil
 	}
 
 	statusMap := make(map[string]infrav1.MachineConfigSlotStatus, len(pool.Status.ConfigStatuses))
@@ -920,7 +985,12 @@ func (r machineConfigPoolReconciler) reconcileDelete(ctx context.Context, pool *
 					"hostname", slot.Hostname,
 					"persistentDiskCount", len(slot.PersistentDisks),
 				)
-				reclaimed, wait, err := r.reclaimSlotDisks(ctx, pool, slot, vcp)
+				params, err := resolveVCenter()
+				if err != nil {
+					log.Error(err, "Cannot resolve vCenter credentials for deletion reclaim, will retry")
+					return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+				}
+				reclaimed, wait, err := r.reclaimSlotDisks(ctx, pool, slot, params)
 				if err != nil {
 					return reconcile.Result{}, err
 				}

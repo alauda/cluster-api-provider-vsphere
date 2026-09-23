@@ -22,6 +22,7 @@ import (
 )
 
 // +kubebuilder:webhook:verbs=create;update,path=/validate-controlplane-cluster-x-k8s-io-v1beta1-kubeadmcontrolplane-capv,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,groups=controlplane.cluster.x-k8s.io,resources=kubeadmcontrolplanes,versions=v1beta1,name=validation.kubeadmcontrolplane.capv.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1beta1
+
 type KubeadmControlPlane struct {
 	Client client.Client
 }
@@ -58,8 +59,11 @@ func (webhook *KubeadmControlPlane) ValidateDelete(_ context.Context, _ runtime.
 
 func (webhook *KubeadmControlPlane) validatePoolRef(ctx context.Context, obj *controlplanev1.KubeadmControlPlane) field.ErrorList {
 	var allErrs field.ErrorList
-	template := &infrav1.VSphereMachineTemplate{}
 	templatePath := field.NewPath("spec", "machineTemplate", "infrastructureRef")
+	if !isVSphereMachineTemplateRef(&obj.Spec.MachineTemplate.InfrastructureRef) {
+		return allErrs
+	}
+	template := &infrav1.VSphereMachineTemplate{}
 	key := client.ObjectKey{Namespace: obj.Namespace, Name: obj.Spec.MachineTemplate.InfrastructureRef.Name}
 	if err := webhook.Client.Get(ctx, key, template); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -166,6 +170,9 @@ func rejectOtherObjectsReferencingPool(ctx context.Context, c client.Client, poo
 		if kcp.Name == self.Name && self.Kind == "KubeadmControlPlane" {
 			continue
 		}
+		if !isVSphereMachineTemplateRef(&kcp.Spec.MachineTemplate.InfrastructureRef) {
+			continue
+		}
 		template := &infrav1.VSphereMachineTemplate{}
 		if err := c.Get(ctx, client.ObjectKey{Namespace: kcp.Namespace, Name: kcp.Spec.MachineTemplate.InfrastructureRef.Name}, template); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -184,7 +191,7 @@ func rejectOtherObjectsReferencingPool(ctx context.Context, c client.Client, poo
 	}
 	for i := range mds.Items {
 		md := &mds.Items[i]
-		if md.Spec.Template.Spec.InfrastructureRef.Name == "" {
+		if !isVSphereMachineTemplateRef(&md.Spec.Template.Spec.InfrastructureRef) {
 			continue
 		}
 		if md.Name == self.Name && self.Kind == "MachineDeployment" {

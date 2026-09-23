@@ -100,6 +100,48 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-controlplane-cluster-x-k8s-io-v1beta1-kubeadmcontrolplane-capv
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: validation.kubeadmcontrolplane.capv.cluster.x-k8s.io
+  rules:
+  - apiGroups:
+    - controlplane.cluster.x-k8s.io
+    apiVersions:
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - kubeadmcontrolplanes
+  sideEffects: None
+- admissionReviewVersions:
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-cluster-x-k8s-io-v1beta1-machinedeployment-capv
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: validation.machinedeployment.capv.cluster.x-k8s.io
+  rules:
+  - apiGroups:
+    - cluster.x-k8s.io
+    apiVersions:
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - machinedeployments
+  sideEffects: None
+- admissionReviewVersions:
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-infrastructure-cluster-x-k8s-io-v1beta1-vspherecluster
   failurePolicy: Fail
   matchPolicy: Equivalent

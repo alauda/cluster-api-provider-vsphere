@@ -1305,22 +1305,49 @@ func capvDiskPath(name string) string {
 func DeterministicDiskPath(hostname, primaryIP, datastore, diskName string, clusterNames ...string) string {
 	ds := strings.TrimSpace(datastore)
 	host := strings.TrimSpace(hostname)
-	ip := strings.TrimSpace(primaryIP)
-	if parsed, _, err := net.ParseCIDR(ip); err == nil {
-		ip = parsed.String()
-	}
 	if ds == "" || host == "" || strings.TrimSpace(diskName) == "" {
 		return ""
 	}
+	directory := DeterministicDiskDirectoryName(hostname, primaryIP, clusterNames...)
+	if directory == "" {
+		return ""
+	}
+	return DatastorePrefix(ds) + " " + directory + "/" + DeterministicDiskName(host, normalizeSlotIP(primaryIP), diskName) + ".vmdk"
+}
+
+// DeterministicDiskDirectoryName returns the single datastore path segment that
+// DeterministicDiskPath places a slot's disks in: the slot identity (hostname and
+// primary IP), optionally prefixed with the cluster name. Every persistent disk of
+// a slot on the same datastore shares this directory.
+//
+// Reclamation derives the directory through this function rather than from the
+// observed VolumePath, so that a directory is only ever deleted when its name is
+// one this package would have created.
+//
+// Returns "" when hostname is empty.
+func DeterministicDiskDirectoryName(hostname, primaryIP string, clusterNames ...string) string {
+	host := strings.TrimSpace(hostname)
+	if host == "" {
+		return ""
+	}
 	identity := host
-	if ip != "" {
+	if ip := normalizeSlotIP(primaryIP); ip != "" {
 		identity += "-" + ip
 	}
-	directory := identity
 	if len(clusterNames) > 0 && strings.TrimSpace(clusterNames[0]) != "" {
-		directory = strings.TrimSpace(clusterNames[0]) + "-" + identity
+		return strings.TrimSpace(clusterNames[0]) + "-" + identity
 	}
-	return DatastorePrefix(ds) + " " + directory + "/" + DeterministicDiskName(host, ip, diskName) + ".vmdk"
+	return identity
+}
+
+// normalizeSlotIP trims a slot address and reduces a CIDR to its bare address so
+// the derived identity does not carry a prefix length.
+func normalizeSlotIP(primaryIP string) string {
+	ip := strings.TrimSpace(primaryIP)
+	if parsed, _, err := net.ParseCIDR(ip); err == nil {
+		return parsed.String()
+	}
+	return ip
 }
 
 // PrimarySlotIP returns the configured primary address used for deterministic
@@ -1600,12 +1627,22 @@ while true; do
 
     if [ -n "${mount_path}" ]; then
       if ! blkid "${device_path}" >/dev/null 2>&1; then
+        # The force flag differs per filesystem family: mkfs.ext* takes -F,
+        # mkfs.xfs takes -f. Both mean "overwrite whatever is on the device".
+        case "${fs_format}" in
+          ext4) force_flag="-F" ;;
+          xfs) force_flag="-f" ;;
+          *)
+            echo "unsupported fs format ${fs_format} for disk ${disk_name}" >&2
+            continue
+            ;;
+        esac
         mkfs_cmd="mkfs.${fs_format}"
         if ! command -v "${mkfs_cmd}" >/dev/null 2>&1; then
           echo "missing formatter ${mkfs_cmd} for disk ${disk_name}" >&2
           continue
         fi
-        if ! "${mkfs_cmd}" -F "${device_path}"; then
+        if ! "${mkfs_cmd}" "${force_flag}" "${device_path}"; then
           echo "failed to format ${device_path} for disk ${disk_name}" >&2
           continue
         fi
