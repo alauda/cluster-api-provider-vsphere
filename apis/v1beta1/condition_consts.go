@@ -72,6 +72,31 @@ const (
 
 	// SelfBuiltLoadBalancerInvalidConfigurationReason documents invalid self-built load balancer input configuration.
 	SelfBuiltLoadBalancerInvalidConfigurationReason = "InvalidSelfBuiltLoadBalancerConfiguration"
+
+	// CoreAddonsHandedOffCondition documents whether the platform manages kube-ovn and CoreDNS
+	// of the cluster through ModuleInfo, from platform v4.5, instead of this provider.
+	// It does not gate VSphereCluster.Status.Ready.
+	CoreAddonsHandedOffCondition clusterv1.ConditionType = "CoreAddonsHandedOff"
+
+	// CoreAddonsHandedOffReason documents that the platform manages kube-ovn and CoreDNS.
+	CoreAddonsHandedOffReason = "CoreAddonsHandedOff"
+
+	// CoreAddonsHandoffNotApplicableReason documents that the cluster is below platform v4.5,
+	// so this provider keeps managing kube-ovn and CoreDNS.
+	CoreAddonsHandoffNotApplicableReason = "CoreAddonsHandoffNotApplicable"
+
+	// CoreAddonsHandoffPendingReason documents that the handoff waits for something that
+	// settles by itself, such as the ClusterModule or a rollout.
+	CoreAddonsHandoffPendingReason = "CoreAddonsHandoffPending"
+
+	// CoreAddonsHandoffBlockedReason (Severity=Warning) documents that someone has to act
+	// before the platform can take over, for example on a customised Corefile.
+	CoreAddonsHandoffBlockedReason = "CoreAddonsHandoffBlocked"
+
+	// CoreDNSSkipPhasePendingReason documents that a new cluster waits for the
+	// KubeadmControlPlane to skip the kubeadm CoreDNS addon before the infrastructure
+	// is reported ready.
+	CoreDNSSkipPhasePendingReason = "CoreDNSSkipPhasePending"
 )
 
 // Conditions and condition Reasons for the VSphereMachine and the VSphereVM object.

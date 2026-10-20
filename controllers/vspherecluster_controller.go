@@ -67,6 +67,7 @@ import (
 // +kubebuilder:rbac:groups=cluster.alauda.io,resources=moduleinfoes,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=cluster.alauda.io,resources=moduleinfoes/status,verbs=get
 // +kubebuilder:rbac:groups=cluster.alauda.io,resources=moduleplugins;moduleconfigs;clustermodules,verbs=get;list;watch
+// +kubebuilder:rbac:groups=product.alauda.io,resources=productbases,verbs=get
 // +kubebuilder:rbac:groups=platform.tkestack.io,resources=clusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=clusterregistry.k8s.io,resources=clusters,verbs=get;list;watch
 
