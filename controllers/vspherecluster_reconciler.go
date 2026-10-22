@@ -241,6 +241,7 @@ func (r *clusterReconciler) patch(ctx context.Context, clusterCtx *capvcontext.C
 			infrav1.VSphereClusterVCenterAvailableV1Beta2Condition,
 			infrav1.VSphereClusterClusterModulesReadyV1Beta2Condition,
 			infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition,
+			infrav1.VSphereClusterCoreAddonsHandedOffV1Beta2Condition,
 			infrav1.VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition,
 		}},
 	)
@@ -336,6 +337,13 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 	// Configure CoreDNS before the infrastructure cluster becomes Ready so
 	// kubeadm uses the selected repository during initial bootstrap.
 	if err := r.reconcileKubeadmControlPlaneSystemComponents(ctx, clusterCtx); err != nil {
+		return reconcile.Result{}, err
+	}
+	// A new kube-ovn cluster of platform v4.5 or later gets CoreDNS from the
+	// platform, so kubeadm has to skip its own before KCP creates the first
+	// machine, which it does once the infrastructure is ready.
+	coreDNSSkipped, err := r.reconcileKubeadmControlPlaneCoreDNSSkip(ctx, clusterCtx)
+	if err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -436,6 +444,10 @@ func (r *clusterReconciler) reconcileNormal(ctx context.Context, clusterCtx *cap
 		return affinityReconcileResult, err
 	}
 
+	if r.holdForCoreDNSSkip(clusterCtx.VSphereCluster, coreDNSSkipped) {
+		log.Info("Waiting for the KubeadmControlPlane before reporting the infrastructure ready")
+		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+	}
 	clusterCtx.VSphereCluster.Status.Ready = true
 
 	result, err := r.reconcileKubeOvnAppRelease(ctx, clusterCtx)
@@ -458,9 +470,25 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	if cluster == nil || cluster.Annotations["cpaas.io/network-type"] != "kube-ovn" {
 		conditions.Delete(clusterCtx.VSphereCluster, infrav1.KubeOvnAppReleaseReadyCondition)
 		v1beta2conditions.Delete(clusterCtx.VSphereCluster, infrav1.VSphereClusterKubeOvnAppReleaseReadyV1Beta2Condition)
+		conditions.Delete(clusterCtx.VSphereCluster, infrav1.CoreAddonsHandedOffCondition)
+		v1beta2conditions.Delete(clusterCtx.VSphereCluster, infrav1.VSphereClusterCoreAddonsHandedOffV1Beta2Condition)
 		return reconcile.Result{}, nil
 	}
 	var err error
+
+	// After the handoff the platform owns the kube-ovn AppRelease: never write
+	// it, only report on it.
+	if coreAddonsHandedOff(cluster) {
+		remoteClient, err := r.newRemoteClient(ctx, cluster)
+		if err != nil {
+			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionUnknown, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, err.Error())
+			return reconcile.Result{}, err
+		}
+		if _, err := r.reconcileCoreAddonsHandoff(ctx, clusterCtx, remoteClient); err != nil {
+			return reconcile.Result{}, err
+		}
+		return r.reconcileHandedOffKubeOvn(ctx, clusterCtx, remoteClient)
+	}
 
 	targetVersion := cluster.Annotations["cpaas.io/kube-ovn-version"]
 	joinCIDR := cluster.Annotations["cpaas.io/kube-ovn-join-cidr"]
@@ -520,7 +548,22 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 	}
 	if !ready {
 		r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, "waiting for all control plane Nodes before reconciling kube-ovn AppRelease")
+		r.setCoreAddonsHandoffCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.CoreAddonsHandoffPendingReason, clusterv1.ConditionSeverityInfo, "waiting for every control plane Node to register")
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// kube-ovn sizes ovn-central from the control plane Nodes it sees when it is
+	// rendered, so the handoff waits for all of them, like the provider does.
+	remoteClient, err := client.New(restConfig, client.Options{Scheme: r.Client.Scheme()})
+	if err != nil {
+		return reconcile.Result{}, pkgerrors.Wrap(err, "failed to create workload client")
+	}
+	handedOff, err := r.reconcileCoreAddonsHandoff(ctx, clusterCtx, remoteClient)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if handedOff {
+		return r.reconcileHandedOffKubeOvn(ctx, clusterCtx, remoteClient)
 	}
 
 	chartPullSecret, imagePullSecrets, err := sentryPullSecrets(ctx, clientset)
@@ -539,6 +582,18 @@ func (r *clusterReconciler) reconcileKubeOvnAppRelease(ctx context.Context, clus
 
 	current, err := dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Get(ctx, appRelease.GetName(), metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
+		// A cluster the platform already knows at v4.5 or later gets kube-ovn
+		// from the platform once it is handed over. Installing it here first
+		// only makes the platform take it over and roll it right away.
+		platformInstalls, err := r.platformInstallsKubeOvn(ctx, cluster.Name)
+		if err != nil {
+			r.setReadinessUnknown(clusterCtx.VSphereCluster, kubeOvnAppReleaseConditionSpec, err)
+			return reconcile.Result{}, err
+		}
+		if platformInstalls {
+			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseReconcilingReason, clusterv1.ConditionSeverityInfo, "waiting for the handoff; the platform installs kube-ovn")
+			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 		_, err = dc.Resource(appReleaseGVR).Namespace(appRelease.GetNamespace()).Create(ctx, appRelease, metav1.CreateOptions{})
 		if err != nil {
 			r.setKubeOvnAppReleaseCondition(clusterCtx.VSphereCluster, corev1.ConditionFalse, infrav1.KubeOvnAppReleaseNotReadyReason, clusterv1.ConditionSeverityWarning, err.Error())

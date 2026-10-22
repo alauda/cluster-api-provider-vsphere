@@ -83,12 +83,17 @@ func (r *clusterReconciler) reconcileKubeadmControlPlaneSystemComponents(ctx con
 	dnsImageRepository := path.Join(registry, coreDNSImageRepositoryForTag(coreDNSImageTag(kcp)))
 	originalKCP := kcp.DeepCopy()
 	changed := false
-	if kcp.Spec.KubeadmConfigSpec.ClusterConfiguration == nil {
-		kcp.Spec.KubeadmConfigSpec.ClusterConfiguration = &bootstrapv1.ClusterConfiguration{}
-	}
-	if kcp.Spec.KubeadmConfigSpec.ClusterConfiguration.DNS.ImageRepository != dnsImageRepository {
-		kcp.Spec.KubeadmConfigSpec.ClusterConfiguration.DNS.ImageRepository = dnsImageRepository
-		changed = true
+	// After the handoff the platform owns CoreDNS: leave the KCP DNS settings
+	// alone, but keep the skip annotations so that KCP does not touch CoreDNS
+	// either.
+	if !coreAddonsHandedOff(cluster) {
+		if kcp.Spec.KubeadmConfigSpec.ClusterConfiguration == nil {
+			kcp.Spec.KubeadmConfigSpec.ClusterConfiguration = &bootstrapv1.ClusterConfiguration{}
+		}
+		if kcp.Spec.KubeadmConfigSpec.ClusterConfiguration.DNS.ImageRepository != dnsImageRepository {
+			kcp.Spec.KubeadmConfigSpec.ClusterConfiguration.DNS.ImageRepository = dnsImageRepository
+			changed = true
+		}
 	}
 
 	if kcp.Annotations == nil {
@@ -203,6 +208,10 @@ func (r *clusterReconciler) reconcileKubeProxyRepository(ctx context.Context, cl
 }
 
 func (r *clusterReconciler) reconcileCoreDNSRepository(ctx context.Context, cluster *clusterv1.Cluster, kcp *controlplanev1.KubeadmControlPlane, remoteClient client.Client, imagePullSecret *corev1.LocalObjectReference) error {
+	// After the handoff the platform owns CoreDNS; leave its Deployment alone.
+	if coreAddonsHandedOff(cluster) {
+		return nil
+	}
 	if kcp.Status.Replicas != kcp.Status.UpdatedReplicas {
 		ctrl.LoggerFrom(ctx).V(4).Info("Skipping CoreDNS repository reconcile until KubeadmControlPlane is fully updated",
 			"replicas", kcp.Status.Replicas,

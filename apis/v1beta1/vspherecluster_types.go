@@ -112,6 +112,14 @@ const (
 	VSphereClusterSelfBuiltLoadBalancerReadyV1Beta2Condition = "SelfBuiltLoadBalancerReady"
 )
 
+// VSphereCluster's CoreAddonsHandedOff condition that will be used in v1Beta2 API version.
+const (
+	// VSphereClusterCoreAddonsHandedOffV1Beta2Condition documents whether the platform manages
+	// kube-ovn and CoreDNS of the cluster instead of this provider.
+	// This condition does not contribute to VSphereClusterReadyV1Beta2Condition or VSphereCluster.Status.Ready.
+	VSphereClusterCoreAddonsHandedOffV1Beta2Condition = "CoreAddonsHandedOff"
+)
+
 // VCenterVersion conveys the API version of the vCenter instance.
 type VCenterVersion string
 
@@ -258,7 +266,7 @@ type VSphereClusterStatus struct {
 type VSphereClusterV1Beta2Status struct {
 	// conditions represents the observations of a VSphereCluster's current state.
 	// Known condition types are Ready, FailureDomainsReady, VCenterAvailable, ClusterModulesReady,
-	// KubeOvnAppReleaseReady, SelfBuiltLoadBalancerReady and Paused.
+	// KubeOvnAppReleaseReady, CoreAddonsHandedOff, SelfBuiltLoadBalancerReady and Paused.
 	// +optional
 	// +listType=map
 	// +listMapKey=type

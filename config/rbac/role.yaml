@@ -257,6 +257,12 @@ rules:
   - list
   - watch
 - apiGroups:
+  - product.alauda.io
+  resources:
+  - productbases
+  verbs:
+  - get
+- apiGroups:
   - rbac.authorization.k8s.io
   resources:
   - rolebindings
