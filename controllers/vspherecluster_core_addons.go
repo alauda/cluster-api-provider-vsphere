@@ -551,6 +551,13 @@ func handoffNetworkDevice(cluster *clusterv1.Cluster) string {
 // TLS settings. This provider renders no VLAN or underlay values, so neither
 // does the platform as long as the cluster carries no such annotation; the
 // interface it renders is the one the handoff writes.
+//
+// Below v4.4 the same chart (cpaas-kube-ovn) was published at
+// acp/chart-cpaas-kube-ovn. Moving a release to acp/chart-kube-ovn is an
+// in-place upgrade of release cpaas-kube-ovn: this provider does it when it
+// renders v4.4 or later, and the platform does it for the kube-ovn it installs
+// itself. A cluster upgraded from v4.3, or one whose kube-ovn stayed below v4.4,
+// is therefore handed over on the legacy chart too.
 func kubeOvnAppReleaseBlockers(app *unstructured.Unstructured, target, clusterVersion, podCIDR, serviceCIDR, joinCIDR, networkDevice string) []string {
 	charts, _, _ := unstructured.NestedSlice(app.Object, "spec", "source", "charts")
 	if len(charts) == 0 {
@@ -561,7 +568,7 @@ func kubeOvnAppReleaseBlockers(app *unstructured.Unstructured, target, clusterVe
 	revision, _ := chart["targetRevision"].(string)
 
 	var blockers []string
-	if chartName != kubeOvnChartNameV44 {
+	if chartName != kubeOvnChartNameV44 && chartName != kubeOvnLegacyChartName {
 		blockers = append(blockers, fmt.Sprintf("the kube-ovn AppRelease uses %s, not %s", chartName, kubeOvnChartNameV44))
 	}
 	switch {

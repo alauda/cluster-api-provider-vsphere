@@ -479,11 +479,21 @@ func TestReconcileCoreAddonsHandoff(t *testing.T) {
 			wantMessage: "kube-ovn is at v4.5.7, the platform installs v4.5.3 on v4.5.0",
 		},
 		{
-			name:        "a kube-ovn on the legacy chart blocks the handoff",
+			// A cluster upgraded from v4.3, or whose kube-ovn stayed below v4.4,
+			// still has the chart at its pre-v4.4 address; the platform moves the
+			// same release to acp/chart-kube-ovn when it upgrades it.
+			name:              "a kube-ovn on the legacy chart is handed over for the platform to upgrade it",
+			managed:           v45,
+			remote:            withCoreDNS(providerKubeOvnAppRelease(kubeOvnLegacyChartName, "v4.3.9")),
+			wantHandedOff:     true,
+			wantNetworkDevice: kubeOvnInterface,
+		},
+		{
+			name:        "a kube-ovn AppRelease on another chart blocks the handoff",
 			managed:     v45,
-			remote:      withCoreDNS(providerKubeOvnAppRelease(kubeOvnLegacyChartName, "v4.3.9")),
+			remote:      withCoreDNS(providerKubeOvnAppRelease("acp/chart-other-cni", handoffKubeOvn)),
 			wantReason:  infrav1.CoreAddonsHandoffBlockedReason,
-			wantMessage: "uses acp/chart-cpaas-kube-ovn",
+			wantMessage: "uses acp/chart-other-cni",
 		},
 		{
 			// The platform would move kube-ovn to the interface the cluster names.
