@@ -557,6 +557,31 @@ func TestKubeProxyConfigWithVIPExcluded(t *testing.T) {
 		g.Expect(again).To(Equal(updated))
 	})
 
+	// kubeadm renders the whole default KubeProxyConfiguration, so the list
+	// it has nothing for arrives as null rather than absent. Reading that as
+	// an error left every kubeadm-built cluster with the VIP unexcluded and
+	// strictARP off, and the VSphereCluster reconcile failing on every pass.
+	t.Run("treats the null kubeadm writes as no exclusions", func(t *testing.T) {
+		g := NewWithT(t)
+		updated, changed, err := kubeProxyConfigWithVIPExcluded(
+			"mode: ipvs\nipvs:\n  excludeCIDRs: null\n  strictARP: false\n  scheduler: \"\"\n", "10.0.0.10")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(changed).To(BeTrue())
+
+		config := map[string]interface{}{}
+		g.Expect(yaml.Unmarshal([]byte(updated), &config)).To(Succeed())
+		strictARP, _, _ := unstructured.NestedBool(config, "ipvs", "strictARP")
+		g.Expect(strictARP).To(BeTrue())
+		excludeCIDRs, _, _ := unstructured.NestedStringSlice(config, "ipvs", "excludeCIDRs")
+		g.Expect(excludeCIDRs).To(ConsistOf("10.0.0.10/32"))
+	})
+
+	t.Run("still refuses an excludeCIDRs that is not a list", func(t *testing.T) {
+		g := NewWithT(t)
+		_, _, err := kubeProxyConfigWithVIPExcluded("mode: ipvs\nipvs:\n  excludeCIDRs: 10.0.1.0/24\n", "10.0.0.10")
+		g.Expect(err).To(HaveOccurred())
+	})
+
 	t.Run("keeps existing exclusions", func(t *testing.T) {
 		g := NewWithT(t)
 		updated, changed, err := kubeProxyConfigWithVIPExcluded("mode: ipvs\nipvs:\n  excludeCIDRs:\n  - 10.0.1.0/24\n", "10.0.0.10")
