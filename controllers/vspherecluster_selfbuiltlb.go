@@ -825,9 +825,16 @@ func kubeProxyConfigWithVIPExcluded(rawConfig, vip string) (string, bool, error)
 	}
 
 	vipCIDR := vip + "/32"
-	excludeCIDRs, _, err := unstructured.NestedStringSlice(ipvs, "excludeCIDRs")
-	if err != nil {
-		return "", false, pkgerrors.Wrap(err, "failed to read the kube-proxy ipvs.excludeCIDRs")
+	// kubeadm writes the full default configuration, where an empty list is
+	// "excludeCIDRs: null". NestedStringSlice rejects that as the wrong type,
+	// which left every kubeadm-built cluster without the exclusion, so a null
+	// value reads as no exclusions yet.
+	var excludeCIDRs []string
+	if ipvs["excludeCIDRs"] != nil {
+		excludeCIDRs, _, err = unstructured.NestedStringSlice(ipvs, "excludeCIDRs")
+		if err != nil {
+			return "", false, pkgerrors.Wrap(err, "failed to read the kube-proxy ipvs.excludeCIDRs")
+		}
 	}
 	if !containsString(excludeCIDRs, vipCIDR) {
 		excludeCIDRs = append(excludeCIDRs, vipCIDR)
