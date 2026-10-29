@@ -231,7 +231,7 @@ chart 已具备，唯一质量差距：`values.yaml` 提交了真实形态凭据
 - **设计**：固定 IP 场景强制先删后建（复用刚释放的槽位），不支持 surge，故 webhook 采用强制校验而非 precheck。infra template 引用 `machineConfigPoolRef` 时，KCP/MD webhook（`internal/webhooks/{kubeadmcontrolplane,machinedeployment}.go`）追加三条约束：
   - **`maxSurge == 0`**（KCP 与 MD 均适用）：只接受整型 0，`nil`（默认 1）与非零值一律拒绝。MD 的 `OnDelete` 策略无 surge，跳过。
   - **MD `maxUnavailable ≥ 1`**：`maxSurge` 被钉为 0 后，滚动升级只能靠先删旧机腾槽位再建新机；而 CAPI 默认 `maxUnavailable=0`，与 `maxSurge=0` 组合会 0/0 卡死，故要求 `maxUnavailable` 显式 ≥ 1。
-  - **KCP `replicas ≥ 3`**：CAPI 仅允许控制面在副本数 ≥ 3 时用 `maxSurge=0`（scale-in）。由本 webhook 提前拦截并给出清晰 reason，避免落到 CAPI 那条含糊的 scale-in 报错；不支持单副本固定 IP 控制面。
+  - **KCP `replicas` 为 1 或 ≥ 3**：CAPI 仅允许控制面在副本数 ≥ 3 时用 `maxSurge=0`（scale-in）。2 副本由本 webhook 提前拦截并给出清晰 reason，避免落到 CAPI 那条含糊的 scale-in 报错。单副本允许创建，不受 `maxSurge=0` 约束，沿用 CAPI 默认的 `maxSurge=1`；它不支持升级：先建后删的替换需要池里有空闲槽位。
 - **验收**：见 [test-cases.md](test-cases.md) TC-CAPV-ACP-14。
 
 ---

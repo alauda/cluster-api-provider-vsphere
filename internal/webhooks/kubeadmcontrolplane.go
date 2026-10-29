@@ -103,25 +103,31 @@ func (webhook *KubeadmControlPlane) validatePoolRef(ctx context.Context, obj *co
 		allErrs = append(allErrs, field.Forbidden(templatePath, err.Error()))
 	}
 
+	// A single-replica control plane is allowed as a creation-time topology, but it cannot be upgraded:
+	// Cluster API rejects maxSurge 0 below 3 replicas, so its only rollout is surge-first, and the new machine
+	// needs a free pool slot that a fully-allocated pool does not have. The maxSurge rule is therefore not
+	// applied to it, and Cluster API's own defaulting (maxSurge 1) stands. A nil replicas is Cluster API's
+	// default of 1.
+	if obj.Spec.Replicas == nil || *obj.Spec.Replicas == 1 {
+		return allErrs
+	}
+
+	// Above one, a fixed-IP rollout uses maxSurge 0 (scale-in), which Cluster API only permits for control
+	// planes with at least 3 replicas. Enforce it here so the rejection carries a clear, self-explanatory
+	// reason instead of Cluster API's generic scale-in error.
+	if *obj.Spec.Replicas < 3 {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "replicas"), fmt.Sprintf("%d", *obj.Spec.Replicas),
+			"a KubeadmControlPlane whose infrastructure template references a machineConfigPoolRef (fixed IP) must have 1 or at least 3 replicas: "+
+				"a multi-replica fixed-IP rollout uses maxSurge 0 (scale-in), which Cluster API only permits for control planes with 3 or more replicas"))
+		return allErrs
+	}
+
 	var maxSurge *intstr.IntOrString
 	if obj.Spec.RolloutStrategy != nil && obj.Spec.RolloutStrategy.RollingUpdate != nil {
 		maxSurge = obj.Spec.RolloutStrategy.RollingUpdate.MaxSurge
 	}
 	if err := requireZeroMaxSurge(maxSurge, field.NewPath("spec", "rolloutStrategy", "rollingUpdate", "maxSurge")); err != nil {
 		allErrs = append(allErrs, err)
-	}
-
-	// A fixed-IP rollout uses maxSurge 0 (scale-in), which Cluster API only permits for control planes with
-	// at least 3 replicas. Enforce it here so the rejection carries a clear, self-explanatory reason instead
-	// of Cluster API's generic scale-in error; single-replica control planes are not supported on fixed IP.
-	if obj.Spec.Replicas == nil || *obj.Spec.Replicas < 3 {
-		val := "1 (default)"
-		if obj.Spec.Replicas != nil {
-			val = fmt.Sprintf("%d", *obj.Spec.Replicas)
-		}
-		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "replicas"), val,
-			"a KubeadmControlPlane whose infrastructure template references a machineConfigPoolRef (fixed IP) must have at least 3 replicas: "+
-				"the fixed-IP rollout uses maxSurge 0 (scale-in), which Cluster API only permits for control planes with 3 or more replicas; single-replica control planes are not supported"))
 	}
 
 	return allErrs
