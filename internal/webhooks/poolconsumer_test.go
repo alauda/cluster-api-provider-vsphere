@@ -213,7 +213,7 @@ func TestKubeadmControlPlaneMaxSurge(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
 		Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
 	}
-	// replicas is pinned to 3 so these cases exercise only the maxSurge rule, not the replicas >= 3 rule.
+	// replicas is pinned to 3 so these cases exercise only the maxSurge rule, not the replicas rule.
 	newKCP := func(strategy *controlplanev1.RolloutStrategy) *controlplanev1.KubeadmControlPlane {
 		return &controlplanev1.KubeadmControlPlane{
 			ObjectMeta: metav1.ObjectMeta{Name: "cp-a", Namespace: "default"},
@@ -274,40 +274,44 @@ func TestKubeadmControlPlaneReplicas(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
 		Spec:       infrav1.VSphereMachineConfigPoolSpec{ClusterRef: corev1.ObjectReference{Name: "test-cluster"}, Configs: []infrav1.MachineConfigSlot{{Hostname: "slot-1"}}},
 	}
-	// maxSurge is pinned to 0 so these cases exercise only the replicas >= 3 rule, not the maxSurge rule.
-	newKCP := func(replicas *int32) *controlplanev1.KubeadmControlPlane {
+	newKCP := func(replicas *int32, strategy *controlplanev1.RolloutStrategy) *controlplanev1.KubeadmControlPlane {
 		return &controlplanev1.KubeadmControlPlane{
 			ObjectMeta: metav1.ObjectMeta{Name: "cp-a", Namespace: "default"},
 			Spec: controlplanev1.KubeadmControlPlaneSpec{
 				MachineTemplate: controlplanev1.KubeadmControlPlaneMachineTemplate{InfrastructureRef: vsphereTemplateRef("cp-template")},
 				Replicas:        replicas,
-				RolloutStrategy: zeroMaxSurgeRolloutStrategy(),
+				RolloutStrategy: strategy,
 			},
 		}
 	}
+	surgeOne := &controlplanev1.RolloutStrategy{RollingUpdate: &controlplanev1.RollingUpdate{MaxSurge: ptr.To(intstr.FromInt32(1))}}
 
 	tests := []struct {
 		name     string
 		withPool bool
 		replicas *int32
-		wantErr  bool
+		strategy *controlplanev1.RolloutStrategy
+		wantErr  string
 	}{
-		{name: "pool-bound with 3 replicas is allowed", withPool: true, replicas: ptr.To(int32(3)), wantErr: false},
-		{name: "pool-bound with 5 replicas is allowed", withPool: true, replicas: ptr.To(int32(5)), wantErr: false},
-		{name: "pool-bound with 1 replica is rejected", withPool: true, replicas: ptr.To(int32(1)), wantErr: true},
-		{name: "pool-bound with 2 replicas is rejected", withPool: true, replicas: ptr.To(int32(2)), wantErr: true},
-		{name: "pool-bound with nil (default) replicas is rejected", withPool: true, replicas: nil, wantErr: true},
-		{name: "template without pool ignores replicas", withPool: false, replicas: ptr.To(int32(1)), wantErr: false},
+		{name: "pool-bound with 3 replicas is allowed", withPool: true, replicas: ptr.To(int32(3)), strategy: zeroMaxSurgeRolloutStrategy()},
+		{name: "pool-bound with 5 replicas is allowed", withPool: true, replicas: ptr.To(int32(5)), strategy: zeroMaxSurgeRolloutStrategy()},
+		// A single replica cannot use maxSurge 0 (Cluster API rejects it below 3), so it is allowed with the
+		// default strategy and with an explicit maxSurge 1.
+		{name: "pool-bound with 1 replica and the default strategy is allowed", withPool: true, replicas: ptr.To(int32(1))},
+		{name: "pool-bound with 1 replica and maxSurge 1 is allowed", withPool: true, replicas: ptr.To(int32(1)), strategy: surgeOne},
+		{name: "pool-bound with nil (default) replicas is allowed", withPool: true, replicas: nil},
+		{name: "pool-bound with 2 replicas is rejected", withPool: true, replicas: ptr.To(int32(2)), strategy: zeroMaxSurgeRolloutStrategy(), wantErr: "must have 1 or at least 3 replicas"},
+		{name: "template without pool ignores replicas", withPool: false, replicas: ptr.To(int32(2))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
-			kcp := newKCP(tt.replicas)
+			kcp := newKCP(tt.replicas, tt.strategy)
 			webhook := &KubeadmControlPlane{Client: ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(newTemplate(tt.withPool), kcp, pool).Build()}
 			_, err := webhook.ValidateCreate(context.Background(), kcp)
-			if tt.wantErr {
+			if tt.wantErr != "" {
 				g.Expect(err).To(HaveOccurred())
-				g.Expect(err.Error()).To(ContainSubstring("must have at least 3 replicas"))
+				g.Expect(err.Error()).To(ContainSubstring(tt.wantErr))
 			} else {
 				g.Expect(err).NotTo(HaveOccurred())
 			}
