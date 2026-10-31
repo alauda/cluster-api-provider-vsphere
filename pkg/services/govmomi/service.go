@@ -921,11 +921,7 @@ func (vms *VMService) applyRegistryBootstrap(ctx context.Context, vmCtx *capvcon
 	if vmCtx == nil || vmCtx.VSphereVM == nil {
 		return userData, format, nil
 	}
-	var c client.Client
-	if vmCtx.ControllerManagerContext != nil {
-		c = vmCtx.Client
-	}
-	config, err := registrybootstrap.LoadForVSphereVM(ctx, c, vmCtx.VSphereVM)
+	config, err := registrybootstrap.LoadForVSphereVM(ctx, vmCtx.Client, vmCtx.VSphereVM)
 	if err != nil {
 		return nil, format, err
 	}
