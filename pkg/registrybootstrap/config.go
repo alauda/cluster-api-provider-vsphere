@@ -261,37 +261,38 @@ func validateBootstrapCredentials(secret *corev1.Secret, endpoints []string) err
 	if len(config.Auths) == 0 {
 		return nil
 	}
-	auths := make(map[string]authEntry, len(config.Auths))
-	for endpoint, entry := range config.Auths {
-		key, err := EndpointKey(endpoint)
-		if err != nil {
-			continue
-		}
-		if entry.Auth != "" {
-			raw, err := base64.StdEncoding.DecodeString(entry.Auth)
-			parts := strings.SplitN(string(raw), ":", 2)
-			if err != nil || len(parts) != 2 {
-				return fmt.Errorf("invalid bootstrap credential encoding")
-			}
-			if (entry.Username != "" && entry.Username != parts[0]) || (entry.Password != "" && entry.Password != parts[1]) {
-				return fmt.Errorf("conflicting bootstrap credential encodings")
-			}
-			entry.Username, entry.Password, entry.Auth = parts[0], parts[1], ""
-		}
-		if entry.Username == "" && entry.Password == "" && entry.IdentityToken == "" && entry.RegistryToken == "" {
-			return fmt.Errorf("empty bootstrap credential entry")
-		}
-		if old, ok := auths[key]; ok && old != entry {
-			return fmt.Errorf("conflicting bootstrap credential aliases")
-		}
-		auths[key] = entry
-	}
 	for _, endpoint := range endpoints {
 		key, err := EndpointKey(endpoint)
 		if err != nil {
 			return err
 		}
-		if _, ok := auths[key]; !ok {
+		var matched *authEntry
+		for alias, candidate := range config.Auths {
+			aliasKey, aliasErr := EndpointKey(alias)
+			if aliasErr != nil || aliasKey != key {
+				continue
+			}
+			candidateCopy := candidate
+			if candidateCopy.Auth != "" {
+				raw, decodeErr := base64.StdEncoding.DecodeString(candidateCopy.Auth)
+				parts := strings.SplitN(string(raw), ":", 2)
+				if decodeErr != nil || len(parts) != 2 {
+					return fmt.Errorf("invalid bootstrap credential encoding")
+				}
+				if (candidateCopy.Username != "" && candidateCopy.Username != parts[0]) || (candidateCopy.Password != "" && candidateCopy.Password != parts[1]) {
+					return fmt.Errorf("conflicting bootstrap credential encodings")
+				}
+				candidateCopy.Username, candidateCopy.Password, candidateCopy.Auth = parts[0], parts[1], ""
+			}
+			if candidateCopy.Username == "" && candidateCopy.Password == "" && candidateCopy.IdentityToken == "" && candidateCopy.RegistryToken == "" {
+				return fmt.Errorf("empty bootstrap credential entry")
+			}
+			if matched != nil && *matched != candidateCopy {
+				return fmt.Errorf("conflicting bootstrap credential aliases")
+			}
+			matched = &candidateCopy
+		}
+		if matched == nil {
 			return fmt.Errorf("bootstrap credentials missing configured endpoint")
 		}
 	}
