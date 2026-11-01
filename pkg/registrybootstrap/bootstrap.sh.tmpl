@@ -83,7 +83,7 @@ chmod 0600 /etc/acp/registry-bootstrap/sandbox-image
 /bin/bash /etc/acp/registry-bootstrap/restore-pause.sh
 probe=$(mktemp /run/acp-registry-sandbox.XXXXXX)
 cgroup_parent=''
-if containerd --config /etc/containerd/config.toml config dump | grep -Eq 'SystemdCgroup *= *true'; then cgroup_parent='kubepods.slice'; fi
+if containerd --config /etc/containerd/config.toml config dump | grep -Eiq '(SystemdCgroup|systemd_cgroup)[[:space:]]*=[[:space:]]*true'; then cgroup_parent='kubepods.slice'; fi
 cat > "$probe" <<JSON
 {"metadata":{"name":"registry-bootstrap-check","namespace":"kube-system","uid":"registry-bootstrap-check","attempt":0},"log_directory":"/tmp","linux":{"cgroup_parent":"$cgroup_parent","security_context":{"namespace_options":{"network":2}}}}
 JSON

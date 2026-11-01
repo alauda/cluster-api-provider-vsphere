@@ -154,3 +154,32 @@ func TestEndpointKeyCanonicalizesDefaultPortAndIPv6(t *testing.T) {
 		t.Fatalf("IPv6 aliases did not canonicalize: %q != %q", ip1, ip2)
 	}
 }
+
+func TestLoadForClusterAcceptsIPv6DefaultPortCredentialAlias(t *testing.T) {
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "cpaas-system", UID: "cluster-uid", Annotations: map[string]string{
+		RegistryModeAnnotation:   "mirror",
+		RegistryConfigAnnotation: "registry-bootstrap",
+	}}}
+	creds := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "registry-creds", Namespace: cluster.Namespace}, Type: corev1.SecretTypeDockerConfigJson, Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"[2001:db8::1]":{"username":"user","password":"pass"}}}`)}}
+	config := map[string]interface{}{
+		"mode": "mirror", "source": RegistrySource, "endpoints": []string{"[2001:db8::1]:443"},
+		"clusterUID": string(cluster.UID), "configVersion": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"bootstrapCredentialsSecretRef": map[string]string{"name": "registry-creds"},
+	}
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "registry-bootstrap", Namespace: cluster.Namespace}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{"config.json": payload}}
+	scheme := runtime.NewScheme()
+	if err := clusterv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, bootstrap, creds).Build()
+	if _, err := LoadForCluster(context.Background(), c, cluster); err != nil {
+		t.Fatal(err)
+	}
+}
