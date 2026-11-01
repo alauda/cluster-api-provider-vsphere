@@ -4,6 +4,7 @@ package registrybootstrap
 
 import (
 	"context"
+	"fmt"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -14,12 +15,15 @@ import (
 // LoadForVSphereVM resolves the owning CAPI Cluster from the VM's standard
 // cluster label and loads its versioned bootstrap snapshot.
 func LoadForVSphereVM(ctx context.Context, c client.Client, vm *infrav1.VSphereVM) (Config, error) {
-	if vm == nil || c == nil {
+	if vm == nil {
 		return Config{}, nil
 	}
 	clusterName := vm.Labels[clusterv1.ClusterNameLabel]
 	if clusterName == "" {
 		return Config{}, nil
+	}
+	if c == nil {
+		return Config{}, fmt.Errorf("registry bootstrap client is nil")
 	}
 	cluster := &clusterv1.Cluster{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: vm.Namespace, Name: clusterName}, cluster); err != nil {

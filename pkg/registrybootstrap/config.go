@@ -171,14 +171,17 @@ func LoadForCluster(ctx context.Context, c client.Client, cluster *clusterv1.Clu
 }
 
 func inputSecret(ctx context.Context, c client.Client, namespace string, ref *secretReference) (*corev1.Secret, error) {
-	if ref == nil || ref.Name == "" || ref.UID == "" || ref.ResourceVersion == "" {
-		return nil, fmt.Errorf("registry input Secret reference must include name, UID and resourceVersion")
+	if ref == nil || ref.Name == "" {
+		return nil, fmt.Errorf("registry input Secret reference must include a name")
 	}
 	secret := &corev1.Secret{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.Name}, secret); err != nil {
 		return nil, fmt.Errorf("read registry input Secret: %w", err)
 	}
-	if string(secret.UID) != ref.UID || secret.ResourceVersion != ref.ResourceVersion {
+	if ref.UID != "" && string(secret.UID) != ref.UID {
+		return nil, fmt.Errorf("registry input Secret revision mismatch")
+	}
+	if ref.ResourceVersion != "" && secret.ResourceVersion != ref.ResourceVersion {
 		return nil, fmt.Errorf("registry input Secret revision mismatch")
 	}
 	return secret, nil

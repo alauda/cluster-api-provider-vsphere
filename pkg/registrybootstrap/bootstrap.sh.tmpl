@@ -88,6 +88,9 @@ cat > "$probe" <<JSON
 {"metadata":{"name":"registry-bootstrap-check","namespace":"kube-system","uid":"registry-bootstrap-check","attempt":0},"log_directory":"/tmp","linux":{"cgroup_parent":"$cgroup_parent","security_context":{"namespace_options":{"network":2}}}}
 JSON
 sandbox_id=$(crictl runp "$probe")
+crictl stopp "$sandbox_id" >/dev/null 2>&1 || true
+crictl rmp "$sandbox_id" >/dev/null 2>&1 || true
+sandbox_id=''
 mkdir -p /etc/acp/registry-bootstrap
 : > /etc/acp/registry-bootstrap/provider-ready
 chmod 0600 /etc/acp/registry-bootstrap/provider-ready
