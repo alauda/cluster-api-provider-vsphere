@@ -1,0 +1,98 @@
+#!/bin/bash
+set -euo pipefail
+# MCO owns runtime configuration once it has taken over this node.
+if [ -e /etc/containerd/.acp-registry-mco-managed ]; then exit 0; fi
+if [ -s /etc/acp/registry-bootstrap/sandbox-image ] && [ -f /etc/containerd/.acp-registry-bootstrap-version ] && [ "$(cat /etc/containerd/.acp-registry-bootstrap-version)" = '{{.ConfigVersion}}' ]; then
+  mkdir -p /etc/acp/registry-bootstrap
+  : > /etc/acp/registry-bootstrap/provider-ready
+  chmod 0600 /etc/acp/registry-bootstrap/provider-ready
+  exit 0
+fi
+for command in containerd ctr crictl curl awk tar jq; do command -v "$command" >/dev/null; done
+containerd --version | grep -Eq 'containerd[^ ]* .*v?2\.'
+required_images=(pause kube-apiserver kube-controller-manager kube-scheduler etcd kube-proxy coredns)
+images=()
+for name in "${required_images[@]}"; do
+  archive="/root/images/$name.tar"
+  test -s "$archive" || { echo "OS bootstrap image archive missing: $name" >&2; exit 1; }
+  if index=$(tar -xOf "$archive" index.json 2>/dev/null); then
+    image=$(printf '%s' "$index" | jq -er '[.manifests[]? | (.annotations["io.containerd.image.name"] // .annotations["org.opencontainers.image.ref.name"] // empty)] | if length == 1 then .[0] else error("expected one image reference") end')
+  else
+    image=$(tar -xOf "$archive" manifest.json | jq -er '[.[].RepoTags[]?] | unique | if length == 1 then .[0] else error("expected one image reference") end')
+  fi
+  case "$image" in '{{.Source}}/acp/k8s/'"$name":?*) ;; *) echo "Invalid OS bootstrap image reference: $name" >&2; exit 1;; esac
+  case "$image" in *[!a-zA-Z0-9_./:@+-]*) echo "Unsafe OS bootstrap image reference: $name" >&2; exit 1;; esac
+  images+=("$image")
+done
+sandbox=${images[0]}
+backup=$(mktemp -d /run/acp-registry-rollback.XXXXXX)
+chmod 0700 "$backup"
+managed_files=(/etc/containerd/config.toml /etc/containerd/conf.d/acp-registry.toml '/etc/containerd/certs.d/{{.Source}}/hosts.toml' '/etc/containerd/certs.d/{{.Source}}/ca.crt' /etc/containerd/.acp-registry-bootstrap-version /etc/acp/registry-bootstrap/provider-ready /etc/acp/registry-bootstrap/sandbox-image)
+for i in "${!managed_files[@]}"; do
+  if [ -e "${managed_files[$i]}" ]; then cp -p "${managed_files[$i]}" "$backup/$i"; fi
+done
+was_active=false
+if systemctl is-active --quiet containerd; then was_active=true; fi
+committed=false
+probe=''
+sandbox_id=''
+cleanup() {
+  result=$?
+  trap - EXIT
+  set +e
+  if [ -n "$sandbox_id" ]; then crictl stopp "$sandbox_id" >/dev/null 2>&1; crictl rmp "$sandbox_id" >/dev/null 2>&1; fi
+  if [ -n "$probe" ]; then rm -f "$probe"; fi
+  if [ "$committed" != true ]; then
+    for i in "${!managed_files[@]}"; do
+      if [ -e "$backup/$i" ]; then cp -p "$backup/$i" "${managed_files[$i]}"; else rm -f "${managed_files[$i]}"; fi
+    done
+    if [ "$was_active" = true ]; then systemctl restart containerd; else systemctl stop containerd; fi
+  fi
+  rm -f /etc/containerd/.acp-config-migrated.toml /etc/containerd/.acp-config-new.toml
+  rm -rf "$backup"
+  exit "$result"
+}
+trap cleanup EXIT
+mkdir -p '/etc/containerd/certs.d/{{.Source}}' /etc/containerd/conf.d
+install -m 0644 /etc/acp/registry-bootstrap/hosts.toml '/etc/containerd/certs.d/{{.Source}}/hosts.toml'
+{{if .CA}}install -m 0644 /etc/acp/registry-bootstrap/ca.crt '/etc/containerd/certs.d/{{.Source}}/ca.crt'{{else}}rm -f '/etc/containerd/certs.d/{{.Source}}/ca.crt'{{end}}
+containerd --config /etc/containerd/config.toml config migrate > /etc/containerd/.acp-config-migrated.toml
+awk '/^imports = / { if ($0 !~ /acp-registry.toml/) {sub(/\]$/, ", \"\/etc\/containerd\/conf.d\/acp-registry.toml\"]"); sub(/\[ *,/, "[")} found=1 } {print} END {if (!found) exit 1}' /etc/containerd/.acp-config-migrated.toml > /etc/containerd/.acp-config-new.toml
+cat > /etc/containerd/conf.d/acp-registry.toml <<CONFIG
+version = 3
+[plugins.'io.containerd.cri.v1.images'.registry]
+  config_path = '/etc/containerd/certs.d'
+[plugins.'io.containerd.cri.v1.images'.pinned_images]
+  sandbox = '$sandbox'
+CONFIG
+containerd --config /etc/containerd/.acp-config-new.toml config dump >/dev/null
+mv /etc/containerd/.acp-config-new.toml /etc/containerd/config.toml
+rm -f /etc/containerd/.acp-config-migrated.toml
+systemctl restart containerd
+for attempt in $(seq 1 60); do if crictl info >/dev/null 2>&1; then break; fi; sleep 1; done
+crictl info >/dev/null
+reachable=false
+{{range .Endpoints}}
+if code=$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 {{if $.Insecure}}--insecure {{else if $.CA}}--cacert '/etc/acp/registry-bootstrap/ca.crt' {{end}}'https://{{.}}/v2/'); then case "$code" in 200|401) reachable=true;; esac; fi
+{{end}}
+if [ "$reachable" != true ]; then echo 'No mirror endpoint is reachable with configured TLS policy' >&2; exit 1; fi
+for name in "${required_images[@]}"; do ctr -n k8s.io images import "/root/images/$name.tar" >/dev/null; done
+for image in "${images[@]}"; do crictl inspecti "$image" >/dev/null; done
+printf '%s\n' "$sandbox" > /etc/acp/registry-bootstrap/sandbox-image
+chmod 0600 /etc/acp/registry-bootstrap/sandbox-image
+/bin/bash /etc/acp/registry-bootstrap/restore-pause.sh
+probe=$(mktemp /run/acp-registry-sandbox.XXXXXX)
+cgroup_parent=''
+if containerd --config /etc/containerd/config.toml config dump | grep -Eiq '(SystemdCgroup|systemd_cgroup)[[:space:]]*=[[:space:]]*true'; then cgroup_parent='kubepods.slice'; fi
+cat > "$probe" <<JSON
+{"metadata":{"name":"registry-bootstrap-check","namespace":"kube-system","uid":"registry-bootstrap-check","attempt":0},"log_directory":"/tmp","linux":{"cgroup_parent":"$cgroup_parent","security_context":{"namespace_options":{"network":2}}}}
+JSON
+sandbox_id=$(crictl runp "$probe")
+crictl stopp "$sandbox_id" >/dev/null 2>&1 || true
+crictl rmp "$sandbox_id" >/dev/null 2>&1 || true
+sandbox_id=''
+mkdir -p /etc/acp/registry-bootstrap
+: > /etc/acp/registry-bootstrap/provider-ready
+chmod 0600 /etc/acp/registry-bootstrap/provider-ready
+printf '%s\n' '{{.ConfigVersion}}' > /etc/containerd/.acp-registry-bootstrap-version
+committed=true

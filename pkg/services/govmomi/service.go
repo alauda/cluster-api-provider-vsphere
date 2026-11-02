@@ -47,6 +47,7 @@ import (
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/registrybootstrap"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/cluster"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi/clustermodules"
@@ -148,6 +149,17 @@ func (vms *VMService) ReconcileVM(ctx context.Context, vmCtx *capvcontext.VMCont
 				Type:    infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  v1beta2Reason,
+				Message: err.Error(),
+			})
+			return vm, err
+		}
+		bootstrapData, format, err = vms.applyRegistryBootstrap(ctx, vmCtx, bootstrapData, format)
+		if err != nil {
+			conditions.MarkFalse(vmCtx.VSphereVM, infrav1.BootstrapReadyCondition, infrav1.BootstrapSecretContentInvalidReason, clusterv1.ConditionSeverityWarning, "%s", err.Error())
+			v1beta2conditions.Set(vmCtx.VSphereVM, metav1.Condition{
+				Type:    infrav1.VSphereVMBootstrapReadyV1Beta2Condition,
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.VSphereVMBootstrapSecretContentInvalidV1Beta2Reason,
 				Message: err.Error(),
 			})
 			return vm, err
@@ -886,6 +898,11 @@ func (vms *VMService) reconcileBootstrapUserData(ctx context.Context, virtualMac
 		log.Info("Reusing existing kubelet serving cert bootstrap data")
 	}
 
+	mergedUserData, _, err = vms.applyRegistryBootstrap(ctx, &virtualMachineCtx.VMContext, mergedUserData, format)
+	if err != nil {
+		return false, err
+	}
+
 	if string(mergedUserData) == existingUserData {
 		return true, nil
 	}
@@ -898,6 +915,31 @@ func (vms *VMService) reconcileBootstrapUserData(ctx context.Context, virtualMac
 	virtualMachineCtx.VSphereVM.Status.TaskRef = taskRef
 	log.Info("Wait for VM user-data to be updated")
 	return false, nil
+}
+
+func (vms *VMService) applyRegistryBootstrap(ctx context.Context, vmCtx *capvcontext.VMContext, userData []byte, format bootstrapv1.Format) ([]byte, bootstrapv1.Format, error) {
+	if vmCtx == nil || vmCtx.VSphereVM == nil {
+		return userData, format, nil
+	}
+	config, err := registrybootstrap.LoadForVSphereVM(ctx, vmCtx.Client, vmCtx.VSphereVM)
+	if err != nil {
+		return nil, format, err
+	}
+	if config.Source == "" {
+		return userData, format, nil
+	}
+	if format != bootstrapv1.CloudConfig {
+		return nil, format, errors.Errorf("registry mirror bootstrap requires cloud-config, got %q", format)
+	}
+	extra, err := registrybootstrap.RenderCloudConfig(config)
+	if err != nil {
+		return nil, format, err
+	}
+	merged, err := util.MergeCloudConfigUserData(userData, extra)
+	if err != nil {
+		return nil, format, errors.Wrap(err, "merge registry mirror bootstrap cloud-config")
+	}
+	return merged, format, nil
 }
 
 func hasKubeletServingCertUserData(userData string) bool {

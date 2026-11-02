@@ -18,6 +18,8 @@ package vmoperator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -41,6 +43,7 @@ import (
 	vmwarev1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/vmware/v1beta1"
 	capvcontext "sigs.k8s.io/cluster-api-provider-vsphere/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/context/vmware"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/registrybootstrap"
 	infrautilv1 "sigs.k8s.io/cluster-api-provider-vsphere/pkg/util"
 )
 
@@ -388,6 +391,11 @@ func (v *VmopMachineService) reconcileVMOperatorVM(ctx context.Context, supervis
 	if dsn := supervisorMachineCtx.Machine.Spec.Bootstrap.DataSecretName; dsn != nil {
 		dataSecretName = *dsn
 	}
+	var err error
+	dataSecretName, err = v.registryBootstrapDataSecret(ctx, supervisorMachineCtx, dataSecretName)
+	if err != nil {
+		return err
+	}
 
 	var minHardwareVersion int32
 	if version := supervisorMachineCtx.VSphereMachine.Spec.MinHardwareVersion; version != "" {
@@ -398,7 +406,7 @@ func (v *VmopMachineService) reconcileVMOperatorVM(ctx context.Context, supervis
 		minHardwareVersion = int32(hwVersion)
 	}
 
-	_, err := ctrlutil.CreateOrPatch(ctx, v.Client, vmOperatorVM, func() error {
+	_, err = ctrlutil.CreateOrPatch(ctx, v.Client, vmOperatorVM, func() error {
 		// Define a new VM Operator virtual machine.
 		// NOTE: Set field-by-field in order to preserve changes made directly
 		//  to the VirtualMachine spec by other sources (e.g. the cloud provider)
@@ -504,6 +512,80 @@ func (v *VmopMachineService) reconcileVMOperatorVM(ctx context.Context, supervis
 		return nil
 	})
 	return err
+}
+
+// registryBootstrapDataSecret creates an immutable copy of CABPK user-data
+// when mirror bootstrap is enabled. VM Operator reads a Secret directly, so
+// mutating the shared CABPK Secret would make retries and other consumers race.
+func (v *VmopMachineService) registryBootstrapDataSecret(ctx context.Context, machineCtx *vmware.SupervisorMachineContext, sourceName string) (string, error) {
+	if machineCtx == nil || machineCtx.Cluster == nil {
+		return sourceName, nil
+	}
+	config, err := registrybootstrap.LoadForCluster(ctx, v.Client, machineCtx.Cluster)
+	if err != nil {
+		return "", err
+	}
+	if config.Source == "" {
+		return sourceName, nil
+	}
+	if sourceName == "" {
+		return "", errors.New("mirror registry bootstrap requires bootstrap data Secret")
+	}
+	source := &corev1.Secret{}
+	if err := v.Client.Get(ctx, apitypes.NamespacedName{Namespace: machineCtx.Machine.Namespace, Name: sourceName}, source); err != nil {
+		return "", errors.Wrap(err, "read bootstrap data Secret for registry mirror")
+	}
+	format := string(source.Data["format"])
+	if format == "" {
+		format = "cloud-config"
+	}
+	if format != "cloud-config" {
+		return "", fmt.Errorf("registry mirror bootstrap requires cloud-config, got %q", format)
+	}
+	raw := source.Data["value"]
+	if len(raw) == 0 {
+		raw = source.Data["user-data"]
+	}
+	if len(raw) == 0 {
+		return "", errors.New("bootstrap data Secret has no value or user-data")
+	}
+	extra, err := registrybootstrap.RenderCloudConfig(config)
+	if err != nil {
+		return "", err
+	}
+	merged, err := infrautilv1.MergeCloudConfigUserData(raw, extra)
+	if err != nil {
+		return "", errors.Wrap(err, "merge registry mirror bootstrap cloud-config")
+	}
+	hash := sha256.Sum256([]byte(config.ConfigVersion))
+	name := fmt.Sprintf("%s-registry-%s", machineCtx.Machine.Name, hex.EncodeToString(hash[:])[:12])
+	desired := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: machineCtx.Machine.Namespace}, Type: source.Type, Data: map[string][]byte{}}
+	for key, value := range source.Data {
+		desired.Data[key] = append([]byte(nil), value...)
+	}
+	desired.Data["value"] = append([]byte(nil), merged...)
+	desired.Data["user-data"] = append([]byte(nil), merged...)
+	if desired.Type == "" {
+		desired.Type = corev1.SecretTypeOpaque
+	}
+	if machineCtx.VSphereMachine != nil && machineCtx.VSphereMachine.UID != "" && v.Client.Scheme() != nil {
+		if err := ctrlutil.SetControllerReference(machineCtx.VSphereMachine, desired, v.Client.Scheme()); err != nil {
+			return "", errors.Wrap(err, "set registry bootstrap Secret owner reference")
+		}
+	}
+	desiredType := desired.Type
+	desiredData := desired.Data
+	desiredOwners := append([]metav1.OwnerReference(nil), desired.OwnerReferences...)
+	_, err = ctrlutil.CreateOrPatch(ctx, v.Client, desired, func() error {
+		desired.Type = desiredType
+		desired.Data = desiredData
+		desired.OwnerReferences = desiredOwners
+		return nil
+	})
+	if err != nil {
+		return "", errors.Wrap(err, "create registry bootstrap Secret")
+	}
+	return name, nil
 }
 
 func (v *VmopMachineService) reconcileNetwork(supervisorMachineCtx *vmware.SupervisorMachineContext, vm *vmoprv1.VirtualMachine) bool {
